@@ -1,0 +1,271 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// The one per-particle pass of a substep. For every live particle:
+//   1. gather  (grid -> particle): APIC velocity + affine matrix from the projected grid,
+//      local composition for oil / aqueous slip and water / syrup mixing
+//   2. advect, collide with the solid SDF, apply the mouse tool
+//   3. scatter (particle -> grid): mass and momentum to the faces, composition to the cells
+// Gather reads only float fields and scatter writes only the integer accumulators, so the
+// two halves of consecutive substeps share a single sweep over particle memory.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PC {
+    uint gather;  // 0 on the first substep after a reset: the grid holds nothing yet
+} pc;
+
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float sample_sdf(vec2 x, out vec2 grad) {
+    vec2 g = clamp(x, vec2(0.0), vec2(P.grid) - 0.001);
+    ivec2 i = ivec2(g);
+    vec2 f = g - vec2(i);
+    int w1 = P.grid.x + 1;
+    int k = i.y * w1 + i.x;
+    float d00 = sdf[k], d10 = sdf[k + 1], d01 = sdf[k + w1], d11 = sdf[k + w1 + 1];
+    grad = vec2(mix(d10 - d00, d11 - d01, f.y), mix(d01 - d00, d11 - d10, f.x));
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= P.n_slots) return;
+    Particle p = particles[id];
+    if (p.kind == KIND_DEAD) return;
+
+    float dt = P.dt;
+    float rho_p = particle_density(p);
+
+    if (pc.gather != 0u) {
+        vec2 v = p.vel;
+        vec4 C = p.c;
+        vec2 corr = vec2(0.0);  // density-correction velocity: moves the particle, is not kept
+        float slip = 0.0;       // vertical slip relative to the mixture, likewise
+        float crowd = 0.0;      // occupancy around the particle, 1 at rest
+        vec2 w[3];
+
+        // ---- velocity: u faces live at (i, j + 0.5) --------------------------------
+        {
+            vec2 gp = p.pos - vec2(0.0, 0.5);
+            ivec2 base = ivec2(floor(gp - 0.5));
+            vec2 f = gp - vec2(base);
+            bspline(f, w);
+            float sw = 0.0, su = 0.0, sc = 0.0;
+            vec2 sd = vec2(0.0), sud = vec2(0.0);
+            for (int b = 0; b < 3; b++) {
+                for (int a = 0; a < 3; a++) {
+                    vec4 q = vel[cidx(base + ivec2(a, b))];
+                    if (face_live(q.z)) {
+                        float wt = w[a].x * w[b].y;
+                        vec2 d = vec2(a, b) - f;
+                        sw += wt;
+                        su += wt * q.x;
+                        sc += wt * q.z;
+                        sd += wt * d;
+                        sud += wt * q.x * d;
+                    }
+                }
+            }
+            if (sw > 1e-4) {
+                float u = su / sw;
+                v.x = u;
+                corr.x = sc / sw;
+                C.xy = 4.0 * (sud - u * sd) / sw;
+            }
+        }
+        // ---- velocity: v faces live at (i + 0.5, j) --------------------------------
+        {
+            vec2 gp = p.pos - vec2(0.5, 0.0);
+            ivec2 base = ivec2(floor(gp - 0.5));
+            vec2 f = gp - vec2(base);
+            bspline(f, w);
+            float sw = 0.0, su = 0.0, sc = 0.0;
+            vec2 sd = vec2(0.0), sud = vec2(0.0);
+            for (int b = 0; b < 3; b++) {
+                for (int a = 0; a < 3; a++) {
+                    vec4 q = vel[cidx(base + ivec2(a, b))];
+                    if (face_live(q.w)) {
+                        float wt = w[a].x * w[b].y;
+                        vec2 d = vec2(a, b) - f;
+                        sw += wt;
+                        su += wt * q.y;
+                        sc += wt * q.w;
+                        sd += wt * d;
+                        sud += wt * q.y * d;
+                    }
+                }
+            }
+            if (sw > 1e-4) {
+                float u = su / sw;
+                v.y = u;
+                corr.y = sc / sw;
+                C.zw = 4.0 * (sud - u * sd) / sw;
+            }
+        }
+        C = clamp(C, vec4(-1.0 / dt), vec4(1.0 / dt));
+        {
+            float cl = length(corr), cmax = 0.5 / dt;
+            if (cl > cmax) corr *= cmax / cl;
+        }
+
+        // ---- composition: cell centres at (i + 0.5, j + 0.5) -----------------------
+        {
+            vec2 gp = p.pos - 0.5;
+            ivec2 base = ivec2(floor(gp - 0.5));
+            vec2 f = gp - vec2(base);
+            bspline(f, w);
+            float sw = 0.0, srho = 0.0, soil = 0.0, saq = 0.0, ssyr = 0.0;
+            for (int b = 0; b < 3; b++) {
+                for (int a = 0; a < 3; a++) {
+                    vec4 q = comp[cidx(base + ivec2(a, b))];
+                    float wt = w[a].x * w[b].y;
+                    crowd += wt * q.w;
+                    if (q.x > 0.0) {
+                        sw += wt;
+                        srho += wt * q.x;
+                        soil += wt * q.y;
+                        if (q.y < 0.999) {
+                            saq += wt;
+                            ssyr += wt * q.z;
+                        }
+                    }
+                }
+            }
+            if (sw > 1e-4) {
+                // Slip between the two immiscible phases (a drift-flux / algebraic slip
+                // model). Where oil and the aqueous phase share a cell, below the scale the
+                // grid can resolve, they would otherwise move as one fluid and never
+                // separate. Instead oil rises through the mixture and the aqueous phase
+                // sinks, each in proportion to the other's share, so the volume flux of
+                // the pair cancels and pure regions do not slip at all.
+                float o = soil / sw;
+                float rho_m = srho / sw;
+                float rho_aq = saq > 1e-4 ? aqueous_density(ssyr / saq) : P.rho.x;
+                float share = p.kind == KIND_OIL ? 1.0 - o : -o;
+                slip = clamp(P.gravity * P.sep_tau * (rho_aq - P.rho.z) / rho_m, -P.sep_max, P.sep_max) * share;
+
+                // Miscible exchange: relax the particle's syrup fraction towards the local
+                // aqueous mean. Scatter and gather use the same weights, so syrup volume is
+                // conserved to round-off.
+                if (p.kind == KIND_AQUEOUS && saq > 1e-4) {
+                    p.s = clamp(p.s + (ssyr / saq - p.s) * (1.0 - exp(-P.diffuse * dt)), 0.0, 1.0);
+                }
+            }
+        }
+
+        // ---- mouse tool ------------------------------------------------------------
+        if (P.tool_mode != 0) {
+            vec2 d = P.tool_pos - p.pos;
+            float r2 = dot(d, d) / (P.tool_radius * P.tool_radius);
+            if (r2 < 1.0) {
+                if (P.tool_mode == 2) {
+                    particles[id].kind = KIND_DEAD;
+                    return;
+                }
+                float fall = 1.0 - r2;
+                float k = clamp(P.tool_strength * fall * dt, 0.0, 1.0);
+                v = mix(v, P.tool_vel + d * 4.0, k);
+            }
+        }
+
+        float sp = length(v);
+        if (sp > P.vmax) v *= P.vmax / sp;
+
+        // ---- advect and collide ----------------------------------------------------
+        vec2 x = p.pos + dt * (v + corr + vec2(0.0, slip));
+        // Particles squeezed onto the same spot sample the same grid values and would stay
+        // together for good, invisible to the density correction. Shake badly over-full
+        // spots apart; nothing at ordinary densities is touched.
+        float excess = clamp(crowd - 1.5, 0.0, 1.0);
+        if (excess > 0.0) {
+            uint h = hash(id ^ hash(floatBitsToUint(p.pos.x) ^ P.frame));
+            x += (vec2(h & 0xffffu, h >> 16) / 65535.0 - 0.5) * 0.5 * excess;
+        }
+        for (int it = 0; it < 2; it++) {
+            vec2 n;
+            float d = sample_sdf(x, n);
+            if (d < P.wall_margin) {
+                float l = length(n);
+                if (l > 1e-5) {
+                    n /= l;
+                    // Out to the surface, then as far beyond it as the particle was inside:
+                    // fluid caught under a newly placed solid keeps its area instead of
+                    // being flattened onto the outline.
+                    x += n * (P.wall_margin - d + max(-d, 0.0));
+                    float vn = dot(v, n);
+                    if (vn < 0.0) v -= vn * n;
+                }
+            }
+        }
+        x = clamp(x, vec2(2.01), vec2(P.grid) - 2.01);
+
+        p.pos = x;
+        p.vel = v;
+        p.c = C;
+        particles[id] = p;
+        rho_p = particle_density(p);
+    }
+
+    // ---- scatter ---------------------------------------------------------------------
+    vec2 vs = p.vel * dt;  // cells / step
+    vec4 Cs = p.c * dt;
+    vec2 w[3];
+    {
+        vec2 gp = p.pos - vec2(0.0, 0.5);
+        ivec2 base = ivec2(floor(gp - 0.5));
+        vec2 f = gp - vec2(base);
+        bspline(f, w);
+        for (int b = 0; b < 3; b++) {
+            for (int a = 0; a < 3; a++) {
+                int k = cidx(base + ivec2(a, b)) * ACC_STRIDE;
+                float m = w[a].x * w[b].y * rho_p;
+                vec2 d = vec2(a, b) - f;
+                atomicAdd(acc[k + 0], int(floor(m * MASS_SCALE + 0.5)));
+                atomicAdd(acc[k + 1], int(floor(m * (vs.x + dot(Cs.xy, d)) * MOM_SCALE + 0.5)));
+            }
+        }
+    }
+    {
+        vec2 gp = p.pos - vec2(0.5, 0.0);
+        ivec2 base = ivec2(floor(gp - 0.5));
+        vec2 f = gp - vec2(base);
+        bspline(f, w);
+        for (int b = 0; b < 3; b++) {
+            for (int a = 0; a < 3; a++) {
+                int k = cidx(base + ivec2(a, b)) * ACC_STRIDE;
+                float m = w[a].x * w[b].y * rho_p;
+                vec2 d = vec2(a, b) - f;
+                atomicAdd(acc[k + 2], int(floor(m * MASS_SCALE + 0.5)));
+                atomicAdd(acc[k + 3], int(floor(m * (vs.y + dot(Cs.zw, d)) * MOM_SCALE + 0.5)));
+            }
+        }
+    }
+    {
+        vec2 gp = p.pos - 0.5;
+        ivec2 base = ivec2(floor(gp - 0.5));
+        vec2 f = gp - vec2(base);
+        bspline(f, w);
+        bool oil = p.kind == KIND_OIL;
+        for (int b = 0; b < 3; b++) {
+            for (int a = 0; a < 3; a++) {
+                int k = cidx(base + ivec2(a, b)) * ACC_STRIDE;
+                int wi = int(floor(w[a].x * w[b].y * MASS_SCALE + 0.5));
+                atomicAdd(acc[k + 4], wi);
+                if (oil) {
+                    atomicAdd(acc[k + 5], wi);
+                } else if (p.s > 0.0) {
+                    atomicAdd(acc[k + 6], int(floor(w[a].x * w[b].y * p.s * MASS_SCALE + 0.5)));
+                }
+            }
+        }
+    }
+}

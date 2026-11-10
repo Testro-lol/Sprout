@@ -1,0 +1,29 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Subtracts the pressure gradient from the face velocities and stores the gradient of the
+// density-correction potential beside them.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x < 1 || c.y < 1 || c.x >= P.grid.x || c.y >= P.grid.y) return;
+    int i = cidx(c);
+    vec4 cf = coef[i];
+    if (cf.x == 0.0 && cf.y == 0.0) return;
+    vec4 me = vel[i];
+    vec2 p = pres[i];
+    if (face_live(me.z)) {
+        vec2 d = cf.x * (p - pres[i - 1]);
+        me.x -= d.x;
+        me.z = -d.y;
+    }
+    if (face_live(me.w)) {
+        vec2 d = cf.y * (p - pres[i - P.grid.x]);
+        me.y -= d.x;
+        me.w = -d.y;
+    }
+    vel[i] = me;
+}

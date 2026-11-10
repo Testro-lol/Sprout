@@ -1,0 +1,53 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Assembles the pressure system for liquid cells:
+//     sum_f a_f g_f (P_c - P_n)     = -div(u)     pressure
+//     sum_f a_f g_f (psi_c - psi_n) = S           density correction
+// with a_f the open fraction of each face (cut-cell solids). S asks for just enough
+// expansion or contraction to bring the particle occupancy back to its rest value. Keeping
+// it in its own potential means it displaces particles without ever becoming momentum,
+// so the correction cannot ring or pump energy into the flow.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    int W = P.grid.x;
+    vec4 me = cell[i];
+    if (me.w <= 0.0) {
+        pw[i] = vec4(0.0);
+        prhs[i] = vec4(0.0);
+        return;
+    }
+    vec4 sol = solid[i];
+    vec4 cf = coef[i];
+    float aL = sol.x, aB = sol.y, aR = solid[i + 1].x, aT = solid[i + W].y;
+    vec4 w = vec4(aL * cf.x, aR * coef[i + 1].x, aB * cf.y, aT * coef[i + W].y);
+    float diag = w.x + w.y + w.z + w.w;
+
+    vec4 vme = vel[i];
+    float div = aR * vel[i + 1].x - aL * vme.x + aT * vel[i + W].y - aB * vme.y;
+
+    // Over-full cells always push out. Under-full cells pull in only when they are buried
+    // in liquid that is under pressure (last substep's): at a free surface an under-full
+    // cell is simply the surface, and liquid under tension is being stretched by the flow
+    // (a falling stream), which the projection already answers by narrowing it. Pulling
+    // there too would open bubbles.
+    // Both directions use the same gain: a stronger push than pull would let any agitated
+    // liquid swell.
+    float err = clamp(comp[i].w - P.rest_phi, -0.5, 0.5);
+    if (err < 0.0) {
+        bool interior = (aL <= 0.0 || cell[i - 1].w > 0.0) && (aR <= 0.0 || cell[i + 1].w > 0.0)
+            && (aB <= 0.0 || cell[i - W].w > 0.0) && (aT <= 0.0 || cell[i + W].w > 0.0);
+        bool pressed = pres[i].x > 0.5 * me.y * P.gravity * P.dt;
+        if (!(interior && pressed)) err = 0.0;
+    }
+    float s = P.density_k * err;
+
+    pw[i] = w;
+    prhs[i] = vec4(-div, s / P.dt, diag > 1e-9 ? 1.0 / diag : 0.0, 0.0);
+}

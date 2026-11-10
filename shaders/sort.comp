@@ -1,0 +1,63 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Counting sort of the particles by grid cell, run every so often between substeps.
+//
+// Particles that share a cell end up far apart in memory once the fluid has mixed, and
+// then every gather and scatter misses the cache. Putting neighbours back side by side
+// costs about one particle pass and makes all the following ones faster. Dead slots
+// collect at the end of the buffer as a by-product.
+//
+// The accumulators are idle between substeps and serve as scratch space:
+//   slot 7 of a cell               particle count, then the running index within its row
+//   slot 6 of a row's first cell   row total, then the index at which the row starts
+// Stages, in order: 0 count, 1 prefix sums along each row, 2 prefix sums over the rows,
+// 3 move every particle to its place in `sorted`.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PC {
+    uint stage;
+} pc;
+
+int cell_of(vec2 pos) {
+    return cidx(clamp(ivec2(pos), ivec2(0), P.grid - 1));
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    int W = P.grid.x;
+    if (pc.stage == 0u) {
+        if (id >= P.n_slots || particles[id].kind == KIND_DEAD) return;
+        atomicAdd(acc[cell_of(particles[id].pos) * ACC_STRIDE + 7], 1);
+    } else if (pc.stage == 1u) {
+        if (id >= uint(P.grid.y)) return;
+        int first = int(id) * W;
+        int run = 0;
+        for (int x = 0; x < W; x++) {
+            int k = (first + x) * ACC_STRIDE + 7;
+            int n = acc[k];
+            acc[k] = run;
+            run += n;
+        }
+        acc[first * ACC_STRIDE + 6] = run;
+    } else if (pc.stage == 2u) {
+        if (id != 0u) return;
+        int run = 0;
+        for (int y = 0; y < P.grid.y; y++) {
+            int k = y * W * ACC_STRIDE + 6;
+            int n = acc[k];
+            acc[k] = run;
+            run += n;
+        }
+    } else {
+        if (id >= P.n_slots) return;
+        Particle p = particles[id];
+        if (p.kind == KIND_DEAD) return;
+        int c = cell_of(p.pos);
+        int first = (c / W) * W;
+        int dst = acc[first * ACC_STRIDE + 6] + atomicAdd(acc[c * ACC_STRIDE + 7], 1);
+        sorted[dst] = p;
+    }
+}

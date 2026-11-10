@@ -1,0 +1,22 @@
+[package]
+name = "sprout"
+version = "0.1.0"
+edition = "2024"
+description = "Sprout: a fast, interactive 2D multi-fluid sandbox (Rust + Vulkano)"
+
+[dependencies]
+vulkano = "0.35"
+winit = "0.30"
+egui = "0.31"
+egui-winit = { version = "0.31", default-features = false, features = ["wayland", "x11"] }
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+
+[profile.release]
+opt-level = 3
+debug = false
+
+# Keep debug builds usable: the sim itself runs on the GPU, but map generation and
+# SDF rasterisation run on the CPU.
+[profile.dev]
+opt-level = 1

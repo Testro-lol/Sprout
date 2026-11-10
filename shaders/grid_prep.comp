@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Turns the raw scatter accumulators into grid fields: face velocities (plus gravity),
+// per-cell composition, density, viscosity and the liquid / air classification.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const float BRIDGE_LEVEL = 0.05;
+
+// Whether cell `i` holds enough particles to count as liquid on its own.
+bool packed(int i) {
+    vec4 sol = solid[i];
+    float phi_f = float(acc[i * ACC_STRIDE + 4]) / MASS_SCALE * P.inv_ppc;
+    return sol.w > 0.02 && phi_f > 0.04 && phi_f + sol.z > P.fluid_thr;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    int k = i * ACC_STRIDE;
+    int um = acc[k], umom = acc[k + 1], vm = acc[k + 2], vmom = acc[k + 3];
+    int cw = acc[k + 4], coil = acc[k + 5], csyr = acc[k + 6];
+    vec4 sol = solid[i];
+
+    vec4 o = vec4(0.0, 0.0, FACE_EMPTY, FACE_EMPTY);
+    if (sol.x <= 0.0) {
+        o.z = FACE_CLOSED;
+    } else if (um >= MIN_FACE_MASS) {
+        o.x = (float(umom) / MOM_SCALE) / (float(um) / MASS_SCALE) / P.dt;
+        o.z = 0.0;
+    }
+    if (sol.y <= 0.0) {
+        o.w = FACE_CLOSED;
+    } else if (vm >= MIN_FACE_MASS) {
+        o.y = (float(vmom) / MOM_SCALE) / (float(vm) / MASS_SCALE) / P.dt - P.gravity * P.dt;
+        o.w = 0.0;
+    }
+    vel[i] = o;
+    vel0[i] = o.xy;
+
+    float phi_f = float(cw) / MASS_SCALE * P.inv_ppc;
+    float oil = 0.0, syr = 0.0, rho = 0.0, mu = 0.0;
+    if (cw > 0) {
+        oil = clamp(float(coil) / float(cw), 0.0, 1.0);
+        int aq = cw - coil;
+        syr = aq > 0 ? clamp(float(csyr) / float(aq), 0.0, 1.0) : 0.0;
+        rho = mix(aqueous_density(syr), P.rho.z, oil);
+        mu = mix(aqueous_viscosity(syr), P.rho.z * P.nu.z, oil);
+    }
+    float phi_t = phi_f + sol.z;
+
+    // Level > 0 marks a liquid cell. Sparse spray stays "air": it gets no pressure and
+    // flies ballistically until it packs densely enough to count as liquid again.
+    bool has = phi_f > 0.04 && sol.w > 0.02;
+    float level = has ? phi_t - P.fluid_thr : -P.fluid_thr;
+    // A thin cell squeezed between two liquid ones stays liquid. Liquid that is being
+    // stretched (a falling stream) is under tension, and without this a one-cell crack
+    // would count as a free surface, lose that tension and tear the stream into slugs.
+    if (has && level <= 0.0 && c.x > 0 && c.y > 0 && c.x < P.grid.x - 1 && c.y < P.grid.y - 1) {
+        int W = P.grid.x;
+        if ((packed(i - 1) && packed(i + 1)) || (packed(i - W) && packed(i + W))) level = BRIDGE_LEVEL;
+    }
+
+    cell[i] = vec4(phi_f, rho, mu, level);
+    comp[i] = vec4(rho, oil, syr, phi_t);
+    if (level <= 0.0) pres[i] = vec2(0.0);
+}

@@ -1,0 +1,17 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Recycles dead particle slots once the buffer has no fresh ones left: every dead slot
+// claims the next pending entry of the spawn buffer.
+
+layout(local_size_x = 128) in;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= P.n_slots) return;
+    if (particles[id].kind != KIND_DEAD) return;
+    if (counter[0] >= P.spawn_count) return;
+    uint k = atomicAdd(counter[0], 1u);
+    if (k < P.spawn_count) particles[id] = spawn[k];
+}

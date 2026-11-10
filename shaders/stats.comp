@@ -1,0 +1,28 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Counts live particles per material. Each invocation folds a run of slots so the shared
+// counters see few atomic operations.
+//   counter[4] live   counter[5] oil   counter[6] syrup volume (1/256 particle)
+
+layout(local_size_x = 64) in;
+
+const uint RUN = 64u;
+
+void main() {
+    uint first = gl_GlobalInvocationID.x * RUN;
+    if (first >= P.n_slots) return;
+    uint last = min(first + RUN, P.n_slots);
+    uint live = 0u, oil = 0u, syr = 0u;
+    for (uint id = first; id < last; id++) {
+        uint kind = particles[id].kind;
+        if (kind == KIND_DEAD) continue;
+        live++;
+        if (kind == KIND_OIL) oil++;
+        else syr += uint(particles[id].s * 256.0 + 0.5);
+    }
+    if (live > 0u) atomicAdd(counter[4], live);
+    if (oil > 0u) atomicAdd(counter[5], oil);
+    if (syr > 0u) atomicAdd(counter[6], syr);
+}

@@ -1,0 +1,39 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Per-face coefficients of the variable-density pressure solve.
+//   rho_f : liquid density on the face (occupancy-weighted mean of the two cells)
+//   g_f   : 1 / (rho_f * theta). theta < 1 on a liquid/air face places the p = 0 surface at
+//           its sub-cell position (ghost fluid), which keeps resting surfaces calm.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void face(vec4 a, vec4 b, float open, out float g, out float rho) {
+    float wsum = a.x + b.x;
+    rho = wsum > 1e-6 ? (a.x * a.y + b.x * b.y) / wsum : 1.0;
+    g = 0.0;
+    bool fa = a.w > 0.0, fb = b.w > 0.0;
+    if (open <= 0.0 || !(fa || fb)) return;
+    float theta = 1.0;
+    if (fa != fb) {
+        float lf = fa ? a.w : b.w;
+        float la = fa ? b.w : a.w;
+        theta = clamp(lf / (lf - la), THETA_MIN, 1.0);
+    }
+    g = 1.0 / (max(rho, 0.05) * theta);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    vec4 o = vec4(0.0, 0.0, 1.0, 1.0);
+    if (c.x > 0 && c.y > 0) {
+        vec4 me = cell[i];
+        vec4 sol = solid[i];
+        face(me, cell[i - 1], sol.x, o.x, o.z);
+        face(me, cell[i - P.grid.x], sol.y, o.y, o.w);
+    }
+    coef[i] = o;
+}
