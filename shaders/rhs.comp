@@ -3,12 +3,16 @@
 #include "common.glsl"
 
 // Assembles the pressure system for liquid cells:
-//     sum_f a_f g_f (P_c - P_n)     = -div(u)     pressure
-//     sum_f a_f g_f (psi_c - psi_n) = S           density correction
-// with a_f the open fraction of each face (cut-cell solids). S asks for just enough
-// expansion or contraction to bring the particle occupancy back to its rest value. Keeping
-// it in its own potential means it displaces particles without ever becoming momentum,
-// so the correction cannot ring or pump energy into the flow.
+//     sum_f a_f g_f (P_c - P_n)     = -div(u) + sum_(air faces) a_f g_f P_jump   pressure
+//     sum_f a_f g_f (psi_c - psi_n) = S                                        density correction
+// with a_f the open fraction of each face (cut-cell solids). The matrix goes to level 0 of
+// the multigrid hierarchy (couplings in mga, diagonal in mgd), the right-hand sides to prhs.
+// P_jump is the Laplace pressure sigma * kappa at the liquid-air interface (ghost fluid);
+// air cells themselves are not unknowns.
+//
+// S asks for just enough expansion or contraction to bring the particle occupancy back to
+// its rest value. Keeping it in its own potential means it displaces particles without
+// ever becoming momentum, so the correction cannot ring or pump energy into the flow.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -18,8 +22,9 @@ void main() {
     int i = cidx(c);
     int W = P.grid.x;
     vec4 me = cell[i];
-    if (me.w <= 0.0) {
-        pw[i] = vec4(0.0);
+    if (me.w <= 0.0 || c.x == 0 || c.y == 0 || c.x == P.grid.x - 1 || c.y == P.grid.y - 1) {
+        mga[i] = vec4(0.0);
+        mgd[i] = 0.0;
         prhs[i] = vec4(0.0);
         return;
     }
@@ -31,6 +36,12 @@ void main() {
 
     vec4 vme = vel[i];
     float div = aR * vel[i + 1].x - aL * vme.x + aT * vel[i + W].y - aB * vme.y;
+    // Interface terms (surf_apply.comp): on a face into air the air side's ghost pressure,
+    // on a face across the oil-aqueous interface the jump P(owner) - P(other), the owner
+    // being the cell right of / above the face.
+    bool lL = cell[i - 1].w > 0.0, lR = cell[i + 1].w > 0.0, lB = cell[i - W].w > 0.0, lT = cell[i + W].w > 0.0;
+    float jump = w.x * (lL ? pjump[i].x : pjump[i].x) + w.y * (lR ? -pjump[i + 1].x : pjump[i + 1].x)
+        + w.z * (lB ? pjump[i].y : pjump[i].y) + w.w * (lT ? -pjump[i + W].y : pjump[i + W].y);
 
     // Over-full cells always push out. Under-full cells pull in only when they are buried
     // in liquid that is under pressure (last substep's): at a free surface an under-full
@@ -43,11 +54,15 @@ void main() {
     if (err < 0.0) {
         bool interior = (aL <= 0.0 || cell[i - 1].w > 0.0) && (aR <= 0.0 || cell[i + 1].w > 0.0)
             && (aB <= 0.0 || cell[i - W].w > 0.0) && (aT <= 0.0 || cell[i + W].w > 0.0);
-        bool pressed = pres[i].x > 0.5 * me.y * P.gravity * P.dt;
+        // Last substep's pressure, rescaled to this substep's length (pres holds p * dt).
+        bool pressed = pres[i].x * (S.dt / S.dt_prev) > 0.5 * me.y * P.gravity * S.dt;
         if (!(interior && pressed)) err = 0.0;
     }
-    float s = P.density_k * err;
+    // A share of the error per unit of time, not per substep, so that the correction does
+    // not depend on how the time step happens to be cut.
+    float s = min(1.0 - exp(-S.dt / P.tol.w), P.density_k) * err;
 
-    pw[i] = w;
-    prhs[i] = vec4(-div, s / P.dt, diag > 1e-9 ? 1.0 / diag : 0.0, 0.0);
+    mga[i] = diag > 1e-9 ? w : vec4(0.0);
+    mgd[i] = diag > 1e-9 ? diag : 0.0;
+    prhs[i] = vec4(-div + jump, s / S.dt, 0.0, 0.0);
 }

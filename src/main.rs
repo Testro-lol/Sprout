@@ -24,7 +24,7 @@ USAGE:
     sprout shot OUT.png [OPTIONS]    render a map off-screen
     sprout bench [OPTIONS]           measure simulation and rendering throughput
     sprout validate [TEST]           run the physics and tool checks (hydrostatic, dam, ritter, layers,
-                                     viscous, buoyancy, tools)
+                                     viscosity, viscous, buoyancy, surface, settle, convergence, tools)
     sprout --selftest                drive the real window through every tool and control
     sprout maps                      list the built-in maps
 
@@ -40,7 +40,7 @@ OPTIONS:
     --shots <DIR>         validate: save a picture of each scenario
     --no-vsync            present as fast as possible (uncapped frame rate)
     --frames <N>          run N frames, print frame timings and exit
-    --set <name=value>    override a physics parameter (repeatable), e.g. --set nu_syrup=900
+    --set <name=value>    override a physics parameter (repeatable, SI units), e.g. --set nu_syrup=0.09
 ";
 
 fn parse_pair(s: &str) -> Option<[u32; 2]> {
@@ -234,10 +234,10 @@ mod tests {
 
     #[test]
     fn options_parse() {
-        let o = parse(&["--quality", "high", "--map", "dam", "--set", "nu_syrup=900", "--no-vsync", "out.png"]).unwrap();
+        let o = parse(&["--quality", "high", "--map", "dam", "--set", "nu_syrup=0.09", "--no-vsync", "out.png"]).unwrap();
         assert_eq!(o.grid, [768, 432]);
         assert_eq!(maps::MAPS[o.map].name, "Dam Break");
-        assert_eq!(o.overrides, vec![("nu_syrup".to_string(), 900.0)]);
+        assert_eq!(o.overrides, vec![("nu_syrup".to_string(), 0.09)]);
         assert!(!o.vsync);
         assert_eq!(o.positional, vec!["out.png".to_string()]);
 

@@ -1,5 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #include "common.glsl"
 
 // The one per-particle pass of a substep. For every live particle:
@@ -42,7 +43,7 @@ void main() {
     Particle p = particles[id];
     if (p.kind == KIND_DEAD) return;
 
-    float dt = P.dt;
+    float dt = S.dt;
     float rho_p = particle_density(p);
 
     if (pc.gather != 0u) {
@@ -147,11 +148,30 @@ void main() {
                 // separate. Instead oil rises through the mixture and the aqueous phase
                 // sinks, each in proportion to the other's share, so the volume flux of
                 // the pair cancels and pure regions do not slip at all.
+                //
+                // The slip speed is the terminal velocity of a droplet of the minority
+                // phase as large as the unresolved scale (P.sep_tau holds its diameter in
+                // cells) in the majority phase, with the drag law C_d = 24/Re + 0.44
+                // (Stokes at low Reynolds number, Newton at high):
+                //   (4/3) |drho| g d = 24 nu_c rho_c v / d + 0.44 rho_c v^2
+                // It therefore follows the cell size and the viscosity of the fluids: a
+                // droplet hardly drifts through syrup.
                 float o = soil / sw;
-                float rho_m = srho / sw;
-                float rho_aq = saq > 1e-4 ? aqueous_density(ssyr / saq) : P.rho.x;
+                float s_aq = saq > 1e-4 ? ssyr / saq : 0.0;
+                float rho_aq = aqueous_density(s_aq);
+                bool oil_cont = o > 0.5;
+                float rho_c = oil_cont ? P.rho.z : rho_aq;
+                float nu_c = oil_cont ? P.nu.z : aqueous_viscosity(s_aq) / rho_aq;
+                float d = P.sep_tau;
+                float drho = rho_aq - P.rho.z;
+                float qa = 0.44 * rho_c, qb = 24.0 * nu_c * rho_c / d, qc = 4.0 / 3.0 * abs(drho) * P.gravity * d;
+                float vt = 2.0 * qc / (qb + sqrt(qb * qb + 4.0 * qa * qc));
                 float share = p.kind == KIND_OIL ? 1.0 - o : -o;
-                slip = clamp(P.gravity * P.sep_tau * (rho_aq - P.rho.z) / rho_m, -P.sep_max, P.sep_max) * share;
+                // Capped at the CFL distance per step: the step size already accounts for
+                // the slip speed (it enters the particle speed below), so the cap only acts
+                // in the substep where slip first appears.
+                float sep_max = P.cfl / dt;
+                slip = min(vt, sep_max) * sign(drho) * share;
 
                 // Miscible exchange: relax the particle's syrup fraction towards the local
                 // aqueous mean. Scatter and gather use the same weights, so syrup volume is
@@ -177,11 +197,15 @@ void main() {
             }
         }
 
-        float sp = length(v);
-        if (sp > P.vmax) v *= P.vmax / sp;
-
         // ---- advect and collide ----------------------------------------------------
-        vec2 x = p.pos + dt * (v + corr + vec2(0.0, slip));
+        // No speed cap: the substep is sized so that the fastest particle of the last step
+        // moves at most `cfl` cells. Report this one's displacement speed for the next.
+        vec2 disp = v + corr + vec2(0.0, slip);
+        {
+            float m = subgroupMax(length(disp));
+            if (subgroupElect() && m > uintBitsToFloat(S.umax_part)) atomicMax(S.umax_part, floatBitsToUint(m));
+        }
+        vec2 x = p.pos + dt * disp;
         // Particles squeezed onto the same spot sample the same grid values and would stay
         // together for good, invisible to the density correction. Shake badly over-full
         // spots apart; nothing at ordinary densities is touched.
@@ -216,8 +240,8 @@ void main() {
     }
 
     // ---- scatter ---------------------------------------------------------------------
-    vec2 vs = p.vel * dt;  // cells / step
-    vec4 Cs = p.c * dt;
+    vec2 vs = p.vel * S.dt;  // cells / step
+    vec4 Cs = p.c * S.dt;
     vec2 w[3];
     {
         vec2 gp = p.pos - vec2(0.0, 0.5);

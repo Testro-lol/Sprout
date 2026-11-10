@@ -1,0 +1,153 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Sums the per-workgroup partials and advances the scalar state of a conjugate-gradient
+// solve. Pressure (two potentials at once, each with its own scalars) and viscosity (one
+// vector unknown) share this kernel:
+//   mode 0  pressure start   rz, rr from part[0..n), bb from part[n..2n).xy
+//   mode 1  pressure alpha   pq from part[n..2n).zw
+//   mode 2  pressure beta    rz, rr from part[0..n)
+//   mode 3  pressure end     statistics
+//   mode 4  viscosity start  rz, rr from part[0..n).xy (the residual of the initial guess)
+//   mode 5  viscosity alpha  pq from part[n..2n).z
+//   mode 6  viscosity beta   rz, rr from part[0..n).xy
+//   mode 7  viscosity end    statistics
+// When a solve has converged, its entries in the indirect argument buffer are zeroed so
+// the iterations recorded after that point do no work.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform RPC {
+    uint mode;
+    uint n;            // partials per half
+    uint n_entries;    // indirect entries per set
+    uint first_entry;  // entries this solve owns: [first_entry, last_entry)
+    uint last_entry;
+    uint pad0, pad1, pad2;
+} R;
+
+shared vec4 sbuf[256];
+shared uint s_live;
+
+vec4 total(uint base) {
+    uint t = gl_LocalInvocationIndex;
+    vec4 s = vec4(0.0);
+    for (uint k = t; k < R.n; k += 256u) s += part[base + k];
+    sbuf[t] = s;
+    barrier();
+    for (uint h = 128u; h > 0u; h >>= 1) {
+        if (t < h) sbuf[t] += sbuf[t + h];
+        barrier();
+    }
+    vec4 v = sbuf[0];
+    barrier();
+    return v;
+}
+
+// Called by thread 0 only after it updated K; spreads the decision through shared memory.
+void publish(bool on) {
+    if (gl_LocalInvocationIndex == 0u) s_live = on ? 1u : 0u;
+    barrier();
+    bool live = s_live != 0u;
+    uint t = gl_LocalInvocationIndex;
+    on = live;
+    for (uint e = R.first_entry + t; e < R.last_entry; e += 256u) {
+        for (uint k = 0u; k < 3u; k++) ind[3u * e + k] = on ? ind[3u * (R.n_entries + e) + k] : 0u;
+    }
+}
+
+void publish_pressure() {
+    publish(gl_LocalInvocationIndex == 0u ? !(K.p_done.x != 0u && K.p_done.y != 0u) : false);
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    uint mode = R.mode;
+    if (mode == 0u) {
+        vec4 a = total(0u);
+        vec4 b = total(R.n);
+        bool all_done = false;
+        if (t == 0u) {
+            K.p_bb = b.xy;
+            K.p_rz = a.xy;
+            K.p_rr = a.zw;
+            K.p_beta = vec2(0.0);
+            K.p_alpha = vec2(0.0);
+            K.p_iters = uvec2(0u);
+            vec2 tol = P.tol.xy;
+            bvec2 done = lessThanEqual(a.zw, tol * tol * b.xy);
+            K.p_done = uvec2(done);
+            K.solves += 1u;
+        }
+        publish_pressure();
+    } else if (mode == 1u) {
+        vec4 b = total(R.n);
+        if (t == 0u) {
+            vec2 pq = b.zw;
+            vec2 a = vec2(0.0);
+            if (K.p_done.x == 0u && pq.x > 0.0) a.x = K.p_rz.x / pq.x;
+            if (K.p_done.y == 0u && pq.y > 0.0) a.y = K.p_rz.y / pq.y;
+            K.p_alpha = a;
+        }
+    } else if (mode == 2u) {
+        vec4 a = total(0u);
+        if (t == 0u) {
+            uvec2 was = K.p_done;
+            K.p_iters += uvec2(1u) - was;
+            vec2 tol = P.tol.xy;
+            bvec2 now = lessThanEqual(a.zw, tol * tol * K.p_bb);
+            uvec2 done = max(was, uvec2(now));
+            vec2 beta = vec2(0.0);
+            if (done.x == 0u && K.p_rz.x > 0.0) beta.x = a.x / K.p_rz.x;
+            if (done.y == 0u && K.p_rz.y > 0.0) beta.y = a.y / K.p_rz.y;
+            K.p_beta = beta;
+            K.p_rz = a.xy;
+            K.p_rr = mix(a.zw, K.p_rr, vec2(was));
+            K.p_done = done;
+        }
+        publish_pressure();
+    } else if (mode == 3u) {
+        if (t == 0u) {
+            K.p_it_max = max(K.p_it_max, max(K.p_iters.x, K.p_iters.y));
+            if (K.p_done.x == 0u) K.p_unconv += 1u;
+            float rel = K.p_bb.x > 0.0 ? sqrt(K.p_rr.x / K.p_bb.x) : 0.0;
+            K.p_res_max = max(K.p_res_max, rel);
+        }
+    } else if (mode == 4u) {
+        vec4 a = total(0u);
+        if (t == 0u) {
+            K.v_rz = a.x;
+            K.v_r0 = a.y;
+            K.v_rr = a.y;
+            K.v_beta = 0.0;
+            K.v_alpha = 0.0;
+            K.v_iters = 0u;
+            K.v_done = (a.y <= 1e-30 || a.x <= 0.0) ? 1u : 0u;
+        }
+        publish(t == 0u ? K.v_done == 0u : false);
+    } else if (mode == 5u) {
+        vec4 b = total(R.n);
+        if (t == 0u) K.v_alpha = (K.v_done == 0u && b.z > 0.0) ? K.v_rz / b.z : 0.0;
+    } else if (mode == 6u) {
+        vec4 a = total(0u);
+        if (t == 0u) {
+            uint was = K.v_done;
+            K.v_iters += 1u - was;
+            bool now = a.y <= P.tol.z * P.tol.z * K.v_r0;
+            uint done = max(was, uint(now));
+            K.v_beta = (done == 0u && K.v_rz > 0.0) ? a.x / K.v_rz : 0.0;
+            K.v_rz = a.x;
+            if (was == 0u) K.v_rr = a.y;
+            K.v_done = done;
+        }
+        publish(t == 0u ? K.v_done == 0u : false);
+    } else if (mode == 7u) {
+        if (t == 0u) {
+            K.v_it_max = max(K.v_it_max, K.v_iters);
+            if (K.v_done == 0u) K.v_unconv += 1u;
+            float rel = K.v_r0 > 0.0 ? sqrt(K.v_rr / K.v_r0) : 0.0;
+            K.v_res_max = max(K.v_res_max, rel);
+        }
+    }
+}

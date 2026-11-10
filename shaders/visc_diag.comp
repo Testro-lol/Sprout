@@ -1,0 +1,28 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+
+// Diagonal of A for the Jacobi preconditioner (zw of vw).
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!in_grid(c)) return;
+    int i = cidx(c);
+    int W = P.grid.x;
+    vec2 d = vec2(1.0);
+    if (interior(c)) {
+        vec4 cf = coef[i];
+        if (live_u(i)) {
+            float c1 = closed_u(i - W) ? 1.0 : 0.5, c2 = closed_u(i + W) ? 1.0 : 0.5;
+            d.x = cf.z + vw[i - 1].x + vw[i].x + vw[i].y * c1 * c1 + vw[i + W].y * c2 * c2;
+        }
+        if (live_v(i)) {
+            float d1 = closed_v(i - 1) ? 1.0 : 0.5, d2 = closed_v(i + 1) ? 1.0 : 0.5;
+            d.y = cf.w + vw[i - W].x + vw[i].x + vw[i].y * d1 * d1 + vw[i + 1].y * d2 * d2;
+        }
+    }
+    vec4 o = vw[i];
+    o.zw = d;
+    vw[i] = o;
+}

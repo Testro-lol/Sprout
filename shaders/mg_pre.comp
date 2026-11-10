@@ -1,0 +1,35 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "mg.glsl"
+
+// Pre-smoothing from a zero initial guess: one red-black Gauss-Seidel sweep, red first.
+// From zero the red half-sweep is just z = r / D, so the black half computes its red
+// neighbours on the fly and both halves fit in one dispatch.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!inside_f(c)) return;
+    int i = fidx(c);
+    float D = mgd[i];
+    if (D <= 0.0) {
+        mgx[i] = vec2(0.0);
+        return;
+    }
+    vec2 r = mgr[i];
+    if (((c.x + c.y) & 1) == 0) {
+        mgx[i] = r / D;
+        return;
+    }
+    vec4 w = mga[i];
+    vec2 sum = r;
+    for (int d = 0; d < 4; d++) {
+        ivec2 n = c + NB[d];
+        if (!unknown_f(n)) continue;
+        int j = fidx(n);
+        sum += wcomp(w, d) * mgr[j] / mgd[j];
+    }
+    mgx[i] = sum / D;
+}

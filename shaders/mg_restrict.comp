@@ -1,0 +1,27 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "mg.glsl"
+
+// Coarse right-hand side = P^T (r - A z): the summed residual of the four children.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 C = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(C, M.dim_c))) return;
+    vec2 sum = vec2(0.0);
+    for (int k = 0; k < 4; k++) {
+        ivec2 c = 2 * C + ivec2(k & 1, k >> 1);
+        if (!unknown_f(c)) continue;
+        int i = fidx(c);
+        vec4 w = mga[i];
+        vec2 az = mgd[i] * mgx[i];
+        for (int d = 0; d < 4; d++) {
+            ivec2 n = c + NB[d];
+            if (unknown_f(n)) az -= wcomp(w, d) * mgx[fidx(n)];
+        }
+        sum += mgr[i] - az;
+    }
+    mgr[cidx_c(C)] = sum;
+}

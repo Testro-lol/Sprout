@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Turns curvature into pressure jumps at interfaces (ghost fluid method, Kang, Fedkiw & Liu
+// 2000), for both kinds of interface:
+//
+// Liquid-air: the air side of a face takes the Dirichlet value P = sigma * kappa at the
+// interface (sub-cell position from the liquid level, as for the free surface itself).
+// sigma is that of the liquid on the face: water, syrup or oil against air, blended by
+// composition. pjump holds that air-side value.
+//
+// Oil-aqueous: both sides are liquid. Where the oil fraction crosses 1/2 between two cells,
+// the pressure must jump by sigma_oa * kappa across the face (higher on the oil side of a
+// convex oil surface). pjump holds that jump as P(this cell) - P(the neighbour behind),
+// and rhs.comp / project.comp subtract it from the pressure difference. The jump and the
+// pressure gradient use the same face coefficient, so a jump of the right size is balanced
+// exactly and drives no flow ("balanced force").
+//
+// Water and syrup are miscible: they share one aqueous phase, so there is no tension
+// between them (the transient Korteweg stress of a fresh miscible interface is neglected).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+float sigma_air(vec4 m) {
+    return mix(mix(P.sigma.x, P.sigma.y, m.z), P.sigma.z, m.y);
+}
+
+// Ghost pressure (* dt) on the face between cells a and b, one liquid, one air.
+float air_jump(int a, int b) {
+    bool la = cell[a].w > 0.0;
+    int liq = la ? a : b, air = la ? b : a;
+    float lf = cell[liq].w, lg = cell[air].w;
+    float theta = clamp(lf / (lf - lg), THETA_MIN, 1.0);
+    float kl = surf[liq].z, kg = surf[air].z;
+    float kap = kg != 0.0 ? mix(kl, kg, theta) : kl;
+    return S.dt * sigma_air(comp[liq]) * kap;
+}
+
+// Jump P(c) - P(n) (* dt) across the liquid-liquid face between n (behind) and c.
+float oil_jump(int c, int n) {
+    float oc = comp[c].y, on = comp[n].y;
+    if ((oc - 0.5) * (on - 0.5) >= 0.0) return 0.0;
+    float theta = (0.5 - on) / (oc - on);  // interface position from n towards c
+    float kc = surf[c].w, kn = surf[n].w;
+    float kap = kc == 0.0 ? kn : kn == 0.0 ? kc : mix(kn, kc, theta);
+    float j = S.dt * P.sigma.w * kap;
+    return oc > on ? j : -j;
+}
+
+float face_jump(int c, int n, float open) {
+    if (open <= 0.0) return 0.0;
+    bool lc = cell[c].w > 0.0, ln = cell[n].w > 0.0;
+    if (lc != ln) return air_jump(c, n);
+    if (lc && ln) return oil_jump(c, n);
+    return 0.0;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    vec2 pj = vec2(0.0);
+    if (c.x > 0 && c.y > 0) {
+        vec4 sol = solid[i];
+        pj.x = face_jump(i, i - 1, sol.x);
+        pj.y = face_jump(i, i - P.grid.x, sol.y);
+    }
+    pjump[i] = pj;
+}

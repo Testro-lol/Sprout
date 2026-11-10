@@ -1,0 +1,20 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+
+// Second half of visc_split: once every inactive face has its explicit update (which reads
+// the strain of its neighbours), remove the inactive tiles from the implicit system.
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!in_grid(c) || tile_active()) return;
+    int i = cidx(c);
+    vec4 w = vw[i];
+    w.xy = vec2(0.0);
+    vw[i] = w;
+    vs[i] = vec4(0.0);
+    vr[i] = vec2(0.0);
+    vp[i] = vec2(0.0);
+    vq[i] = vec2(0.0);
+}

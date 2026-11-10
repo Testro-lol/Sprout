@@ -1,29 +1,54 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 #include "common.glsl"
 
 // Subtracts the pressure gradient from the face velocities and stores the gradient of the
-// density-correction potential beside them.
+// density-correction potential beside them. Surface tension enters as interface terms: the
+// air side of a liquid-air face takes the Laplace ghost pressure, and across the
+// oil-aqueous interface the prescribed jump is removed from the difference. Also reports
+// the fastest live face for the next substep's CFL limit.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+void report(float m) {
+    m = subgroupMax(m);
+    if (subgroupElect() && m > uintBitsToFloat(S.umax_grid)) atomicMax(S.umax_grid, floatBitsToUint(m));
+}
+
+// P(this cell) - P(the one behind) across a face, interface terms included (surf_apply.comp):
+// an air side takes the ghost pressure; across the oil-aqueous interface the jump is removed.
+float difference(bool lc, bool ln, float pc, float pn, float j) {
+    if (lc && ln) return pc - pn - j;
+    return (lc ? pc : j) - (ln ? pn : j);
+}
+
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    if (c.x < 1 || c.y < 1 || c.x >= P.grid.x || c.y >= P.grid.y) return;
+    if (c.x < 1 || c.y < 1 || c.x >= P.grid.x || c.y >= P.grid.y) {
+        report(0.0);
+        return;
+    }
     int i = cidx(c);
     vec4 cf = coef[i];
-    if (cf.x == 0.0 && cf.y == 0.0) return;
     vec4 me = vel[i];
-    vec2 p = pres[i];
-    if (face_live(me.z)) {
-        vec2 d = cf.x * (p - pres[i - 1]);
-        me.x -= d.x;
-        me.z = -d.y;
+    if (cf.x != 0.0 || cf.y != 0.0) {
+        vec2 p = pres[i];
+        bool liq = cell[i].w > 0.0;
+        if (face_live(me.z) && cf.x != 0.0) {
+            int n = i - 1;
+            me.x -= cf.x * difference(liq, cell[n].w > 0.0, p.x, pres[n].x, pjump[i].x);
+            me.z = -cf.x * (p.y - pres[n].y);
+        }
+        if (face_live(me.w) && cf.y != 0.0) {
+            int n = i - P.grid.x;
+            me.y -= cf.y * difference(liq, cell[n].w > 0.0, p.x, pres[n].x, pjump[i].y);
+            me.w = -cf.y * (p.y - pres[n].y);
+        }
+        vel[i] = me;
     }
-    if (face_live(me.w)) {
-        vec2 d = cf.y * (p - pres[i - P.grid.x]);
-        me.y -= d.x;
-        me.w = -d.y;
-    }
-    vel[i] = me;
+    float m = 0.0;
+    if (face_live(me.z)) m = abs(me.x);
+    if (face_live(me.w)) m = max(m, abs(me.y));
+    report(m);
 }

@@ -1,0 +1,29 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "mg.glsl"
+
+// Coarse-grid correction plus the black half of the post-smoothing sweep, fused.
+// A Gauss-Seidel update overwrites a cell's own value, so black cells only need their red
+// neighbours' corrected values z + omega * z_parent, computed here on the fly; the red cells
+// are rewritten from scratch by mg_post_red right after. The result is exactly "prolong,
+// then black, then red" (the mirror image of the pre-smoother, so the V-cycle stays
+// symmetric, as conjugate gradients requires of a preconditioner).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!inside_f(c) || ((c.x + c.y) & 1) == 0) return;
+    int i = fidx(c);
+    float D = mgd[i];
+    if (D <= 0.0) return;
+    vec4 w = mga[i];
+    vec2 sum = mgr[i];
+    for (int d = 0; d < 4; d++) {
+        ivec2 n = c + NB[d];
+        if (!unknown_f(n)) continue;
+        sum += wcomp(w, d) * (mgx[fidx(n)] + M.omega * mgx[cidx_c(n >> 1)]);
+    }
+    mgx[i] = sum / D;
+}

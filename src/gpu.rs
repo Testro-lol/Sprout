@@ -6,7 +6,7 @@ use vulkano::{
     VulkanLibrary,
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
-        allocator::StandardCommandBufferAllocator,
+        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
     },
     descriptor_set::allocator::StandardDescriptorSetAllocator,
     device::{
@@ -93,7 +93,11 @@ impl Gpu {
             instance,
             memory: Arc::new(StandardMemoryAllocator::new_default(device.clone())),
             descriptors: Arc::new(StandardDescriptorSetAllocator::new(device.clone(), Default::default())),
-            commands: Arc::new(StandardCommandBufferAllocator::new(device.clone(), Default::default())),
+            commands: Arc::new(StandardCommandBufferAllocator::new(
+                device.clone(),
+                // The solver caches a few secondary command buffers (see `FluidSim::grid_part`).
+                StandardCommandBufferAllocatorCreateInfo { secondary_buffer_count: 4, ..Default::default() },
+            )),
             device,
             queue,
         })

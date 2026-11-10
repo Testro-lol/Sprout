@@ -6,7 +6,7 @@ and blend. The whole simulation runs in compute shaders on the GPU.
 
 ![Playground map with the control panel](docs/playground.png)
 
-This is the first version: the fluid solver, its tools and maps. The code is laid out so
+The fluid solver, its tools and maps; see [Physics](#physics) and [Validation](#validation) for what changed in the second round. The code is laid out so
 that more simulations can join the same world later (see [Code layout](#code-layout)).
 
 ## Build and run
@@ -33,7 +33,7 @@ Useful options (run `sprout --help` for all of them):
 | `--map <N or name>` | Starting map, e.g. `--map 2` or `--map dam` |
 | `--quality low\|medium\|high\|ultra` | Grid of 384x216, 512x288 (default), 768x432 or 1024x576 cells |
 | `--no-vsync` | Uncapped frame rate |
-| `--set name=value` | Override a physics parameter, e.g. `--set nu_syrup=900` |
+| `--set name=value` | Override a physics parameter (SI units), e.g. `--set nu_syrup=0.09` or `--set cell_size=0.001` |
 | `--frames N` | Run N frames, print frame timings, exit |
 
 ## Controls
@@ -53,9 +53,9 @@ Useful options (run `sprout --help` for all of them):
 | `PgUp` `PgDn` | Previous / next map |
 | `Home` `H` `F11` `Esc` | Reset view, hide panel, fullscreen, quit |
 
-The panel also has sliders for the fluid properties (viscosities, densities, how fast oil
-separates and syrup blends), the solver (substeps per second, sweep counts), the grid
-resolution and slow motion.
+The panel also has sliders for the fluid properties (viscosities, surface tensions, contact
+angles, densities, cell size), the solver (CFL number, tolerances; it also shows the current
+substep and iteration counts), the grid resolution and slow motion.
 
 Pouring lays down a solid stream as wide as the brush. A low pour rate narrows it. Nothing
 pours while paused, because the stream is laid out for the time the simulation advances.
@@ -89,165 +89,264 @@ cargo run --release -- shot out.png --map 2 --at 3,10
 cargo test --release                     # CPU-side unit tests
 ```
 
-`validate` takes a test name (`hydrostatic`, `dam`, `ritter`, `layers`, `viscous`,
-`buoyancy`, `tools`) and `--shots DIR` to save a picture of each scenario. `shot` renders
+`validate` takes a test name (`hydrostatic`, `dam`, `ritter`, `layers`, `viscosity`,
+`viscous`, `buoyancy`, `surface`, `settle`, `convergence`, `tools`) and `--shots DIR` to save a
+picture of each scenario. Two debug commands are not in `--help`: `sprout probe [DEPTH]`
+prints an energy, step and iteration trace (`--map N` for a map, `--at T` for the duration),
+and `sprout profile` splits a frame into CPU recording and GPU time and times every pass of
+one substep with GPU timestamps. `shot` renders
 any map at the given simulated times, with `--ui` to include the panel.
 
 ## Physics
 
-Units: one grid cell is one length unit, nominally 1 cm, so gravity is 981 cells/s².
-Densities are relative to water.
+**Units and scale.** The solver works in grid units (cells, seconds, densities relative to
+water). Everything you can edit is in SI and converted in one place
+([src/sim/params.rs](src/sim/params.rs), `SimParams::gpu_units`), together with the physical
+size of a cell, `cell_size` (default 1 cm, so gravity is 981 cells/s²). Changing the cell size
+changes the physical scale of the whole tank: at 1 mm per cell surface tension matters, at
+1 cm it barely does (see below).
 
 **Method.** Particles carry the fluid and a staggered grid solves the forces (APIC, a
-low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each substep
-(240 per simulated second by default):
+low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each substep:
 
-1. One pass over the particles gathers velocity from the grid, moves them, collides them
-   with solids, and scatters mass and momentum back to the grid.
-2. Viscosity is applied implicitly, so syrup can be hundreds of times thicker than an
-   explicit step would allow. Solid surfaces are no-slip for viscous fluid.
-3. A pressure solve makes the velocity field divergence-free. It accounts for the density
-   of every cell, which is what produces buoyancy: light fluid is pushed up through heavy
-   fluid by the same pressure that holds a pool at rest. The free surface sits at its
-   sub-cell position, and solids cut cells and faces by their true open fraction.
-4. A second solve with the same matrix corrects density errors by nudging particle
-   positions only. It never adds momentum, so it cannot pump energy into the flow.
+1. The GPU picks the substep length (`step.comp`) from the CFL condition,
+   `dt = cfl / (u_max + sqrt(5 g dx))`, with `u_max` the fastest face velocity after the last
+   projection, the fastest particle displacement of the last advection (velocity, density
+   correction and oil slip) and what the mouse or a pour will impose; `cfl` = 2 cells. It is
+   also capped at 1/60 s and at the capillary-wave limit of explicit surface tension. The
+   CPU only asks for a span of simulated time per frame; it never caps velocities.
+2. One pass over the particles gathers velocity from the grid, moves them, collides them
+   with solids, and scatters mass and momentum back to the grid; gravity is added on the grid.
+3. Surface tension: curvature of smoothed liquid and oil indicators, turned into pressure
+   jumps at liquid–air and oil–aqueous interfaces (below).
+4. Viscosity, full stress tensor (below).
+5. Pressure: the velocity field is made divergence-free with a variable-density, cut-cell,
+   ghost-fluid Poisson solve, by conjugate gradients preconditioned with an aggregation
+   multigrid V-cycle (red–black Gauss–Seidel smoothing, Galerkin coarse operators,
+   coarse-correction weight 1.8). It stops at a relative residual of 1e-4, so its accuracy
+   does not depend on the resolution: a resting pool needs about 3 iterations, the dam
+   break at most 10 (512 × 288) to 12 (1600 × 900), with no unconverged solve in either.
+6. A second solve with the same matrix corrects density errors by nudging particle
+   positions only; it never adds momentum.
 
-**The three fluids.**
+How many Krylov iterations each substep records adapts to what recent solves needed (read
+back a frame later); iterations recorded after convergence are dispatched indirectly with
+zero work. A solve that runs out of recorded iterations is counted and reported (`probe`,
+`validate`, the panel). Every substep is recorded once into a raw secondary command buffer
+with explicit barriers and replayed ([src/sim/raw.rs](src/sim/raw.rs)); vulkano's
+automatic synchronisation cost several milliseconds of CPU per substep at this dispatch count.
 
-| | Density | Kinematic viscosity (cells²/s) |
-|---|---|---|
-| Water | 1.0 | 0 |
-| Oil | 0.9 | 30 |
-| Syrup | 1.4 | 600 |
+**Viscosity** is implicit (backward Euler) in the variational form of Batty & Bridson (2008):
+the new velocities minimise kinetic energy change plus `dt * mu * D:D`, D the strain rate.
+That is `div(mu (grad u + grad u^T))`, not `mu lap(u)`: it is consistent across viscosity
+jumps (water next to syrup), gives traction-free free surfaces and does not slow a rigid
+rotation. Solid walls are no-slip, with the wall where it is (half a cell from the first
+tangential sample). The system is symmetric positive definite, solved by Jacobi-
+preconditioned conjugate gradients to a relative residual of 1e-3, so no viscosity is too
+large for the time step. Where the viscous diffusion number `nu dt / dx²` is below 1e-3
+(water: about 1e-5 on 1 cm cells) the same operator is applied explicitly instead, which is
+stable to about 0.12; in a water-only tank that is the whole tank, in mixed tanks the
+implicit solve runs only on 16 × 16 tiles near more viscous fluid.
 
-The viscosities are chosen for feel at this scale, not taken from material tables: syrup
-is thicker than real honey, oil thicker than real cooking oil.
+**Surface tension** uses the ghost-fluid method (Kang, Fedkiw & Liu 2000) for both kinds of
+interface, so the jump is as sharp as the free surface and is balanced exactly by the
+pressure gradient:
+
+- *Liquid–air:* the air side of a surface face takes the Laplace pressure `sigma * kappa` at
+  the interface's sub-cell position. `sigma` is that of the liquid there (water, syrup or oil
+  against air, blended by composition).
+- *Oil–aqueous:* where the oil fraction crosses 1/2 between two cells, the pressure jumps by
+  `sigma_oil * kappa` across that face.
+- *Water–syrup:* miscible, one aqueous phase, no interfacial tension (the weak transient
+  Korteweg stress of a fresh miscible interface is neglected).
+
+Curvature is the divergence of the unit normal of a 5 × 5 binomially smoothed occupancy
+field. **Wetting** is the minimal static-contact-angle model (Brackbill, Kothe & Zemach 1992):
+within 1.5 cells of a solid the normal is replaced by the one the material's contact angle
+prescribes. There is no contact-angle hysteresis and no contact-line slip model; a contact
+line moves as fast as the no-slip viscous wall lets it.
+
+**The three fluids** (all editable; `--set nu_oil=8e-5`, `--set sigma_water=0.07`,
+`--set contact_water=40`, ...):
+
+| | Density | Kinematic viscosity | Tension vs air | Contact angle |
+|---|---|---|---|---|
+| Water | 998 kg/m³ | 1.0e-6 m²/s | 0.072 N/m | 90° |
+| Syrup | 1.4 × water | 0.06 m²/s | 0.076 N/m | 90° |
+| Oil | 0.9 × water | 6.0e-5 m²/s | 0.032 N/m | 90° |
+
+Oil against water or syrup: 0.025 N/m. Water's values are the standard 20 °C ones; oil's are
+typical of olive or sunflower oil (50–90 mPa·s, 0.03 N/m against air, 0.02–0.03 N/m against
+water). Syrup is a choice, not a measured product: a thick golden syrup or honey. The
+contact angles are a neutral default because the scene does not say what the solids are.
+The previous version tuned oil to 50 × and water to zero viscosity "for feel"; water now has
+its real viscosity, and it changes almost nothing at this scale (see Validation).
 
 - **Water and syrup are miscible.** Each aqueous particle carries a syrup fraction.
   Neighbours exchange it at a set rate, conserving total syrup exactly. Density blends
-  linearly with the fraction and viscosity logarithmically, so a little water thins syrup
-  a lot, as with real sugar solutions.
-- **Oil is a separate phase.** Oil particles stay oil. Where oil and water share a cell,
-  below what the grid can resolve, they would otherwise move as one fluid and never
-  separate. A slip model handles that scale: oil rises through the mixture and the
-  aqueous phase sinks, each in proportion to the other's share, so pure regions do not
-  slip and the two fluxes cancel.
+  linearly with the fraction and viscosity logarithmically.
+- **Oil is a separate phase.** Where oil and water share a cell, below what the grid
+  resolves, they would otherwise move as one fluid. Sub-cell droplets therefore drift at
+  their terminal velocity: a droplet one cell across (`droplet`, in cells) in whichever
+  phase is the majority, with drag `C_d = 24/Re + 0.44`. This follows the cell size and the
+  viscosity of the fluids (a droplet barely drifts through syrup). The previous model used a
+  fixed relaxation time, which made the drift ten times faster in cells per second at 1 mm
+  cells and ignored viscosity; at 1 mm it broke up oil blobs.
 
-**Liquid and air.** Air is not simulated. A cell is liquid when it holds at least half
-its rest density; sparser spray flies ballistically until it lands. Liquid being stretched
-(a falling stream) narrows instead of tearing, because one-cell gaps inside it stay
-connected.
+**Liquid and air.** Air is not simulated. A cell is liquid when it holds at least half its
+rest density; sparser spray flies ballistically until it lands.
 
-**Details that matter for stability**, each found by a failing test: faces leading into
-cells that are almost entirely solid are sealed, because the pressure solve would treat
-such a cell as a free surface and drain fluid into it; particles caught under a newly
-placed solid are mirrored out through its surface so they keep their area; and badly
-over-full spots are jittered apart so that stacked particles can separate.
+**Numerical stabilisation.** Every device below exists for a stated reason; none limits
+speed or damps motion globally.
+
+| Device | Purpose | Measured effect |
+|---|---|---|
+| Density correction (position-only potential, 1 − exp(−dt/6 ms) of the error per substep, at most 0.5) | Removes the volume drift that particle advection accumulates | Volume −0.29 % after the 40 s overturn; lifts a resting 1 M-particle pool by 0.016 cells (an energy change of 1.5e-4 of its potential energy). A time constant rather than a per-step share, so short substeps do not over-correct; per-step it caused visible jitter |
+| Correction displacement ≤ 0.5 cell per substep | Keeps one bad cell from throwing particles | Inactive in every validation scene except at impacts |
+| Crowding jitter (cells over 1.5 × rest density) | Lets particles stacked on one spot separate | Unchanged from before |
+| APIC matrix clamp ‖C‖ ≤ 1/dt | Bounds the affine velocity of a particle in thin spray | Rarely active at CFL 2 |
+| Oil slip ≤ cfl cells per substep | The step size already accounts for the slip; this only acts in the substep it appears | — |
+| Ghost-fluid fraction θ ≥ 0.1 | Bounds the pressure coefficient of a nearly empty surface cell | Standard; unchanged |
+| Curvature only where the smoothed indicator's gradient is resolved; ‖κ‖ ≤ 0.5 / cell | Radii under two cells are not representable; particle noise there would become huge pressure jumps | Spurious currents around a resting drop 1.2 % of the capillary velocity |
+| Implicit-viscosity tiles (diffusion number ≥ 1e-3) | Skip Krylov work where it changes nothing above tolerance; those tiles get the explicit step | Viscosity checks unchanged; viscosity cost 5.8 → 2.3 ms per substep on Playground 1024 |
 
 ## Validation
 
-`sprout validate` runs these on the real solver at 512x288 and compares against a known
-answer. All 35 checks pass on the machine below. Measured values from the last run:
+`sprout validate` runs these on the real solver, mostly at 512 × 288, and compares against a
+known answer. All checks pass on the machine below (one measurement is reported without a
+pass/fail, see Limitations). Measured values from the last run, with the previous version
+where it was measured under identical conditions:
 
-| Test | Measured | Expected |
-|---|---|---|
-| Resting pool, 10 s | level −0.51 %, residual speed 0.00007 √(gh) | stays level and still |
-| Shallow dam break vs Ritter's exact solution | depth 0.463 h₀, speed 0.637 √(gh₀) at the dam | 0.444, 0.667 |
-| Dam break, column 2:1, vs Martin & Moyce (1952) | front 8–16 % ahead, front speed 1.47 | experiment 1.32 |
-| Three layers stacked upside down, 30 s | oil / water / syrup end at mean heights 151 / 79 / 48 cells; 1 % of water left above the oil; volume −0.45 % | sorted by density |
-| Same run, energy | never rises between samples; 0.3 % of the released energy left as motion | only falls |
-| Same run, conservation | syrup volume +0.0000 %, oil particles unchanged | conserved |
-| Syrup slumping vs Huppert's (1982) viscous current | exponent 0.192, front 13 % ahead at 16 s | exponent 0.2 |
-| Water vs syrup column after 1 s | fronts at 431 vs 166 cells | water far ahead |
-| Oil blob at the bottom, syrup blob at the top of a pool | oil reaches the surface, syrup the floor | rise and sink |
-| Pour, erase, slot reuse, grab, place and remove solids | counts exact, pool rises by the displaced volume (36.00 vs 35.90 cells mean height), no clumps | as stated |
+| Test | Now | Before | Expected |
+|---|---|---|---|
+| Resting pool 1024 × 576, 250 cells deep, 1 M particles, 6 s: peak KE per particle | 0.0011 | 162 (25 cells/s sloshing) | 0 |
+| Same: mean height | constant to 0.016 cells | swung by 1.7 cells | constant |
+| Same: unconverged pressure solves | 0 of 367 (≤ 10 iterations) | — (fixed 30 sweeps) | 0 |
+| Resting pool 512 × 288, 10 s | level −0.57 %, rms 0.00018 √(gh) | −0.51 %, 0.00007 | level, still |
+| Syrup slump vs Huppert (1982) at 16 s | 1.02, exponent 0.204 | 1.13, 0.192 | 1.0, 0.2 |
+| Shear decay, free slab (traction-free surfaces) | −4.4 % of ν(π/H)² | not tested | exact rate |
+| Shear decay on a no-slip floor | −1.7 % of ν(π/2H)² | not tested | exact rate |
+| Rigid rotation, ν = 0.01 m²/s, angular momentum after 1 s | 1.011 | 0.919 (Laplacian form, converged) | 1 |
+| Resting drop, 1 mm cells: pressure / (σ/R) | 1.002 | no tension | 1 |
+| Spurious currents around it | 1.2 % of √(σ/ρR) | — | small |
+| Oil disc in water: pressure jump / (σ_oa/R) | 1.002 | — | 1 |
+| Water drop n = 2 oscillation vs Rayleigh | +0.6 % | — | 0 |
+| Syrup blob in water (miscible): shape change | 0.000 | — | none |
+| Contact angle 60° / 90° / 120° | 73° / 86° / 132° | none | as set |
+| Oil square in water, 0.5 s: R_max / R_equal-area | 0.99 with tension, 1.19 without | — | 1 = disc |
+| Dam break 2:1, front Z at T = 3.33, a = 30 / 60 / 120 cells | 4.495 / 4.530 / 4.546 | — | converging |
+| Dam break front speed dZ/dT | 1.47 | 1.47 | experiments 1.14–1.74 |
+| Dam break front vs Martin & Moyce table | +8 … +15 % | +8 … +16 % | see below |
+| Shallow dam break vs Ritter | depth 0.459, speed 0.638 | 0.463, 0.637 | 0.444, 0.667 |
+| Overturn of three layers, 40 s | oil / water / syrup at 149 / 83 / 45, 0.6 % trapped, energy never rises | 151 / 79 / 48 at 30 s | sorted |
+| Stir then 10 s of rest: energy above rest | 2066 → 1072 | 2072 → 1087 | falling |
+| Same: particle-scale jitter | 9.3 → 3.0 cells/s (0.4 % of the energy) | 9.1 → 3.1 | decaying |
+| Tools: pour, erase, recycle, grab, solids | all pass | all pass | |
 
-`sprout --selftest` opens the real window and feeds a script through the same handlers
-that mouse and keyboard events reach: pouring each fluid, brush keys, placing and removing
-solids, both stir buttons, erase, pause and single step, zoom, pan, map reset, next map,
-and a change of resolution. All 19 checks pass. It does not replace a hand on the mouse:
-how the operating system delivers real input events is the one part not exercised.
+What the numbers say about the reported problems:
 
-`cargo test` covers the CPU side (shape distances, rasterised solids, map building,
-option parsing, frame pacing): 17 tests, all passing.
+- **"Rarely settles at high particle counts"** was the pressure solve: thirty SOR sweeps do
+  not converge a 576-cell-tall grid, so the pool compressed under gravity, the density
+  correction lifted it back, and the cycle pumped energy in. With 300 sweeps the old solver
+  settled too; the new solve stops on its residual and needs 3–10 iterations.
+- **"Syrup front 13 % fast"** was the viscosity solve: six Gauss–Seidel sweeps leave the
+  long-wavelength viscous modes largely unsolved, so syrup acted thinner than set. With 60
+  sweeps the old code gave 1.04; the new solve gives 1.02 and decays shear at the analytical
+  rate.
+- **"Dam break 8–16 % fast"** is not a solver error. The front does not move when the pressure
+  sweeps, the substep rate, the density correction or the speed cap change, it converges
+  under grid refinement (0.4 % between the two finest grids), and its speed (1.47) sits
+  inside the spread of published experiments (1.14–1.74 for v/√(gH) after t* = 1, Lobovský et
+  al. 2014, table 1; Martin & Moyce's own 2:1 run is 1.69 there). The table the check
+  compares positions against (1.32) is one data set typed from memory, and real experiments
+  lose time to the gate and to floor friction that a frictionless instant release does not
+  have.
+- **"Water sloshes excessively"** after a stir is physical: waves in a 5 m tank decay over
+  minutes. The same stir on the old and new solvers loses the same energy at the same rate,
+  and the old one had no injection there. Water's real viscosity (1e-6 m²/s) is now in;
+  on 1 cm cells it changes a velocity by about 1e-4 of its neighbour difference per substep,
+  which is why it is not visible. Raising it would be tuning, not physics.
+- **"Oil does not bead"**: oil now has interfacial tension and rounds off (0.99 vs 1.19). At
+  the default 1 cm cells the Bond number of any drop the grid can resolve is large
+  (a 5 cm oil drop in water: Δρ g R² / σ ≈ 100), so gravity wins and blobs flatten, as real
+  5 cm blobs would. Set `--set cell_size=0.001` to see capillary-scale beading.
 
-Two caveats on the references. The Martin & Moyce numbers in
-[src/validate.rs](src/validate.rs) are the table as commonly reproduced in the dam-break
-literature, typed from memory and not checked against the paper; the Ritter check beside
-it needs no data. And a frictionless solver released instantly is expected to run ahead of
-that experiment, whose gate takes time to open, so the 20 % tolerance there is loose.
+`sprout --selftest` drives the real window through every tool and key (19 checks, all pass).
+`cargo test` covers the CPU side: 18 tests, all pass. `cargo clippy` is clean.
 
 ## Performance
 
-Hardware: AMD Ryzen 5 3600, NVIDIA RTX 3060 Ti 8 GB (driver 615.78), Fedora 45, Wayland,
-165 Hz display.
+Hardware: AMD Ryzen 5 3600, NVIDIA RTX 3060 Ti 8 GB (driver 615.78), Fedora 45, Wayland.
+Both versions measured the same day with the same command, a 1600 × 900 window, uncapped
+(`--no-vsync --frames 1800`, the first 360 frames skipped), nothing else on the GPU. Frame
+times in ms; "sim speed" is simulated seconds per wall-clock second.
 
-`sprout bench`, off-screen at 1920x1080, default settings (240 substeps/s, 30 pressure
-sweeps, 6 viscosity sweeps), each scene timed after 6 s of simulated mixing. Times are
-wall-clock for submitted-and-finished work, CPU recording included.
+| Scene | Version | mean | p5 | p25 | p50 | p75 | p95 | p99 | max | sim speed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Dam Break 1600 × 900, 1.04 M water | before | 13.4 | 9.9 | 10.1 | 10.4 | 18.8 | 19.1 | 19.4 | 23.4 | 0.42 |
+| | now | 16.1 | 11.3 | 11.9 | 12.7 | 22.2 | 24.1 | 25.2 | 28.7 | 0.07 |
+| | now, fixed 240 substeps/s | 17.5 | 12.5 | 13.1 | 13.7 | 24.3 | 26.1 | 27.1 | 29.2 | 0.32 |
+| Dam Break 768 × 432, 237 k water | before | 0.9 | 0.4 | 0.4 | 0.4 | 0.7 | 2.8 | 2.9 | 13.6 | 0.96 |
+| | now | 11.3 | 0.5 | 4.4 | 13.2 | 16.7 | 18.9 | 21.4 | 24.9 | 0.57 |
+| Playground 1024 × 576, 732 k mixed | before | 17.2 | 12.2 | 17.7 | 17.9 | 18.0 | 18.2 | 20.0 | 20.5 | 0.70 |
+| | now | 14.5 | 9.3 | 9.9 | 17.0 | 18.2 | 19.3 | 20.1 | 22.0 | 0.14 |
+| | now, fixed 240 substeps/s | 14.7 | 10.3 | 10.9 | 11.5 | 20.4 | 22.0 | 22.6 | 24.9 | 0.39 |
+| Upside Down 512 × 288, 369 k mixed | before | 1.5 | 0.6 | 0.6 | 0.9 | 2.7 | 3.2 | 3.2 | 4.0 | 0.98 |
+| | now | 8.7 | 0.6 | 0.8 | 7.2 | 13.6 | 18.9 | 20.4 | 25.3 | 0.87 |
 
-| Map | Grid | Particles | ms per substep | Render ms | Real-time load | Frame rate left |
-|---|---|---|---|---|---|---|
-| Dam Break | 384x216 | 57,846 | 0.59 | 0.27 | 14 % | 3,194 fps |
-| Playground | 384x216 | 99,600 | 0.85 | 0.30 | 20 % | 2,662 fps |
-| Upside Down | 384x216 | 205,632 | 1.29 | 0.33 | 31 % | 2,124 fps |
-| Dam Break | 512x288 | 104,000 | 0.85 | 0.33 | 20 % | 2,389 fps |
-| Playground | 512x288 | 179,372 | 1.54 | 0.34 | 37 % | 1,857 fps |
-| Upside Down | 512x288 | 369,380 | 2.46 | 0.43 | 59 % | 955 fps |
-| Dam Break | 768x432 | 237,384 | 2.25 | 0.41 | 54 % | 1,120 fps |
-| Playground | 768x432 | 408,036 | 3.40 | 0.49 | 81 % | 378 fps |
-| Upside Down | 768x432 | 839,724 | 5.40 | 0.69 | 130 % | 0.77x speed |
-| Dam Break | 1024x576 | 424,534 | 3.75 | 0.66 | 90 % | 149 fps |
-| Playground | 1024x576 | 732,432 | 5.82 | 0.80 | 140 % | 0.72x speed |
-| Upside Down | 1024x576 | 1,498,496 | 9.34 | 1.15 | 224 % | 0.45x speed |
+Resting 1 M-particle pool, 1024 × 576, 6 simulated seconds (`sprout probe 250 --grid
+1024x576 --at 6`, same command on both): 10.2 s wall before, 3.7 s now, and it ends at rest
+(before: still moving at up to 2.5 cells/s).
 
-"Real-time load" is the share of each second needed to run one simulated second of
-substeps. "Frame rate left" is what the rest of the second renders at. Over 100 %, the
-scene cannot run at full speed on this GPU.
+Reading these honestly:
 
-In the actual window (1600x900, `--frames`):
+- **Simulated time per second is lower in fast scenes, and that is mostly the step count.**
+  The previous version took 240 substeps per simulated second whatever happened, and clipped
+  every particle to 600 cells/s to make that look stable. In the 1600 × 900 dam break the
+  impact jets reach 2000–3000 cells/s (0.1 % of the particles above 2000; the old code
+  produces the same jets once its clamp is lifted, and total energy never rises), so a step
+  that moves nothing more than 2 cells needs about 1600 substeps per simulated second. At
+  the old fixed rate the new solver costs 1.3 × (dam) to 1.8 × (playground) more per
+  simulated second; the rest of the gap is the steps the physics requires.
+- **Calm scenes are faster** (2.7 × on the resting pool): the CFL step there is 1/60 s.
+- **The frame rate holds near 60 fps** in heavy scenes: the app gives each frame fewer
+  substeps and slows simulated time instead, as before; the panel shows it.
+- **Small scenes now run at about 60–120 fps uncapped instead of 700–1100**: each frame
+  simulates its share in one or two long substeps rather than a fraction of a short one,
+  and a substep with converged solves costs more than an SOR sweep set.
 
-| Scene | Present mode | Frame rate | Frame time p99 | Simulation speed |
-|---|---|---|---|---|
-| Playground, 512x288, 179k particles | VSync | 165 fps | 7.4 ms | 1.00x |
-| Playground, 512x288, 179k particles | uncapped | 1,670 fps | 2.0 ms | 0.98x |
-| Upside Down, 512x288, 369k particles | uncapped | 679 fps | 3.2 ms | 0.99x |
-| Playground, 768x432, 408k particles | uncapped | 358 fps | 5.3 ms | 0.99x |
-| Upside Down, 768x432, 840k particles | uncapped | 60 fps | 18.8 ms | 0.74x |
-
-When a scene is too heavy, the app gives each frame fewer substeps: simulated time slows
-down and the frame rate holds near 60 fps, as in the last row. The panel says so when it
-happens.
-
-Where the time goes at 512x288 on Playground: about 40 % in the per-particle pass and the
-fixed grid passes, about 60 % in the pressure and viscosity sweeps (their share of command
-recording on the CPU included). Particles are re-sorted by cell every 128 substeps;
-without that a substep of Upside Down slows by a third over twenty seconds, as the fluid
-mixes and neighbours drift apart in memory.
+Where one substep goes (Dam Break 1600 × 900, GPU timestamps from `sprout profile`, ms):
+particles 2.7, pressure solve 5.6 (multigrid levels 3.9, Krylov vectors 1.7), viscosity
+(explicit, water) 0.6, surface tension 0.7, other grid passes 1.1; total 10.7. The pressure
+solve is bandwidth-bound on the finest level (roughly 370 bytes per cell per iteration).
+Recording a frame costs 0.1 ms of CPU.
 
 ## Limitations
 
-- **No surface tension.** Oil and water have no interfacial tension, so there are no
-  round droplets or beading, and a flat layer of water resting on oil starts seeping
-  through at once instead of waiting for fingers to form.
-- **Water never quite stops.** It has zero viscosity, so swirls and sloshing fade slowly:
-  ten seconds after a hard stir, half the energy is still there.
-- **The pressure solve is not run to convergence.** Thirty sweeps, warm-started, are
-  enough for the checks above, but violent large-scale motion leaves small errors that
-  the density correction then cleans up. Volume drifts by about half a percent.
-- **Fronts run ahead of the references**: 8–16 % in the dam break, 13 % in the viscous
-  current.
-- **Speed cap.** Particles move at most 2.5 cells per substep (600 cells/s). A fall from
-  the top of the default tank would reach about 740, so the fastest streams are clipped.
-  Solids thinner than about three cells can leak at such speeds.
-- **Fewer than 240 substeps per second is rougher.** At 120 the falling stream shows
-  occasional gaps.
+- **Fast flows at high resolution are expensive.** See Performance: the CFL step follows the
+  fastest jets. A larger CFL number trades accuracy (at CFL 4 the dam front moves by 2 % and
+  energy rises by 0.1 % between samples); particle sub-stepping would allow longer grid
+  steps but is not implemented.
+- **Oil–water capillary oscillation is off.** The static jump across an oil–water interface
+  is exact (1.002), but an oil drop in water oscillates 27 % slower than the inviscid theory
+  with the real oil viscosity, and 30 % faster with both fluids made inviscid, where it
+  should match. The dynamic error is not understood yet; `validate surface` reports it
+  without a pass/fail.
+- **Contact angles are biased** about 12° towards non-wetting (60° → 73°, 120° → 132°); there
+  is no hysteresis and no contact-line slip.
+- **Free surfaces sit about half a cell off** for viscosity (the free-slab shear decays 4 %
+  slow, as for a slab one cell thicker).
+- **Surface tension needs small cells to matter**: see the beading note above.
+- **Runs are not bit-reproducible**: the periodic particle sort orders particles within a
+  cell by atomics, and the crowding jitter depends on that order, so chaotic scenes
+  (the overturn) end slightly differently every run (oil-layer trapping 0.45–1 % at 40 s).
+  This was already true before.
 - **Air is nothing.** Trapped pockets have no pressure and collapse; there are no bubbles.
+  A tank filled to the lid has no pressure reference and is not supported.
 - **Solids are static**, and a tank is limited to four particles per cell of its area.
-  When it is full, pouring stops until something is erased.
-- **Tested on one machine.** NVIDIA on Linux only. Nothing is vendor-specific, but AMD,
-  Intel, Windows and macOS (through MoltenVK) are untried.
+  Solids thinner than about three cells can leak (particles move up to 2 cells per substep).
+- **Tested on one machine.** NVIDIA on Linux only; the solver needs subgroup arithmetic
+  (Vulkan 1.1).
 - No save or load, and no undo.
 
 ## Code layout
@@ -256,7 +355,7 @@ mixes and neighbours drift apart in memory.
 |---|---|
 | [src/world.rs](src/world.rs) | The sandbox world: solids plus the simulations living in it. New simulations plug in here. |
 | [src/scene.rs](src/scene.rs) | Shapes and their rasterisation into the fields the solver and renderer use |
-| [src/sim/](src/sim/mod.rs) | The fluid solver: buffers, pipelines, the substep |
+| [src/sim/](src/sim/mod.rs) | The fluid solver: buffers, pipelines, the substep; [params.rs](src/sim/params.rs) holds every material property; [raw.rs](src/sim/raw.rs) the hand-synchronised substep command buffers |
 | [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer. |
 | [src/render.rs](src/render.rs), [src/gui.rs](src/gui.rs) | Particle splatting and compositing; a small egui painter |
 | [src/app.rs](src/app.rs), [src/ui.rs](src/ui.rs), [src/pacing.rs](src/pacing.rs) | Window, input, panel, substep pacing |

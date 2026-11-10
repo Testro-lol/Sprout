@@ -1,0 +1,54 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+
+// Weights of the strain samples: cell (i, j) and node (i, j). Also marks the tiles that need
+// the implicit solve: those within one cell of a cell whose diffusion number reaches
+// IMPLICIT_MIN (the tile buffer is cleared before this pass).
+
+bool ok_u(int i) { return live_u(i) || closed_u(i); }
+bool ok_v(int i) { return live_v(i) || closed_v(i); }
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!in_grid(c)) return;
+    int i = cidx(c);
+    int W = P.grid.x;
+    float wc = 0.0, wn = 0.0;
+    if (interior(c)) {
+        vec4 me = cell[i];
+        if (me.w > 0.0 && ok_u(i) && ok_u(i + 1) && ok_v(i) && ok_v(i + W)) wc = 2.0 * S.dt * me.z;
+
+        // node (i, j): cells (i-1, j-1), (i, j-1), (i-1, j), (i, j)
+        int cs[4] = int[4](i - W - 1, i - W, i - 1, i);
+        int nliq = 0;
+        bool any_air = false;
+        float mu = 0.0;
+        for (int k = 0; k < 4; k++) {
+            vec4 q = cell[cs[k]];
+            if (q.w > 0.0) {
+                nliq++;
+                mu += q.z;
+            } else if (solid[cs[k]].w > 0.02) {
+                any_air = true;
+            }
+        }
+        if (nliq > 0 && !any_air && ok_u(i) && ok_u(i - W) && ok_v(i) && ok_v(i - 1)) {
+            wn = 4.0 * S.dt * (mu / float(nliq)) * (float(nliq) / 4.0);
+        }
+    }
+    vec4 o = vw[i];
+    o.xy = vec2(wc, wn);
+    vw[i] = o;
+    vec4 me = cell[i];
+    if (me.w > 0.0 && S.dt * me.z / max(me.y, 0.05) >= IMPLICIT_MIN) {
+        for (int b = -1; b <= 1; b++) {
+            for (int a = -1; a <= 1; a++) {
+                ivec2 n = clamp(c + ivec2(a, b), ivec2(0), P.grid - 1);
+                uint t = tile_of(n);
+                if (tiles[t] == 0u) atomicOr(tiles[t], 1u);
+            }
+        }
+    }
+}

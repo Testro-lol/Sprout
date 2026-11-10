@@ -125,16 +125,12 @@ pub fn shot(gpu: Arc<Gpu>, o: ShotOptions, apply: &dyn Fn(&mut crate::sim::SimPa
     apply(&mut world.sim.params);
     let mut off = Offscreen::new(gpu.clone(), o.size);
     let view = View::fit(o.grid, o.size);
-    let hz = world.sim.params.substep_hz;
     let start = Instant::now();
+    world.sim.step_blocking(0, ToolState::default());
     for (k, &t) in o.times.iter().enumerate() {
-        let target = (t * hz).round() as u64;
-        while world.sim.substeps_done() < target {
-            let n = (target - world.sim.substeps_done()).min(8) as u32;
-            world.sim.step_blocking(n, ToolState::default());
-        }
-        if world.sim.substeps_done() == 0 {
-            world.sim.step_blocking(0, ToolState::default());
+        let left = t as f64 - world.sim.sim_time();
+        if left > 0.0 {
+            world.sim.advance_blocking(left, ToolState::default());
         }
         let path = if o.times.len() == 1 { o.out.clone() } else { o.out.replace(".png", &format!("_{k}.png")) };
         if o.with_ui {
@@ -227,7 +223,7 @@ pub fn diagnose(ps: &[Particle], params: &SimParams) -> Diag {
         let rho = if p.kind == KIND_OIL { params.rho[2] } else { params.rho[0] + (params.rho[1] - params.rho[0]) * p.s };
         let v2 = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1];
         d.ke += 0.5 * rho * v2;
-        pe += (params.gravity * rho * p.pos[1]) as f64;
+        pe += (params.g_cells() * rho * p.pos[1]) as f64;
         d.max_speed = d.max_speed.max(v2.sqrt());
         d.mean_y += p.pos[1];
         d.max_x = d.max_x.max(p.pos[0]);
@@ -255,18 +251,30 @@ pub fn probe(gpu: Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), map:
     };
     apply(&mut world.sim.params);
     world.sim.step_blocking(0, ToolState::default());
-    let hz = world.sim.params.substep_hz;
-    let steps = (seconds * hz) as u32;
-    println!("probe: {} particles, {steps} substeps", world.sim.slots());
-    println!("{:>7} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9}", "t", "ke", "pe", "ke+pe", "max_speed", "mean_y", "top_y");
-    let every = (steps / 20).max(1);
-    for s in 0..=steps {
-        if s % every == 0 {
-            let d = diagnose(&world.sim.download_particles(), &world.sim.params);
-            println!("{:7.3} {:10.3} {:10.1} {:10.1} {:10.2} {:9.3} {:9.3}", s as f32 / hz, d.ke, d.pe, d.ke + d.pe, d.max_speed, d.mean_y, d.top_y);
+    let samples = 20;
+    println!("probe: {} particles, {seconds} s", world.sim.slots());
+    println!(
+        "{:>7} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9} {:>8} {:>6} {:>6}",
+        "t", "ke", "pe", "ke+pe", "max_speed", "mean_y", "top_y", "dt ms", "p it", "v it"
+    );
+    for s in 0..=samples {
+        let d = diagnose(&world.sim.download_particles(), &world.sim.params);
+        let st = world.sim.solver;
+        println!(
+            "{:7.3} {:10.3} {:10.1} {:10.1} {:10.2} {:9.3} {:9.3} {:8.3} {:6} {:6}",
+            world.sim.sim_time(), d.ke, d.pe, d.ke + d.pe, d.max_speed, d.mean_y, d.top_y, st.dt * 1e3,
+            st.pressure_iters_max, st.viscosity_iters_max
+        );
+        world.sim.solver.reset_extremes();
+        if s < samples {
+            world.sim.advance_blocking(seconds as f64 / samples as f64, ToolState::default());
         }
-        world.sim.step_blocking(1, ToolState::default());
     }
+    let st = world.sim.solver;
+    println!(
+        "substeps {}  unconverged pressure {} viscosity {}",
+        st.substeps, st.pressure_unconverged, st.viscosity_unconverged
+    );
     if let Some(path) = out {
         let size = [1280, 720];
         Offscreen::new(gpu, size).save_png(&world.sim, View::fit(grid, size), Path::new(path));
@@ -275,49 +283,69 @@ pub fn probe(gpu: Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), map:
 
 // ---- benchmark -----------------------------------------------------------------------
 
-fn time_substeps(world: &mut World, batches: u32, per_batch: u32) -> f64 {
-    let start = Instant::now();
-    for _ in 0..batches {
-        world.sim.step_blocking(per_batch, ToolState::default());
+/// Simulated time each benchmark frame asks for, s.
+const FRAME: f32 = 1.0 / 60.0;
+
+/// Runs `frames` frames of `FRAME` simulated seconds each, the way the app would record
+/// them (enough substeps at the last known step length), and returns the wall time of each
+/// frame in ms. Every frame is submitted and waited on.
+fn time_frames(world: &mut World, frames: u32) -> Vec<f64> {
+    let gpu = world.sim.gpu();
+    let mut out = Vec::with_capacity(frames as usize);
+    for _ in 0..frames {
+        let start = Instant::now();
+        let dt = world.sim.dt_estimate();
+        let n = if world.sim.params.fixed_hz > 0.0 { (FRAME / dt).round().max(1.0) as u32 } else { (FRAME / dt).ceil().max(1.0) as u32 };
+        let mut b = gpu.builder();
+        world.sim.record(&mut b, n, FRAME, ToolState::default());
+        submit_and_wait(&gpu, b);
+        world.sim.poll_readbacks();
+        out.push(start.elapsed().as_secs_f64() * 1e3);
     }
-    start.elapsed().as_secs_f64() * 1e3 / (batches * per_batch) as f64
+    out
+}
+
+fn pct(v: &[f64], q: f64) -> f64 {
+    let mut v = v.to_vec();
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[((v.len() - 1) as f64 * q) as usize]
 }
 
 /// Measures simulation and rendering throughput on a few workloads and prints a table.
 ///
-/// Every number is wall-clock time for work submitted and waited on, so it includes
-/// command recording on the CPU as well as GPU execution. (The app records the next frame
-/// while the GPU is still busy with the last one, so it does slightly better.)
+/// Each scene runs for `warmup` simulated seconds, then 120 frames of 1/60 s simulated time
+/// are timed (wall clock, submitted and waited on, CPU recording included). What matters is
+/// simulated time per wall-clock second: a solver that takes fewer, longer steps is only
+/// faster if it still covers the same simulated time.
 pub fn bench(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grids: &[[u32; 2]], maps: &[usize], size: [u32; 2], warmup: f32) {
     println!("device: {}", gpu.device_name());
     println!("render target: {}x{} (off-screen), each map measured after {warmup} s of simulated time\n", size[0], size[1]);
     println!(
-        "{:<14} {:>9} {:>10} | {:>9} {:>9} {:>9} | {:>8} | {:>9} {:>9}",
-        "map", "grid", "particles", "substep", "particles", "solve", "render", "real-time", "fps left"
+        "{:<14} {:>9} {:>10} | {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8} | {:>8} | {:>9}",
+        "map", "grid", "particles", "frame", "p50", "p95", "max", "substeps", "p iters", "render", "sim speed"
     );
-    println!("{:<14} {:>9} {:>10} | {:>9} {:>9} {:>9} | {:>8} | {:>9} {:>9}", "", "", "", "ms", "+ grid ms", "ms", "ms", "load", "");
+    println!(
+        "{:<14} {:>9} {:>10} | {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8} | {:>8} | {:>9}",
+        "", "", "", "mean ms", "ms", "ms", "ms", "/ sim s", "max", "ms", "x real"
+    );
     for &grid in grids {
         let mut off = Offscreen::new(gpu.clone(), size);
         let view = View::fit(grid, size);
         for &map in maps {
             let mut world = World::new(gpu.clone(), grid, map);
             apply(&mut world.sim.params);
-            let params = world.sim.params;
-            let hz = params.substep_hz;
-            let per_frame = (hz / 60.0).round().max(1.0) as u32;
-
+            world.sim.step_blocking(0, ToolState::default());
             // Let the scene get going: a moving, mixed fluid is the workload, not the
             // tidy lattice a map starts as.
-            time_substeps(&mut world, ((hz * warmup) as u32 / per_frame).max(1), per_frame);
+            time_frames(&mut world, ((warmup / FRAME) as u32).max(1));
 
-            let full = time_substeps(&mut world, 60, per_frame);
-            // Running every sweep twice costs exactly one more set of sweeps, which prices
-            // the iterative solves without disturbing the flow being measured.
-            world.sim.params.pressure_iters *= 2;
-            world.sim.params.viscosity_iters *= 2;
-            let solve = (time_substeps(&mut world, 30, per_frame) - full).max(0.0);
-            world.sim.params = params;
-            time_substeps(&mut world, 10, per_frame);
+            world.sim.solver.reset_extremes();
+            let (t0, s0) = (world.sim.sim_time(), world.sim.solver.substeps);
+            let frames = time_frames(&mut world, 120);
+            let wall: f64 = frames.iter().sum::<f64>() / 1e3;
+            let simulated = world.sim.sim_time() - t0;
+            let substeps = (world.sim.solver.substeps - s0) as f64 / simulated.max(1e-9);
+            let iters = world.sim.solver.pressure_iters_max;
 
             let start = Instant::now();
             let n = 60;
@@ -325,57 +353,61 @@ pub fn bench(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grids: &[[u32; 2]], 
                 off.draw(&world.sim, view);
             }
             let render = start.elapsed().as_secs_f64() * 1e3 / n as f64;
-
-            // Share of every second that simulating in real time takes, and the frame
-            // rate the rest of the second can render at.
-            let load = full * hz as f64 / 1e3;
-            let fps = if load < 1.0 { format!("{:.0}", (1.0 - load) * 1e3 / render) } else { format!("{:.2}x speed", 1.0 / load) };
+            let mean = frames.iter().sum::<f64>() / frames.len() as f64;
             println!(
-                "{:<14} {:>9} {:>10} | {:>9.3} {:>9.3} {:>9.3} | {:>8.3} | {:>8.0}% {:>9}",
+                "{:<14} {:>9} {:>10} | {:>8.2} {:>8.2} {:>8.2} {:>8.2} | {:>8.0} {:>8} | {:>8.3} | {:>9.2}",
                 crate::maps::MAPS[map].name,
                 format!("{}x{}", grid[0], grid[1]),
                 world.sim.slots(),
-                full,
-                full - solve,
-                solve,
+                mean,
+                pct(&frames, 0.5),
+                pct(&frames, 0.95),
+                pct(&frames, 1.0),
+                substeps,
+                iters,
                 render,
-                load * 100.0,
-                fps
+                simulated / wall
             );
         }
     }
     println!(
-        "\nsubstep: one full simulation step.  particles + grid: the per-particle pass and the fixed grid passes.\n\
-         solve: the pressure and viscosity sweeps.  real-time load: share of each second needed to run the\n\
-         substeps of one simulated second.  fps left: frame rate the remaining time renders at; where the load\n\
-         is over 100 % the app slows simulated time down instead, to the speed shown."
+        "\nframe: wall time to simulate 1/60 s (no rendering).  substeps: per simulated second (CFL-sized).\n\
+         p iters: most pressure iterations one substep needed.  sim speed: simulated seconds per wall second\n\
+         with the simulation alone; above 1 the scene can run in real time with time left to render."
     );
 }
 
-/// Splits the cost of a batch of substeps into CPU recording and GPU execution.
+/// Splits the cost of simulating 1/60 s frames into CPU recording and GPU execution.
 pub fn profile(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], map: usize, warmup: f32) {
     let mut world = World::new(gpu.clone(), grid, map);
     apply(&mut world.sim.params);
-    let per_frame = 4;
-    let batches = (warmup * world.sim.params.substep_hz) as u32 / per_frame;
-    time_substeps(&mut world, batches.max(1), per_frame);
+    world.sim.step_blocking(0, ToolState::default());
+    time_frames(&mut world, ((warmup / FRAME) as u32).max(1));
     let (mut rec, mut exec) = (0.0f64, 0.0f64);
     let n = 100;
+    let s0 = world.sim.solver.substeps;
     for _ in 0..n {
         let t0 = Instant::now();
+        let dt = world.sim.dt_estimate();
+        let steps = (FRAME / dt).ceil().max(1.0) as u32;
         let mut b = gpu.builder();
-        world.sim.record(&mut b, per_frame, ToolState::default());
+        world.sim.record(&mut b, steps, FRAME, ToolState::default());
         let cb = b.build().unwrap();
         let t1 = Instant::now();
         use vulkano::{command_buffer::PrimaryCommandBufferAbstract, sync::GpuFuture};
         cb.execute(gpu.queue.clone()).unwrap().then_signal_fence_and_flush().unwrap().wait(None).unwrap();
         let t2 = Instant::now();
+        world.sim.poll_readbacks();
         rec += (t1 - t0).as_secs_f64();
         exec += (t2 - t1).as_secs_f64();
     }
-    let k = 1e3 / (n * per_frame) as f64;
+    let substeps = (world.sim.solver.substeps - s0) as f64;
+    let passes = world.sim.profile_passes();
+    let line: Vec<String> = passes.iter().map(|(n, ms)| format!("{n} {ms:.3}")).collect();
+    println!("one substep, GPU ms by pass: {}", line.join(", "));
     println!(
-        "{} {}x{} {} particles: record {:.3} ms/substep, submit+execute {:.3} ms/substep",
-        crate::maps::MAPS[map].name, grid[0], grid[1], world.sim.slots(), rec * k, exec * k
+        "{} {}x{} {} particles: {:.1} substeps per frame; per frame: record {:.3} ms, submit+execute {:.3} ms; per substep: record {:.3} ms, execute {:.3} ms",
+        crate::maps::MAPS[map].name, grid[0], grid[1], world.sim.slots(), substeps / n as f64,
+        rec * 1e3 / n as f64, exec * 1e3 / n as f64, rec * 1e3 / substeps, exec * 1e3 / substeps
     );
 }

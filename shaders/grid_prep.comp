@@ -29,13 +29,13 @@ void main() {
     if (sol.x <= 0.0) {
         o.z = FACE_CLOSED;
     } else if (um >= MIN_FACE_MASS) {
-        o.x = (float(umom) / MOM_SCALE) / (float(um) / MASS_SCALE) / P.dt;
+        o.x = (float(umom) / MOM_SCALE) / (float(um) / MASS_SCALE) / S.dt;
         o.z = 0.0;
     }
     if (sol.y <= 0.0) {
         o.w = FACE_CLOSED;
     } else if (vm >= MIN_FACE_MASS) {
-        o.y = (float(vmom) / MOM_SCALE) / (float(vm) / MASS_SCALE) / P.dt - P.gravity * P.dt;
+        o.y = (float(vmom) / MOM_SCALE) / (float(vm) / MASS_SCALE) / S.dt - P.gravity * S.dt;
         o.w = 0.0;
     }
     vel[i] = o;

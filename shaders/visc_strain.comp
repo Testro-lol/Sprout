@@ -1,0 +1,33 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+
+// Weighted strain W G x of a face vector: x = the current velocities (mode 0) or the
+// search direction (mode 1).
+
+float U(int i) { return live_u(i) ? (V.mode == 0u ? vel[i].x : vp[i].x) : 0.0; }
+float Vv(int i) { return live_v(i) ? (V.mode == 0u ? vel[i].y : vp[i].y) : 0.0; }
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (V.mode != 0u && !tile_active()) return;
+    if (!in_grid(c)) return;
+    int i = cidx(c);
+    int W = P.grid.x;
+    vec4 o = vec4(0.0);
+    vec4 w = vw[i];
+    if (w.x > 0.0) {
+        o.x = w.x * (U(i + 1) - U(i));
+        o.y = w.x * (Vv(i + W) - Vv(i));
+    }
+    if (w.y > 0.0) {
+        float ua = U(i), ub = U(i - W), va = Vv(i), vb = Vv(i - 1);
+        if (closed_u(i) && live_u(i - W)) ua = -ub;
+        if (closed_u(i - W) && live_u(i)) ub = -ua;
+        if (closed_v(i) && live_v(i - 1)) va = -vb;
+        if (closed_v(i - 1) && live_v(i)) vb = -va;
+        o.z = w.y * 0.5 * ((ua - ub) + (va - vb));
+    }
+    vs[i] = o;
+}

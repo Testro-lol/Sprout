@@ -24,7 +24,7 @@ use crate::{
     gpu::Gpu,
     gui::GuiPainter,
     maps::MAPS,
-    pacing::Pacer,
+    pacing::{Pacer, Plan},
     render::{Cursor, Renderer, View},
     scene::Shape,
     selftest::{self, Act, Snapshot},
@@ -449,9 +449,18 @@ impl App {
         if t.is_empty() {
             return;
         }
+        // Raw frame times (seconds, warm-up skipped) for offline comparison of runs.
+        if let Ok(path) = std::env::var("SPROUT_FRAMES_CSV") {
+            let body: String = t.iter().map(|x| format!("{x}\n")).collect();
+            let _ = std::fs::write(path, body);
+        }
         t.sort_by(|a, b| a.total_cmp(b));
         let mean = t.iter().sum::<f32>() / t.len() as f32;
         let pct = |q: f32| t[((t.len() - 1) as f32 * q) as usize] * 1e3;
+        println!(
+            "frame time percentiles (ms): p5 {:.2}  p25 {:.2}  p50 {:.2}  p75 {:.2}  p90 {:.2}  p95 {:.2}  p99 {:.2}",
+            pct(0.05), pct(0.25), pct(0.5), pct(0.75), pct(0.9), pct(0.95), pct(0.99)
+        );
         let size = win.size();
         println!(
             "window {}x{}  grid {}x{}  {} particle slots  present {:?}",
@@ -524,14 +533,16 @@ impl App {
         let frame_dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
         self.ui.frame_times.push(frame_dt);
-        let dt = self.world.sim.params.dt();
-        let mut substeps = 0;
+        let dt = self.world.sim.dt_estimate();
+        let fixed = self.world.sim.params.fixed_hz > 0.0;
+        let mut plan = Plan { substeps: 0, target: 0.0, expected: 0.0 };
         if !self.ui.paused {
-            substeps = self.pacer.substeps(frame_dt, dt, self.ui.time_scale, win.slow_frame());
+            plan = self.pacer.plan(frame_dt, dt, fixed, self.ui.time_scale, win.slow_frame());
         } else if self.step_once {
-            substeps = 1;
+            plan = Plan { substeps: 1, target: dt, expected: dt };
         }
         self.step_once = false;
+        let substeps = plan.substeps;
         self.ui.substeps = substeps;
         self.ui.speed = if self.ui.paused { 1.0 } else { self.pacer.speed() };
 
@@ -554,7 +565,7 @@ impl App {
         } else if input.left && self.ui.tool == Tool::Pour {
             // The stream is laid out for the time the simulation is about to advance, so
             // nothing pours while paused (single steps still do).
-            let elapsed = substeps as f32 * dt;
+            let elapsed = plan.expected;
             let nozzle = Nozzle {
                 material: self.ui.material,
                 from: input.prev_world,
@@ -586,7 +597,7 @@ impl App {
 
         // ---- record ----------------------------------------------------------------
         let mut b = self.gpu.builder();
-        self.world.sim.record(&mut b, substeps, tool);
+        self.world.sim.record(&mut b, substeps, plan.target, tool);
         self.world.sim.poll_stats();
         if self.frame_index.is_multiple_of(15) {
             self.world.sim.request_stats(&mut b);

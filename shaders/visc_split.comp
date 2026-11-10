@@ -1,0 +1,38 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+
+// Hands the inactive tiles (no cell reaches IMPLICIT_MIN) their explicit viscous step,
+// u = u* - M^-1 G^T W G u*, from the strain of u* computed just before over the whole grid,
+// then takes them out of the implicit system: zero weights, strain and Krylov vectors, so
+// their rows read M u = M u* and conjugate gradients never has to visit them. Faces that
+// touch a cell above the threshold are always in an active tile (one-cell halo).
+
+vec2 gts(int i) {
+    int W = P.grid.x;
+    vec2 g = vec2(0.0);
+    if (live_u(i)) {
+        float c1 = closed_u(i - W) ? 1.0 : 0.5, c2 = closed_u(i + W) ? -1.0 : -0.5;
+        g.x = vs[i - 1].x - vs[i].x + vs[i].z * c1 + vs[i + W].z * c2;
+    }
+    if (live_v(i)) {
+        float d1 = closed_v(i - 1) ? 1.0 : 0.5, d2 = closed_v(i + 1) ? -1.0 : -0.5;
+        g.y = vs[i - W].y - vs[i].y + vs[i].z * d1 + vs[i + 1].z * d2;
+    }
+    return g;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!in_grid(c) || tile_active()) return;
+    int i = cidx(c);
+    if (interior(c)) {
+        vec2 g = gts(i);
+        vec4 cf = coef[i];
+        vec4 v = vel[i];
+        if (live_u(i)) v.x -= g.x / cf.z;
+        if (live_v(i)) v.y -= g.y / cf.w;
+        vel[i] = v;
+    }
+}

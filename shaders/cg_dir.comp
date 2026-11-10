@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "mg.glsl"
+
+// p = z + beta p.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!inside_f(c)) return;
+    int i = fidx(c);
+    cgp[i] = mgd[i] > 0.0 ? mgx[i] + K.p_beta * cgp[i] : vec2(0.0);
+}

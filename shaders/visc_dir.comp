@@ -1,0 +1,14 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+
+// p = r / diag + beta p.
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!tile_active()) return;
+    if (!in_grid(c)) return;
+    int i = cidx(c);
+    vp[i] = interior(c) ? vr[i] / vw[i].zw + K.v_beta * vp[i] : vec2(0.0);
+}

@@ -8,7 +8,7 @@ use crate::{
     maps::MAPS,
     render::View,
     scene::Shape,
-    sim::{Material, SimParams},
+    sim::{Material, SimParams, SolverStats},
     world::World,
 };
 
@@ -163,30 +163,44 @@ fn tool_row(ui: &mut egui::Ui, state: &mut UiState, tools: &[(Tool, &str, &str)]
     });
 }
 
-fn physics(ui: &mut egui::Ui, p: &mut SimParams) {
+fn physics(ui: &mut egui::Ui, p: &mut SimParams, solver: &SolverStats) {
     let d = SimParams::default();
+    // Material properties are edited in physical units; the solver converts them.
     egui::Grid::new("physics").num_columns(2).show(ui, |ui| {
         ui.label("Gravity");
-        ui.add(egui::Slider::new(&mut p.gravity, 0.0..=2500.0).suffix(" cells/s²"));
+        ui.add(egui::Slider::new(&mut p.gravity, 0.0..=25.0).suffix(" m/s²"));
         ui.end_row();
-        ui.label("Syrup viscosity");
-        ui.add(egui::Slider::new(&mut p.nu[1], 1.0..=5000.0).logarithmic(true));
+        ui.label("Cell size");
+        ui.add(egui::Slider::new(&mut p.cell_size, 0.0005..=0.05).logarithmic(true).suffix(" m"))
+            .on_hover_text("Physical size of one grid cell. Smaller cells make surface tension matter more.");
         ui.end_row();
-        ui.label("Oil viscosity");
-        ui.add(egui::Slider::new(&mut p.nu[2], 0.1..=1000.0).logarithmic(true));
+        for (i, name) in ["Water", "Syrup", "Oil"].iter().enumerate() {
+            ui.label(format!("{name} viscosity"));
+            ui.add(egui::Slider::new(&mut p.nu[i], 1e-7..=0.5).logarithmic(true).suffix(" m²/s"));
+            ui.end_row();
+        }
+        for (i, name) in ["Water", "Syrup", "Oil"].iter().enumerate() {
+            ui.label(format!("{name}-air tension"));
+            ui.add(egui::Slider::new(&mut p.sigma[i], 0.0..=0.2).suffix(" N/m"));
+            ui.end_row();
+        }
+        ui.label("Oil-water tension");
+        ui.add(egui::Slider::new(&mut p.sigma_oil, 0.0..=0.1).suffix(" N/m"));
         ui.end_row();
-        ui.label("Water viscosity");
-        ui.add(egui::Slider::new(&mut p.nu[0], 0.0..=100.0));
-        ui.end_row();
+        for (i, name) in ["Water", "Syrup", "Oil"].iter().enumerate() {
+            ui.label(format!("{name} contact angle"));
+            ui.add(egui::Slider::new(&mut p.contact_angle[i], 0.0..=180.0).suffix("°"));
+            ui.end_row();
+        }
         ui.label("Syrup density");
-        ui.add(egui::Slider::new(&mut p.rho[1], 1.0..=2.5));
+        ui.add(egui::Slider::new(&mut p.rho[1], 1.0..=2.5).suffix(" × water"));
         ui.end_row();
         ui.label("Oil density");
-        ui.add(egui::Slider::new(&mut p.rho[2], 0.4..=1.0));
+        ui.add(egui::Slider::new(&mut p.rho[2], 0.4..=1.0).suffix(" × water"));
         ui.end_row();
-        ui.label("Oil separation");
-        ui.add(egui::Slider::new(&mut p.sep_tau, 0.0..=1.0).suffix(" s"))
-            .on_hover_text("How quickly oil droplets too small for the grid rise out of water and syrup.");
+        ui.label("Oil droplet size");
+        ui.add(egui::Slider::new(&mut p.droplet, 0.1..=4.0).suffix(" cells"))
+            .on_hover_text("Size of oil droplets too small for the grid; they rise out of water at their terminal velocity.");
         ui.end_row();
         ui.label("Syrup mixing");
         ui.add(egui::Slider::new(&mut p.diffuse, 0.0..=20.0).suffix(" /s"))
@@ -195,14 +209,20 @@ fn physics(ui: &mut egui::Ui, p: &mut SimParams) {
     });
     ui.separator();
     egui::Grid::new("solver").num_columns(2).show(ui, |ui| {
-        ui.label("Substeps / s");
-        ui.add(egui::Slider::new(&mut p.substep_hz, 60.0..=960.0).step_by(30.0));
+        ui.label("CFL number");
+        ui.add(egui::Slider::new(&mut p.cfl, 0.2..=2.0)).on_hover_text("Most cells a particle may move per substep.");
         ui.end_row();
-        ui.label("Pressure sweeps");
-        ui.add(egui::Slider::new(&mut p.pressure_iters, 4..=200));
+        ui.label("Pressure tolerance");
+        ui.add(egui::Slider::new(&mut p.pressure_tol, 1e-6..=1e-2).logarithmic(true));
         ui.end_row();
-        ui.label("Viscosity sweeps");
-        ui.add(egui::Slider::new(&mut p.viscosity_iters, 0..=40));
+        ui.label("Viscosity tolerance");
+        ui.add(egui::Slider::new(&mut p.viscosity_tol, 1e-5..=1e-1).logarithmic(true));
+        ui.end_row();
+        ui.label("Substep");
+        ui.label(format!("{:.2} ms (CFL {:.2} ms)", solver.dt * 1e3, solver.dt_cfl * 1e3));
+        ui.end_row();
+        ui.label("Iterations");
+        ui.label(format!("pressure {}, viscosity {}", solver.pressure_iters_max, solver.viscosity_iters_max));
         ui.end_row();
     });
     if ui.button("Restore defaults").clicked() {
@@ -324,7 +344,10 @@ pub fn build(ctx: &egui::Context, state: &mut UiState, world: &mut World) -> UiA
             );
 
             // ---- settings ----------------------------------------------------------
-            ui.collapsing("Physics", |ui| physics(ui, &mut world.sim.params));
+            ui.collapsing("Physics", |ui| {
+                let solver = world.sim.solver;
+                physics(ui, &mut world.sim.params, &solver);
+            });
             ui.collapsing("Display", |ui| {
                 let mut selected = state.grid;
                 let current = GRIDS

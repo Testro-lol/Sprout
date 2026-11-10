@@ -1,0 +1,37 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Smoothed indicator fields for surface tension: liquid volume fraction (liquid vs air)
+// and oil volume fraction (oil vs the aqueous phase). Particle occupancy is noisy at the
+// particle scale; a 5 x 5 binomial filter, renormalised over open cells so that solids do
+// not read as air, makes it smooth enough to take curvature from. Solids are excluded
+// rather than counted, which on its own is a 90 degree contact angle; surf_curv bends the
+// normals at walls to the configured angle.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const float B5[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    vec2 sum = vec2(0.0);
+    float wsum = 0.0;
+    for (int b = -2; b <= 2; b++) {
+        for (int a = -2; a <= 2; a++) {
+            ivec2 n = c + ivec2(a, b);
+            if (any(lessThan(n, ivec2(0))) || any(greaterThanEqual(n, P.grid))) continue;
+            int j = cidx(n);
+            float open = solid[j].w;
+            if (open <= 0.02) continue;
+            float phi = clamp(cell[j].x / (P.rest_phi * open), 0.0, 1.0);
+            float w = B5[a + 2] * B5[b + 2];
+            sum += w * vec2(phi, phi * comp[j].y);
+            wsum += w;
+        }
+    }
+    vec4 o = surf[cidx(c)];
+    o.xy = wsum > 0.0 ? sum / wsum : vec2(0.0);
+    surf[cidx(c)] = o;
+}

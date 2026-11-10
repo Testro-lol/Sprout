@@ -1,0 +1,91 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Curvature kappa = div(n) of both smoothed indicators, n the outward unit normal
+// (-grad f / |grad f|), taken at the four corners of each cell and differenced across it.
+// Positive kappa is a convex liquid (or oil) surface, whose inside pressure is higher.
+//
+// Wetting: at corners within a cell of a solid the liquid-air normal is replaced by the
+// one the contact angle prescribes (Brackbill, Kothe & Zemach 1992):
+//   n = n_wall cos(theta) + t_wall sin(theta),
+// n_wall pointing out of the solid and t_wall the in-wall direction away from the liquid.
+// This is the minimal static-contact-angle model: no hysteresis and no contact-line
+// mobility model; how fast a contact line can move is left to the wall boundary
+// condition of the viscosity solve (no-slip, so syrup lines creep and water lines slide).
+//
+// Curvature is only kept where the interface is resolved (a clear gradient) and is
+// limited to kappa_max: radii below about two cells are not representable on this grid,
+// and particle noise there would otherwise become huge pressure jumps.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const float G_MIN = 0.05;   // smallest |grad f| (per cell) counted as an interface
+
+float field(ivec2 c, int k) {
+    c = clamp(c, ivec2(0), P.grid - 1);
+    vec4 s = surf[cidx(c)];
+    return k == 0 ? s.x : s.y;
+}
+
+vec2 grad_node(ivec2 n, int k) {
+    float a = field(n, k), b = field(n - ivec2(1, 0), k), d = field(n - ivec2(0, 1), k), e = field(n - ivec2(1, 1), k);
+    return vec2(0.5 * (a + d - b - e), 0.5 * (a + b - d - e));
+}
+
+float node_sdf(ivec2 n) {
+    n = clamp(n, ivec2(0), P.grid);
+    return sdf[n.y * (P.grid.x + 1) + n.x];
+}
+
+// Contact angle of the liquid in the cells around node n: cos, sin.
+vec2 contact(ivec2 n) {
+    vec4 m = comp[cidx(clamp(n, ivec2(0), P.grid - 1))];
+    vec2 aq = mix(P.contact_aq.xy, P.contact_aq.zw, m.z);
+    vec2 cs = mix(aq, P.contact_oil.xy, m.y);
+    return normalize(cs);
+}
+
+vec2 normal_node(ivec2 n, int k, out float mag) {
+    vec2 g = grad_node(n, k);
+    mag = length(g);
+    if (mag < G_MIN) return vec2(0.0);
+    vec2 nn = -g / mag;
+    if (k == 0) {
+        float d = node_sdf(n);
+        if (d < 1.5) {
+            vec2 gw = vec2(node_sdf(n + ivec2(1, 0)) - node_sdf(n - ivec2(1, 0)), node_sdf(n + ivec2(0, 1)) - node_sdf(n - ivec2(0, 1)));
+            if (length(gw) > 1e-4) {
+                vec2 nw = normalize(gw);
+                vec2 t = nn - dot(nn, nw) * nw;
+                if (length(t) > 1e-4) {
+                    t = normalize(t);
+                    vec2 cs = contact(n);
+                    nn = cs.x * nw + cs.y * t;
+                }
+            }
+        }
+    }
+    return nn;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    float kmax = P.contact_oil.z;
+    vec2 kappa = vec2(0.0);
+    for (int k = 0; k < 2; k++) {
+        float m00, m10, m01, m11;
+        vec2 n00 = normal_node(c, k, m00);
+        vec2 n10 = normal_node(c + ivec2(1, 0), k, m10);
+        vec2 n01 = normal_node(c + ivec2(0, 1), k, m01);
+        vec2 n11 = normal_node(c + ivec2(1, 1), k, m11);
+        if (0.25 * (m00 + m10 + m01 + m11) < G_MIN) continue;
+        float kap = 0.5 * (n10.x + n11.x - n00.x - n01.x) + 0.5 * (n01.y + n11.y - n00.y - n10.y);
+        kappa[k] = clamp(kap, -kmax, kmax);
+    }
+    int i = cidx(c);
+    vec4 o = surf[i];
+    o.zw = kappa;
+    surf[i] = o;
+}

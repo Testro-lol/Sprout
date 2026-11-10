@@ -1,0 +1,30 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+#include "reduce.glsl"
+
+// u += alpha p, r -= alpha q, and the partial sums of r.z and r.r with z = r / diag.
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (!tile_active()) {
+        if (gl_LocalInvocationIndex == 0u) part[group_slot()] = vec4(0.0);
+        return;
+    }
+    vec4 acc4 = vec4(0.0);
+    if (in_grid(c) && interior(c)) {
+        int i = cidx(c);
+        float a = K.v_alpha;
+        vec4 v = vel[i];
+        vec2 p = vp[i];
+        if (live_u(i)) v.x += a * p.x;
+        if (live_v(i)) v.y += a * p.y;
+        vel[i] = v;
+        vec2 r = vr[i] - a * vq[i];
+        vr[i] = r;
+        vec2 z = r / vw[i].zw;
+        acc4 = vec4(dot(r, z), dot(r, r), 0.0, 0.0);
+    }
+    group_sum(acc4, group_slot());
+}

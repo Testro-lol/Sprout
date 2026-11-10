@@ -6,6 +6,8 @@ description = "Sprout: a fast, interactive 2D multi-fluid sandbox (Rust + Vulkan
 
 [dependencies]
 vulkano = "0.35"
+# Same version vulkano uses; only for the raw command-buffer handle type (src/sim/raw.rs).
+ash = { version = "=0.38.0", default-features = false }
 winit = "0.30"
 egui = "0.31"
 egui-winit = { version = "0.31", default-features = false, features = ["wayland", "x11"] }

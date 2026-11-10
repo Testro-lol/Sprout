@@ -1,0 +1,49 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Picks the length of the next substep, on the GPU, from the velocities of the last one.
+//
+//   dt = cfl / (u_max + sqrt(5 g dx))      (Bridson, "Fluid Simulation for Computer Graphics")
+//
+// u_max is the fastest of: any face velocity after the last projection (what the next
+// gather interpolates from), any particle's actual displacement speed in the last advection
+// (velocity + density correction + oil slip), and what the mouse tool or a pour will impose.
+// The sqrt(5 g dx) term keeps a step from rest short enough that gravity cannot carry a
+// particle further than the CFL limit within it. dt_max (on the CPU) also includes the
+// capillary limit of explicit surface tension.
+//
+// Within a batch the remaining simulated time is spread evenly over the remaining recorded
+// substeps, so a batch lands exactly on its target unless the CFL limit forbids it; in that
+// case it falls short and the CPU sees `advanced` < its target.
+
+layout(local_size_x = 1) in;
+
+void main() {
+    float u = max(uintBitsToFloat(S.umax_grid), uintBitsToFloat(S.umax_part));
+    u = max(u, P.ext_speed);
+    float dt_cfl = P.cfl / (u + sqrt(5.0 * max(P.gravity, 0.0)) + 1e-6);
+    float dt;
+    if (P.dt_fixed > 0.0) {
+        dt = P.dt_fixed;
+    } else {
+        uint left = S.batch_steps > S.batch_done ? S.batch_steps - S.batch_done : 1u;
+        dt = min(min(dt_cfl, P.dt_max), max(S.frame_left, 0.0) / float(left));
+    }
+    dt = max(dt, 1e-6);
+    S.dt_prev = S.dt > 0.0 ? S.dt : dt;
+    S.dt = dt;
+    S.dt_cfl = min(dt_cfl, P.dt_max);
+    S.umax_seen = u;
+    S.frame_left -= dt;
+    // Cumulative simulated time since the last reset, Kahan-compensated (lo in pad0).
+    float lo = uintBitsToFloat(S.pad0);
+    float y = dt - lo;
+    float t = S.advanced + y;
+    S.pad0 = floatBitsToUint((t - S.advanced) - y);
+    S.advanced = t;
+    S.batch_done += 1u;
+    S.substeps += 1u;
+    S.umax_grid = 0u;
+    S.umax_part = 0u;
+}
