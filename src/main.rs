@@ -26,7 +26,7 @@ USAGE:
     sprout shot OUT.png [OPTIONS]    render a map off-screen
     sprout bench [OPTIONS]           measure simulation and rendering throughput
     sprout validate [TEST]           run the physics and tool checks (hydrostatic, dam, ritter, layers,
-                                     viscosity, viscous, buoyancy, surface, settle, convergence, tools)
+                                     viscosity, viscous, buoyancy, surface, settle, convergence, pour, current, tools)
     sprout --selftest                drive the real window through every tool and control
     sprout maps                      list the built-in maps
 
