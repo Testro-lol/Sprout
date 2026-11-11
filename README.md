@@ -433,8 +433,11 @@ What the numbers say about the originally reported problems:
   limit is 0.7 ms, so the map runs well below real time (1.2 simulated seconds take about
   8 s), which suits it: a centimetre drop rises in a fraction of a second.
 
-`sprout --selftest` drives the real window through every tool and key (27 checks, all pass).
-`cargo test` covers the CPU side: 23 tests, all pass. `cargo clippy` is clean.
+`sprout --selftest` drives the real window through every tool and key (30 checks). On the
+GPU the 27 checks of the previous round all passed; the 30 have only been run on the
+software renderer, where 29 pass and "grab / stir" fails, as it does there for the previous
+commit too (as does `validate tools`' "refilled pool does not clump", 13 against < 12).
+`cargo test` covers the CPU side: 33 tests, all pass. `cargo clippy` is clean.
 
 ## Performance
 
@@ -562,7 +565,7 @@ Reading these honestly:
 | [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer. |
 | [src/render.rs](src/render.rs), [src/gui.rs](src/gui.rs) | Particle splatting and compositing; a small egui painter |
 | [src/app.rs](src/app.rs), [src/ui.rs](src/ui.rs), [src/camera.rs](src/camera.rs), [src/pacing.rs](src/pacing.rs) | Window and input; panel and canvas overlays; eased camera; substep pacing |
-| [src/brush.rs](src/brush.rs) | Brush strokes and the admission of new liquid (CPU only) |
+| [src/brush.rs](src/brush.rs) | Brush strokes, the stream of the pour and the jet, and the admission of new liquid (CPU only) |
 | [src/maps.rs](src/maps.rs) | Built-in maps |
 | [src/validate.rs](src/validate.rs), [src/selftest.rs](src/selftest.rs), [src/headless.rs](src/headless.rs) | Checks, benchmarks, screenshots |
 | [tools/drop_modes.py](tools/drop_modes.py) | Reference periods for the oil-drop oscillation check (viscous normal modes; plain Python) |
