@@ -443,6 +443,7 @@ impl App {
             center: self.camera.target().center,
             brush: self.ui.brush,
             currents: self.world.currents().len(),
+            drift: ps.iter().map(|p| p.vel[0]).sum::<f32>() / ps.len().max(1) as f32,
             jet_angle: self.ui.jet_angle,
             panel: self.ui.show_panel,
         }

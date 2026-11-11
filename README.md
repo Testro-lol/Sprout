@@ -363,6 +363,26 @@ not applicable to that version.
 | Tools: pour, erase, recycle, grab, solids | all pass | all pass | all pass | |
 | Run-to-run spread, layers and overturn | present | trapped share 0.51 – 1.69 % | none (identical output) | none |
 
+The pour and the current were added after that table and have only been measured on a
+software renderer (llvmpipe, no GPU); the GPU columns above were not re-measured, and
+neither was performance. `sprout validate pour` and `sprout validate current`, 512 × 288:
+
+| Check | Measured | Expected |
+|---|---|---|
+| Pour held 1 s at 12000 /s (18 cells wide, 167 cells/s): particles | 11857 | 11861 (12000 less the corners still to cross the round nozzle) |
+| Same: largest gap along the stream, particles outside its width | 0.26 cells, 0.00 % | < 1, < 0.5 % |
+| Same: gain of v² between 40 and 130 cells below the spout | 0.993 of 2 g h (288 → 508 cells/s) | 1 |
+| Same: width × speed × 4 at those heights | 11558 and 12109 /s | 12000 |
+| Same: top of the stream above the brush centre, middle / sides | 6.1 / 1.7 cells | round: about 6.2 (9 less a frame's travel), under 3 |
+| Same at 15 frames/s: particles, gap | 11857, 0.33 cells | as at 60 |
+| Brush sweeping at 240 cells/s | 9924 | below 12000: the nozzle overruns its own liquid |
+| Trickle, 2000 /s (8.3 cells wide at 60 cells/s) | 1969, gap 0.17 cells | 1971 |
+| Spout 20 cells under a pool, 1 s | 6516 of 12000, fullest cell 10 | held back, < 12 (rest 4) |
+| Current (150 cells/s, radius 14) in a 60 cell pool, 3 s: speed along it in the zone | 63 cells/s mean, 126 fastest | driven, never above 150 |
+| Same: particles, flow above and below the zone | 121440 → 121440, −64 cells/s | conserved, returning |
+| Same, 3 s after removing it: kinetic energy | 611 → 326 | falling |
+| Stream falling through a sideways current: sideways / downward speed below it | 56 / 463 cells/s (without: 0 / 462) | pushed aside, fall unchanged |
+
 Notes on what changed in the checks themselves, so the columns can be compared fairly:
 
 - **Oil drop oscillation.** The earlier "30 % fast inviscid, 27 % slow viscous" figures were

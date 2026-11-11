@@ -24,6 +24,8 @@ pub struct Snapshot {
     pub center: [f32; 2],
     pub brush: f32,
     pub currents: usize,
+    /// Mean horizontal velocity of the liquid, cells/s.
+    pub drift: f32,
     pub jet_angle: f32,
     pub jet_speed: f32,
     pub radial_speed: f32,
@@ -156,18 +158,18 @@ pub fn script() -> Vec<(u64, Act)> {
     s.mark().drag(MouseButton::Left, [340.0, 180.0], [400.0, 180.0], 20);
     s.check("jet emits (J)", |m, s| s.particles > m.particles);
 
-    // A current placed in the pool (Z, click) stirs it without adding liquid; X removes it.
-    s.wait(120).mark().key(KeyZ).click([256.0, floor]).wait(90);
-    s.check("place a current (Z)", |m, s| s.currents == 1 && s.particles == m.particles && s.rms_speed > m.rms_speed);
-    s.mark().key(KeyX).click([256.0, floor]).wait(5);
-    s.check("remove the current (X)", |m, s| s.currents == 0 && s.shapes == m.shapes);
-
     // Reset, next map, and a change of resolution with fluid on screen.
     s.mark().key(KeyR).wait(5).check("reset the map (R)", |m, s| s.particles == 0 && s.shapes == 0 && s.map == m.map);
     // Isolate repulsion from gravity and other liquid: a fresh round blob.
     s.key(Space).key(KeyC).click([360.0, 180.0]).key(KeyV).mark();
     s.key(Space).push(Act::Press(MouseButton::Left)).wait(8).push(Act::Release(MouseButton::Left));
     s.check("push repels without adding liquid (V)", |m, s| s.particles == m.particles && s.radial_speed > m.radial_speed + 10.0);
+    // A blob dropped through a current that points right (Z, click) is carried right; X
+    // removes the current.
+    s.key(KeyR).wait(5).mark().key(KeyZ).click([256.0, 110.0]).key(KeyC).click([256.0, 150.0]).wait(30);
+    s.check("a current carries liquid along (Z)", |m, s| s.currents == 1 && s.particles > m.particles && s.drift > 5.0);
+    s.mark().key(KeyX).click([256.0, 110.0]).wait(3);
+    s.check("remove the current (X)", |m, s| s.currents == 0 && s.particles == m.particles);
     s.key(KeyR).wait(5).key(KeyJ).push(Act::Move([256.0, 140.0])).wait(2).push(Act::Press(MouseButton::Left));
     s.wait(120).mark().wait(360);
     s.check("held jet keeps outlet power after 3s", |m, s| s.jet_speed > 100.0 && s.jet_speed > m.jet_speed * 0.7 && s.particles > m.particles);
