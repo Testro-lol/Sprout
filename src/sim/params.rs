@@ -292,13 +292,47 @@ impl SimParams {
 /// Speed the push tool drives liquid outwards at, cells/s (carried in `ToolState::vel[0]`).
 pub const PUSH_SPEED: f32 = 220.0;
 
+/// Most currents a world can hold (the size of the arrays in `GpuParams`).
+pub const MAX_CURRENTS: usize = 8;
+/// How fast a current brings liquid up to its speed, 1/s, at its centre and full strength.
+/// Slow enough that one substep adds a small share of the speed, so the next substep's CFL
+/// limit (taken from the velocities measured in this one) keeps up with it.
+pub const CURRENT_RATE: f32 = 12.0;
+/// Speed of a current at 100 % strength, cells/s.
+pub const CURRENT_SPEED: f32 = 150.0;
+
+/// A current: a round zone, fixed in the world, that drives the liquid passing through it
+/// along `vel`. Only the velocity component along the current is raised towards its speed
+/// (at `rate` per second in the centre, fading to nothing at the rim); liquid already
+/// faster, and motion across the current, are left alone. So it works like a pump or a
+/// fan: it never brakes, and never adds or removes liquid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Current {
+    pub pos: [f32; 2],
+    pub radius: f32,
+    /// Direction and speed the liquid is driven towards, cells/s.
+    pub vel: [f32; 2],
+    /// 1/s; see `CURRENT_RATE`.
+    pub rate: f32,
+}
+
+impl Current {
+    /// A current at `pos` flowing `degrees` clockwise from straight down, at `strength`
+    /// times `CURRENT_SPEED`.
+    pub fn new(pos: [f32; 2], radius: f32, degrees: f32, strength: f32) -> Current {
+        let (s, c) = degrees.to_radians().sin_cos();
+        let speed = CURRENT_SPEED * strength;
+        Current { pos, radius, vel: [s * speed, -c * speed], rate: CURRENT_RATE }
+    }
+}
+
 /// What the mouse is doing to the fluid this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ToolState {
     pub pos: [f32; 2],
     pub vel: [f32; 2],
     pub radius: f32,
-    /// 0 = idle, 1 = grab / stir, 2 = erase, 3 = push (speed in `vel[0]`), 4 = jet nozzle.
+    /// 0 = idle, 1 = grab / stir, 2 = erase, 3 = push (speed in `vel[0]`), 4 = stream nozzle.
     pub mode: i32,
     pub strength: f32,
 }
@@ -319,10 +353,10 @@ impl ToolState {
         ToolState { pos, vel: [PUSH_SPEED, 0.0], radius, mode: 3, strength: 40.0 }
     }
 
-    /// Holds the liquid inside a stream's nozzle (faucet or jet) at the launch velocity
-    /// `vel`. Rows then leave at exactly the speed they were laid out for, so consecutive
-    /// frames join without a gap (left alone, new rows take up the faster flow of the
-    /// accelerating stream below at once and run ahead); and a nozzle whose outlet is
+    /// Holds the liquid inside a stream's nozzle (pour or jet) at the launch velocity `vel`.
+    /// The stream then leaves at exactly the speed it is laid out for, so each frame's
+    /// particles join the last frame's (left alone, new liquid takes up the faster flow of
+    /// the accelerating stream below at once and runs ahead); and a nozzle whose outlet is
     /// already full keeps pushing.
     pub fn nozzle(pos: [f32; 2], vel: [f32; 2], radius: f32) -> ToolState {
         ToolState { pos, vel, radius, mode: 4, strength: 1000.0 }
@@ -338,7 +372,7 @@ impl ToolState {
     }
 }
 
-/// Must match `uniform Params` in `shaders/common.glsl` (std140, 208 bytes).
+/// Must match `uniform Params` in `shaders/common.glsl` (std140, 464 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GpuParams {
@@ -375,16 +409,30 @@ pub struct GpuParams {
     /// Relative tolerances: pressure, density correction, viscosity; then the time constant
     /// of the density correction, s.
     pub tol: [f32; 4],
-    /// Particle speed cap (cells/s, huge = off); advection order; spray CFL multiple; unused.
+    /// Particle speed cap (cells/s, huge = off); advection order; spray CFL multiple; number
+    /// of currents.
     pub ext: [f32; 4],
+    /// Per current: position, radius, rate (1/s).
+    pub current_zone: [[f32; 4]; MAX_CURRENTS],
+    /// Per current: velocity (cells/s); unused.
+    pub current_vel: [[f32; 4]; MAX_CURRENTS],
 }
 
 const _: () = assert!(std::mem::size_of::<Particle>() == 48);
-const _: () = assert!(std::mem::size_of::<GpuParams>() == 208);
+const _: () = assert!(std::mem::size_of::<GpuParams>() == 208 + 32 * MAX_CURRENTS);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_current_heads_clockwise_from_down_at_its_strength() {
+        let right = Current::new([10.0, 20.0], 9.0, 90.0, 1.0);
+        assert!((right.vel[0] - CURRENT_SPEED).abs() < 1e-3 && right.vel[1].abs() < 1e-3);
+        let up = Current::new([10.0, 20.0], 9.0, 180.0, 2.0);
+        assert!(up.vel[0].abs() < 1e-3 && (up.vel[1] - 2.0 * CURRENT_SPEED).abs() < 1e-3);
+        assert_eq!((up.pos, up.radius, up.rate), ([10.0, 20.0], 9.0, CURRENT_RATE));
+    }
 
     #[test]
     fn overrides_reach_the_named_parameter() {

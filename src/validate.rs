@@ -9,7 +9,7 @@ use crate::{
     render::View,
     maps::fill_rect,
     scene::{Scene, Shape, WALL},
-    sim::{KIND_AQUEOUS, KIND_OIL, Material, NOMINAL_DT, PPC, Particle, SimParams, ToolState},
+    sim::{Current, KIND_AQUEOUS, KIND_OIL, Material, NOMINAL_DT, PPC, Particle, SimParams, ToolState},
     world::{Source, World},
 };
 
@@ -358,6 +358,213 @@ fn buoyancy(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.check("syrup blob", format!("{:.0} -> {:.0} cells", syr_c[1], syr_y), "sank below 60 cells", syr_y < 60.0);
 }
 
+/// Holds a source at `at(frame)` for `frames` frames of `ticks` nominal substeps, as the app
+/// drives a held brush. Returns the number of particles emitted.
+#[allow(clippy::too_many_arguments)]
+fn hold(w: &mut World, source: Source, material: Material, at: &dyn Fn(usize) -> [f32; 2], radius: f32, rate: f32, frames: usize, ticks: u32) -> usize {
+    let mut emitted = 0;
+    for frame in 0..frames {
+        emitted += w.emit(source, material, at(frame), radius, rate, ticks as f32 * NOMINAL_DT);
+        w.sim.step_blocking(ticks, source.nozzle(at(frame), radius, rate));
+    }
+    w.end_stroke();
+    emitted
+}
+
+/// The pour tool: a stream of rest-density liquid from a spout as wide as the brush. In
+/// free fall below the round nozzle it must stay whole, gain 2 g h in v^2 and narrow so that
+/// width x speed stays the flow.
+fn pour(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
+    println!("\nPour (a held stream in free fall, coarse frames, a sweeping brush, a trickle, a submerged spout)");
+    let (spout_at, radius, rate) = ([256.0, 200.0], 9.0, 12000.0);
+    let spout = Source::Pour.spout(radius, rate).unwrap();
+    let empty = || {
+        let mut w = World::custom(gpu.clone(), Scene::new(GRID), Vec::new());
+        apply(&mut w.sim.params);
+        w
+    };
+    // The stream from `lo` cells below the spout (the latest particles have travelled for a
+    // frame when they are read back) to `hi`: (largest gap along it, share of its particles
+    // further than `reach` from the axis).
+    let stream = |ps: &[Particle], lo: f32, hi: f32, reach: f32| {
+        let mut ys: Vec<f32> = ps.iter().map(|p| spout_at[1] - p.pos[1]).filter(|&d| d >= lo && d <= hi).collect();
+        ys.sort_by(f32::total_cmp);
+        let gap = ys.windows(2).map(|y| y[1] - y[0]).fold(0.0, f32::max).max(ys.first().map_or(hi - lo, |y| y - lo));
+        let strays = ps.iter().filter(|p| (lo..=hi).contains(&(spout_at[1] - p.pos[1])) && (p.pos[0] - spout_at[0]).abs() > reach).count();
+        (gap, strays as f32 / ys.len().max(1) as f32)
+    };
+
+    // ---- held still, 60 frames a second ------------------------------------------------
+    let mut w = empty();
+    let emitted = hold(&mut w, Source::Pour, Material::Water, &|_| spout_at, radius, rate, 60, 4);
+    r.shot(&w, "pour_stream");
+    let ps = w.sim.download_particles();
+    // What has yet to cross the nozzle's arc: the corners its half disc leaves out of the
+    // 18 x 9 cell box, at 4 particles per cell.
+    let corners = |half: f32| ((2.0 - 0.5 * std::f32::consts::PI) * half * half * PPC as f32) as usize;
+    let due = 12000 - corners(radius);
+    r.check("held 1 s: the flow is exact", format!("{} particles", emitted), &format!("{due} (+/- 0.5 %)"), emitted.abs_diff(due) <= 60 && ps.len() == emitted);
+    let (gap, strays) = stream(&ps, spout.speed / 60.0, 150.0, 0.5 * spout.width + 1.0);
+    r.check("held: the stream is whole down to 150 cells", format!("largest gap {:.2} cells", gap), "< 1", gap < 1.0);
+    r.check("held: nothing leaves the stream", format!("{:.2} % outside the spout's width", strays * 100.0), "< 0.5 %", strays < 0.005);
+    // Below the nozzle the stream is in free fall: between two heights v^2 grows by 2 g h,
+    // and width x speed stays the flow.
+    let g = w.sim.params.g_cells();
+    let band = |fall: f32| {
+        let band: Vec<&Particle> = ps.iter().filter(|p| (spout_at[1] - p.pos[1] - fall).abs() < 3.0).collect();
+        let speed = band.iter().map(|p| -p.vel[1]).sum::<f32>() / band.len().max(1) as f32;
+        // Particles per cell of height, over the rest density: the width of the stream.
+        (speed, band.len() as f32 / 6.0 / PPC as f32)
+    };
+    let ((v1, w1), (v2, w2)) = (band(40.0), band(130.0));
+    let gain = (v2 * v2 - v1 * v1) / (2.0 * g * 90.0);
+    r.check("held: free fall from 40 to 130 cells below", format!("{:.0} -> {:.0} cells/s, {:.3} of 2 g h", v1, v2, gain), "1 (+/- 0.03)", (gain - 1.0).abs() < 0.03);
+    let flow = [w1 * v1 * PPC as f32, w2 * v2 * PPC as f32];
+    r.check(
+        "held: it narrows as it speeds up",
+        format!("{:.1} -> {:.1} cells wide, {:.0} and {:.0} /s", w1, w2, flow[0], flow[1]),
+        "width x speed x 4 = 12000 (+/- 5 %)",
+        flow.iter().all(|f| (f / 12000.0 - 1.0).abs() < 0.05),
+    );
+    // The top of the stream is round: it fills the brush circle and nothing else.
+    let above = |lo: f32, hi: f32| ps.iter().filter(|p| (lo..hi).contains(&(p.pos[0] - spout_at[0]).abs())).map(|p| p.pos[1] - spout_at[1]).fold(f32::MIN, f32::max);
+    let (crown, shoulder) = (above(0.0, 1.5), above(7.5, 9.0));
+    r.check("held: the top is round", format!("{:.1} cells above the centre in the middle, {:.1} at the sides", crown, shoulder), "about 6.2 (9, less a frame's travel) and under 3", (crown - (9.0 - spout.speed / 60.0)).abs() < 1.0 && shoulder < 3.0);
+
+    // ---- 15 frames a second ------------------------------------------------------------
+    let mut w = empty();
+    let emitted = hold(&mut w, Source::Pour, Material::Water, &|_| spout_at, radius, rate, 15, 16);
+    let ps = w.sim.download_particles();
+    let (gap, strays) = stream(&ps, spout.speed / 15.0, 150.0, 0.5 * spout.width + 1.0);
+    r.check(
+        "15 frames/s: same flow, still whole",
+        format!("{} particles, gap {:.2}, {:.2} % stray", emitted, gap, strays * 100.0),
+        &format!("{due} (+/- 0.5 %), < 1, < 0.5 %"),
+        emitted.abs_diff(due) <= 60 && gap < 1.0 && strays < 0.005,
+    );
+
+    // ---- a brush sweeping at 240 cells/s -----------------------------------------------
+    let mut w = empty();
+    let sweep = |frame: usize| [136.0 + 4.0 * frame as f32, 200.0];
+    let emitted = hold(&mut w, Source::Pour, Material::Oil, &sweep, radius, rate, 60, 4);
+    r.shot(&w, "pour_sweep");
+    let ps = w.sim.download_particles();
+    // Faster sideways than the stream runs: the leading flank of the nozzle overruns its own
+    // liquid, and what would land on top of it is held back.
+    r.check("sweeping at 240 cells/s: most of the flow", format!("{} particles", emitted), "> 9600 of 12000 (80 %), all live", emitted > 9600 && emitted <= 12000 && ps.len() == emitted);
+
+    // ---- a trickle ---------------------------------------------------------------------
+    let mut w = empty();
+    let emitted = hold(&mut w, Source::Pour, Material::Syrup, &|_| spout_at, radius, 2000.0, 60, 4);
+    r.shot(&w, "pour_trickle");
+    let ps = w.sim.download_particles();
+    let thin = Source::Pour.spout(radius, 2000.0).unwrap();
+    let (gap, strays) = stream(&ps, thin.speed / 60.0, 12.0, 0.5 * thin.width + 1.0);
+    r.check(
+        "trickle: narrow, slow and exact",
+        format!("{} particles, {:.1} cells wide at {:.0} cells/s, gap {:.2}, {:.2} % stray", emitted, thin.width, thin.speed, gap, strays * 100.0),
+        &format!("{} (+/- 0.5 %), narrower than the brush, whole", 2000 - corners(0.5 * thin.width)),
+        emitted.abs_diff(2000 - corners(0.5 * thin.width)) <= 10 && thin.width < 2.0 * radius && gap < 1.0 && strays < 0.005,
+    );
+
+    // ---- a submerged spout ---------------------------------------------------------------
+    let mut w = world(gpu, apply, &[([0.0, 0.0, 512.0, WALL + 60.0], Material::Water)]);
+    let n0 = w.sim.download_particles().len();
+    let under = [256.0, WALL + 40.0];
+    let emitted = hold(&mut w, Source::Pour, Material::Water, &|_| under, radius, rate, 60, 4);
+    r.shot(&w, "pour_submerged");
+    let ps = w.sim.download_particles();
+    let mut counts = vec![0u32; (GRID[0] * GRID[1]) as usize];
+    for p in &ps {
+        counts[p.pos[1] as usize * GRID[0] as usize + p.pos[0] as usize] += 1;
+    }
+    let fullest = counts.iter().copied().max().unwrap_or(0);
+    r.check(
+        "submerged: the pool takes what it has room for",
+        format!("{} of 12000 emitted, fullest cell holds {}", emitted, fullest),
+        "all live, some held back, < 12 (rest 4)",
+        ps.len() == n0 + emitted && emitted > 0 && emitted < 12000 && fullest < 12,
+    );
+}
+
+/// The current tool: a zone that drives the liquid passing through it along its heading,
+/// without braking it, turning it aside, or adding or removing any.
+fn current(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
+    println!("\nCurrent (a zone in a pool, a stream falling through one, removal)");
+    // ---- in a pool -----------------------------------------------------------------------
+    let mut w = world(gpu, apply, &[([0.0, 0.0, 512.0, WALL + 60.0], Material::Water)]);
+    let n0 = w.sim.download_particles().len();
+    let zone = Current::new([256.0, WALL + 30.0], 14.0, 90.0, 1.0);
+    let speed = zone.vel[0];
+    let inside = |p: &&Particle| (p.pos[0] - zone.pos[0]).hypot(p.pos[1] - zone.pos[1]) < 0.5 * zone.radius;
+    let along = |ps: &[Particle]| {
+        let v: Vec<f32> = ps.iter().filter(inside).map(|p| p.vel[0]).collect();
+        (v.iter().sum::<f32>() / v.len().max(1) as f32, v.iter().copied().fold(f32::MIN, f32::max))
+    };
+    let at_rest = along(&w.sim.download_particles()).0;
+    assert!(w.add_current(zone));
+    run(&mut w, 3.0);
+    r.shot(&w, "current_pool");
+    let ps = w.sim.download_particles();
+    let (mean, fastest) = along(&ps);
+    r.check(
+        "pool: liquid in the zone flows along it",
+        format!("{:.0} cells/s (at rest {:.1})", mean, at_rest),
+        &format!("> {:.0}, a quarter of the current's {:.0}", 0.25 * speed, speed),
+        mean > 0.25 * speed,
+    );
+    r.check("pool: nothing is driven past the current's speed", format!("fastest {:.0} cells/s", fastest), &format!("< {:.0}", 1.05 * speed), fastest < 1.05 * speed);
+    r.check("pool: no liquid is added or lost", format!("{} -> {}", n0, ps.len()), "equal", ps.len() == n0);
+    // The pool turns over around the zone: the return flow runs the other way below and above.
+    let back: Vec<f32> = ps.iter().filter(|p| (p.pos[0] - zone.pos[0]).abs() < 10.0 && (p.pos[1] - zone.pos[1]).abs() > 20.0).map(|p| p.vel[0]).collect();
+    let back = back.iter().sum::<f32>() / back.len().max(1) as f32;
+    r.check("pool: the rest of the pool flows back around it", format!("{:.1} cells/s above and below the zone", back), "< 0", back < 0.0);
+
+    // ---- removal -------------------------------------------------------------------------
+    let stirred = energy(&ps, &w.sim.params).0;
+    let removed = w.remove_current_at([250.0, WALL + 34.0]) && !w.remove_current_at([250.0, WALL + 34.0]);
+    run(&mut w, 3.0);
+    let ps = w.sim.download_particles();
+    let later = energy(&ps, &w.sim.params).0;
+    r.check(
+        "removed: the pool is left to calm down",
+        format!("kinetic energy {:.0} -> {:.0}", stirred, later),
+        "one current removed, energy falling",
+        removed && w.currents().is_empty() && later < stirred,
+    );
+
+    // ---- a stream falling through a sideways current ---------------------------------------
+    // Without the current, then with it: it pushes the stream aside and leaves its fall alone.
+    let mut fall = |with: bool| {
+        let mut w = World::custom(gpu.clone(), Scene::new(GRID), Vec::new());
+        apply(&mut w.sim.params);
+        if with {
+            w.add_current(Current::new([256.0, 150.0], 14.0, 90.0, 1.0));
+        }
+        hold(&mut w, Source::Pour, Material::Water, &|_| [256.0, 220.0], 6.0, 6000.0, 45, 4);
+        if with {
+            r.shot(&w, "current_stream");
+        }
+        let ps = w.sim.download_particles();
+        let band: Vec<&Particle> = ps.iter().filter(|p| (p.pos[1] - 110.0).abs() < 4.0).collect();
+        let n = band.len().max(1) as f32;
+        (band.iter().map(|p| p.vel[0]).sum::<f32>() / n, band.iter().map(|p| -p.vel[1]).sum::<f32>() / n, band.len())
+    };
+    let (free, driven) = (fall(false), fall(true));
+    r.check(
+        "stream: the current carries it sideways",
+        format!("{:.0} cells/s below the zone (without: {:.0})", driven.0, free.0),
+        "> 30, and 0 without",
+        driven.0 > 30.0 && free.0.abs() < 3.0 && driven.2 > 100,
+    );
+    r.check(
+        "stream: its fall is left alone",
+        format!("{:.0} cells/s down (without: {:.0})", driven.1, free.1),
+        "equal (+/- 3 %)",
+        (driven.1 / free.1 - 1.0).abs() < 0.03,
+    );
+}
+
 /// The interactive tools, driven through the same calls the app makes each frame.
 fn tools(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     println!("\nTools (pour, erase, slot recycling, grab / stir, placing and removing solids)");
@@ -368,7 +575,7 @@ fn tools(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     let mut w = World::custom(gpu.clone(), Scene::new(GRID), Vec::new());
     apply(&mut w.sim.params);
     let dt = NOMINAL_DT;
-    // The faucet held still, as the app drives it each frame.
+    // The pour held still, as the app drives it each frame.
     let mut emitted = 0;
     for _ in 0..120 {
         emitted += w.emit(Source::Pour, Material::Water, [256.0, 120.0], 9.0, 12000.0, 4.0 * dt);
@@ -382,7 +589,7 @@ fn tools(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     let mean = mean_height(&ps, |_| 1.0) - WALL;
     r.check("pour: every emitted particle is live", format!("{} of {}", ps.len(), emitted), "equal", ps.len() == emitted);
     // 12000 particles/s for 120 frames of 4 nominal substeps.
-    r.check("pour: the faucet delivers its flow", format!("{} particles", emitted), "24000 (+/- 3 %)", emitted.abs_diff(24000) < 720);
+    r.check("pour: it delivers its flow", format!("{} particles", emitted), "24000 (+/- 3 %)", emitted.abs_diff(24000) < 720);
     r.check(
         "pour: the stream ends as a pool on the floor",
         format!("mean height {:.1} cells", mean),
@@ -1242,7 +1449,7 @@ pub fn run_all(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), only: Option<&str>
         (Offscreen::new(gpu.clone(), [960, 540]), PathBuf::from(dir))
     });
     let mut r = Report { failures: 0, shots };
-    let tests: [(&str, Test); 11] = [
+    let tests: [(&str, Test); 13] = [
         ("hydrostatic", hydrostatic),
         ("dam", dam_break),
         ("ritter", ritter),
@@ -1253,6 +1460,8 @@ pub fn run_all(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), only: Option<&str>
         ("surface", surface),
         ("settle", settle),
         ("convergence", convergence),
+        ("pour", pour),
+        ("current", current),
         ("tools", tools),
     ];
     for (name, test) in tests {

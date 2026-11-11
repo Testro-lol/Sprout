@@ -6,7 +6,7 @@
 // The one per-particle pass of a substep. For every live particle:
 //   1. gather  (grid -> particle): APIC velocity + affine matrix from the projected grid,
 //      local composition for oil / aqueous slip and water / syrup mixing
-//   2. advect, collide with the solid SDF, apply the mouse tool
+//   2. advect, collide with the solid SDF, apply the mouse tool and the currents
 //   3. scatter (particle -> grid): mass and momentum to the faces, composition to the cells
 // Gather reads only float fields and scatter writes only the integer accumulators, so the
 // two halves of consecutive substeps share a single sweep over particle memory.
@@ -292,6 +292,22 @@ void main() {
                 float k = clamp(P.tool_strength * fall * dt, 0.0, 1.0);
                 v = mix(v, tool_target(d), k);
                 pushed = true;
+            }
+        }
+
+        // ---- currents (params.rs: Current) -------------------------------------------
+        // Raise the velocity along each current towards its speed; never brake, and leave
+        // the motion across it alone.
+        for (int i = 0; i < int(P.ext.w); i++) {
+            vec4 zone = P.current_zone[i];
+            vec2 d = p.pos - zone.xy;
+            float r2 = dot(d, d) / (zone.z * zone.z);
+            if (r2 < 1.0) {
+                vec2 target = P.current_vel[i].xy;
+                float speed = length(target);
+                vec2 dir = target / max(speed, 1e-6);
+                float fall = (1.0 - r2) * (1.0 - r2);
+                v += dir * max(speed - dot(v, dir), 0.0) * (1.0 - exp(-zone.w * fall * dt));
             }
         }
 

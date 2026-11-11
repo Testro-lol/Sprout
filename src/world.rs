@@ -7,18 +7,17 @@
 use std::sync::Arc;
 
 use crate::{
-    brush::{self, Admission},
+    brush::{self, Admission, Spout, Stream},
     gpu::Gpu,
     maps::{self, MAPS},
     scene::{Scene, Shape},
-    sim::{FluidSim, Material, PPC, Particle, SPAWN_MAX, SimParams, ToolState},
+    sim::{Current, FluidSim, MAX_CURRENTS, Material, PPC, Particle, SPAWN_MAX, SimParams, ToolState},
 };
 
 /// What a held brush emits.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Source {
-    /// A faucet: a steady stream straight down, as wide as the brush (or narrower at low
-    /// flow), at a speed set by the flow.
+    /// A stream straight down out of the round brush, at a speed set by the flow.
     Pour,
     /// Sparse droplets thrown outwards from the brush rim.
     Spray,
@@ -27,15 +26,22 @@ pub enum Source {
 }
 
 impl Source {
-    /// The force a held brush applies besides emitting: the nozzle of a stream (see
+    /// The outlet of the streams (pour and jet); spray has none.
+    pub fn spout(self, radius: f32, rate: f32) -> Option<Spout> {
+        match self {
+            Source::Pour => Some(Spout::pour(rate, radius)),
+            Source::Jet { angle } => Some(Spout::jet(angle, rate, radius)),
+            Source::Spray => None,
+        }
+    }
+
+    /// The force a held brush applies besides emitting: a stream's nozzle (see
     /// `ToolState::nozzle`), nothing for spray.
     pub fn nozzle(self, at: [f32; 2], radius: f32, rate: f32) -> ToolState {
-        let (direction, speed) = match self {
-            Source::Pour => ([0.0, -1.0], brush::faucet_speed(rate, radius)),
-            Source::Jet { angle } => (brush::jet_direction(angle), brush::JET_SPEED),
-            Source::Spray => return ToolState::default(),
-        };
-        ToolState::nozzle(at, [direction[0] * speed, direction[1] * speed], radius)
+        match self.spout(radius, rate) {
+            Some(spout) => ToolState::nozzle(at, spout.velocity(), 0.5 * spout.width + 1.0),
+            None => ToolState::default(),
+        }
     }
 }
 
@@ -44,8 +50,10 @@ impl Source {
 struct Emitter {
     /// Where the brush was at the last frame: each frame paints the stroke from there.
     last: Option<[f32; 2]>,
-    /// Particles (spray) or stream rows (pour, jet) owed from earlier frames, below one.
+    /// Spray particles owed from earlier frames, below one.
     owed: f32,
+    /// The stream of a pour or a jet.
+    stream: Stream,
 }
 
 pub struct World {
@@ -115,6 +123,7 @@ impl World {
         self.scene = scene;
         self.refresh_solids();
         self.sim.reset(particles);
+        self.sim.set_currents(&[]);
         self.end_stroke();
     }
 
@@ -130,6 +139,40 @@ impl World {
     pub fn add_shape(&mut self, shape: Shape) {
         self.scene.shapes.push(shape);
         self.refresh_solids();
+    }
+
+    /// The currents placed in the world (see `Current`).
+    pub fn currents(&self) -> &[Current] {
+        self.sim.currents()
+    }
+
+    /// Places a current, unless the world already holds `MAX_CURRENTS`.
+    pub fn add_current(&mut self, current: Current) -> bool {
+        let mut currents = self.currents().to_vec();
+        if currents.len() >= MAX_CURRENTS {
+            return false;
+        }
+        currents.push(current);
+        self.sim.set_currents(&currents);
+        true
+    }
+
+    /// The topmost (latest) current under `pos`.
+    pub fn pick_current(&self, pos: [f32; 2]) -> Option<usize> {
+        self.currents().iter().rposition(|c| (pos[0] - c.pos[0]).hypot(pos[1] - c.pos[1]) <= c.radius)
+    }
+
+    /// Removes the topmost current under `pos`. Returns whether anything was removed.
+    pub fn remove_current_at(&mut self, pos: [f32; 2]) -> bool {
+        match self.pick_current(pos) {
+            Some(i) => {
+                let mut currents = self.currents().to_vec();
+                currents.remove(i);
+                self.sim.set_currents(&currents);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Removes the topmost shape under `pos`. Returns whether anything was removed.
@@ -152,24 +195,16 @@ impl World {
         if seconds <= 0.0 {
             return 0;
         }
-        match source {
-            Source::Pour => {
-                let speed = brush::faucet_speed(rate, radius);
-                self.stream(material, from, at, radius, rate, [0.0, -1.0], speed, seconds)
-            }
-            Source::Jet { angle } => {
-                self.stream(material, from, at, radius, rate, brush::jet_direction(angle), brush::JET_SPEED, seconds)
-            }
-            Source::Spray => {
-                self.emitter.owed += rate * seconds * brush::SPRAY_SHARE;
-                // At most one brush-full per frame; what does not fit is dropped rather than
-                // released as a backlog after a slow frame or a blocked stroke.
-                let full = (std::f32::consts::PI * radius * radius * PPC as f32) as usize;
-                let count = (self.emitter.owed as usize).min(full);
-                self.emitter.owed = self.emitter.owed.fract();
-                self.paint(material, from, at, radius, count, true)
-            }
+        if let Some(spout) = source.spout(radius, rate) {
+            return self.stream(material, &spout, from, at, seconds);
         }
+        self.emitter.owed += rate * seconds * brush::SPRAY_SHARE;
+        // At most one brush-full per frame; what does not fit is dropped rather than
+        // released as a backlog after a slow frame or a blocked stroke.
+        let full = (std::f32::consts::PI * radius * radius * PPC as f32) as usize;
+        let count = (self.emitter.owed as usize).min(full);
+        self.emitter.owed = self.emitter.owed.fract();
+        self.paint(material, from, at, radius, count, true)
     }
 
     /// Lets go of the brush: the next `emit` starts a new stroke.
@@ -222,56 +257,28 @@ impl World {
         self.sim.spawn(&particles)
     }
 
-    /// A stream (the faucet, the jet): rows of rest-density liquid across the nozzle,
-    /// launched along `direction` at `speed`. Each row is placed as far along the stream as
-    /// it has travelled since it was due, and the nozzle sweeps from `from` to `to` over the
-    /// frame, so the stream comes out continuous whatever the frame rate and however the
-    /// brush moves. `rate` (particles/s) sets the width, up to the brush's diameter.
-    #[allow(clippy::too_many_arguments)]
-    fn stream(&mut self, material: Material, from: [f32; 2], to: [f32; 2], radius: f32, rate: f32, direction: [f32; 2], speed: f32, seconds: f32) -> usize {
-        let spacing = 1.0 / (PPC as f32).sqrt();
-        let width = (rate / (PPC as f32 * speed)).min(2.0 * radius);
-        let cols = (width / spacing).round().max(1.0) as usize;
-        let travel = speed * seconds / spacing;
-        self.emitter.owed += travel;
-        let rows = (self.emitter.owed as usize).min(SPAWN_MAX / cols);
-        self.emitter.owed = self.emitter.owed.fract();
-        let side = [-direction[1], direction[0]];
-        let velocity = [direction[0] * speed, direction[1] * speed];
-        let reach = speed * seconds + radius + 1.0;
+    /// A stream (the pour, the jet): this frame's particles of `brush::Stream`, launched at
+    /// the spout's velocity, except where a solid or liquid that cannot get away blocks them.
+    fn stream(&mut self, material: Material, spout: &Spout, from: [f32; 2], to: [f32; 2], seconds: f32) -> usize {
+        let positions = self.emitter.stream.advance(spout, from, to, seconds, SPAWN_MAX);
+        let reach = spout.speed * seconds + spout.width + 1.0;
         let mut admission = self.admission(from, to, reach, true);
-        let mut particles = Vec::with_capacity(rows * cols);
-        for row in 0..rows {
-            let age = (rows - 1 - row) as f32 + self.emitter.owed;
-            // Older rows left the nozzle earlier in the frame, from earlier along the sweep.
-            let t = (1.0 - age / travel.max(1e-6)).clamp(0.0, 1.0);
-            let centre = [
-                from[0] + (to[0] - from[0]) * t + direction[0] * age * spacing,
-                from[1] + (to[1] - from[1]) * t + direction[1] * age * spacing,
-            ];
-            for col in 0..cols {
-                // A little jitter keeps the lattice from showing as stripes in the stream.
-                let offset = (col as f32 + 0.5 - cols as f32 * 0.5 + 0.3 * (self.rand() - 0.5)) * spacing;
-                let along = 0.3 * (self.rand() - 0.5) * spacing;
-                let pos = [
-                    centre[0] + side[0] * offset + direction[0] * along,
-                    centre[1] + side[1] * offset + direction[1] * along,
-                ];
-                if self.solid_distance(pos) > 0.4 && admission.admit(pos) {
-                    particles.push(Particle::new(material, pos, velocity));
-                }
-            }
-        }
+        let velocity = spout.velocity();
+        let particles: Vec<Particle> = positions
+            .into_iter()
+            .filter(|&pos| self.solid_distance(pos) > 0.4 && admission.admit(pos))
+            .map(|pos| Particle::new(material, pos, velocity))
+            .collect();
         self.sim.spawn(&particles)
     }
 
-    /// Which cells within `margin` of the stroke can take new liquid (see `Admission`);
-    /// `top_up` lets partly filled cells fill to rest density.
-    fn admission(&self, from: [f32; 2], to: [f32; 2], margin: f32, top_up: bool) -> Admission {
+    /// Which cells within `margin` of the stroke can take new liquid, for painted liquid or
+    /// for a `stream` (see `Admission`).
+    fn admission(&self, from: [f32; 2], to: [f32; 2], margin: f32, stream: bool) -> Admission {
         let (lo, hi) = Admission::window(from, to, margin);
         let lo = [lo[0].max(0), lo[1].max(0)];
         let hi = [hi[0].clamp(lo[0], self.sim.grid[0] as i32), hi[1].clamp(lo[1], self.sim.grid[1] as i32)];
-        Admission::new(lo, [hi[0] - lo[0], hi[1] - lo[1]], &self.sim.cell_counts(lo, hi), PPC, top_up)
+        Admission::new(lo, [hi[0] - lo[0], hi[1] - lo[1]], &self.sim.cell_counts(lo, hi), PPC, stream)
     }
 
     fn rand(&mut self) -> f32 {

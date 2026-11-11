@@ -22,6 +22,8 @@ const uint KIND_DEAD = 0u;
 const uint KIND_AQUEOUS = 1u;
 const uint KIND_OIL = 2u;
 
+const int MAX_CURRENTS = 8;  // params.rs: MAX_CURRENTS
+
 layout(std140, set = 0, binding = 0) uniform Params {
     ivec2 grid;           // W, H in cells
     uint n_slots;         // particle slots in use (high-water mark)
@@ -46,11 +48,13 @@ layout(std140, set = 0, binding = 0) uniform Params {
     vec2 tool_pos;        // cells
     vec2 tool_vel;        // cells / s
     float tool_radius;    // cells
-    int tool_mode;        // 0 none, 1 grab / stir, 2 erase
+    int tool_mode;        // 0 none, 1 grab / stir, 2 erase, 3 push, 4 stream nozzle
     float tool_strength;
     uint frame;
     vec4 tol;             // relative tolerance: pressure, density correction, viscosity; density-correction time constant (s)
-    vec4 ext;             // particle speed cap (cells / s, huge = off); advection order (1 Euler, 2 midpoint); CFL multiple allowed to spray; unused
+    vec4 ext;             // particle speed cap (cells / s, huge = off); advection order (1 Euler, 2 midpoint); CFL multiple allowed to spray; number of currents
+    vec4 current_zone[MAX_CURRENTS];  // position (cells), radius, rate (1 / s)
+    vec4 current_vel[MAX_CURRENTS];   // velocity the liquid is driven towards (cells / s); unused
 } P;
 
 layout(std430, set = 0, binding = 1) buffer ParticleBuf { Particle particles[]; };

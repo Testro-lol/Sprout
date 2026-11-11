@@ -30,7 +30,7 @@ use crate::{
     render::Renderer,
     scene::Shape,
     selftest::{self, Act, Snapshot},
-    sim::{KIND_OIL, Material, ToolState},
+    sim::{Current, KIND_OIL, Material, ToolState},
     ui::{self, Overlay, Tool, UiActions, UiState},
     world::{Source, World},
 };
@@ -153,6 +153,7 @@ fn tool_for_key(code: KeyCode) -> Option<Tool> {
         KeyCode::KeyC => Tool::Drop,
         KeyCode::KeyW => Tool::Grab,
         KeyCode::KeyV => Tool::Push,
+        KeyCode::KeyZ => Tool::Current,
         KeyCode::KeyE => Tool::Erase,
         KeyCode::KeyA => Tool::Circle,
         KeyCode::KeyS => Tool::Box,
@@ -401,9 +402,8 @@ impl App {
     fn wheel(&mut self, lines: f32) {
         if self.input.modifiers.shift_key() || self.input.modifiers.control_key() {
             self.ui.scale_brush(1.12f32.powf(lines));
-        } else if self.ui.tool == Tool::Jet && !self.input.modifiers.alt_key() {
-            self.ui.rotate_jet(lines * 15.0);
-        } else {
+        } else if self.input.modifiers.alt_key() || !self.ui.aim(lines * 15.0) {
+            // Nothing to aim (or Alt held): the wheel zooms.
             self.zoom_at_cursor(1.15f32.powf(lines));
         }
     }
@@ -442,6 +442,7 @@ impl App {
             zoom: self.camera.target().zoom,
             center: self.camera.target().center,
             brush: self.ui.brush,
+            currents: self.world.currents().len(),
             jet_angle: self.ui.jet_angle,
             panel: self.ui.show_panel,
         }
@@ -490,7 +491,9 @@ impl App {
         let (tool, material, radius) = (self.ui.tool, self.ui.material, self.ui.brush);
         let done = match tool {
             Tool::Drop => self.world.stamp(material, at, radius) > 0,
-            Tool::Remove => self.world.remove_shape_at(at),
+            Tool::Current => self.world.add_current(Current::new(at, radius, self.ui.current_angle, self.ui.force_strength)),
+            // Currents lie on top of the solids.
+            Tool::Remove => self.world.remove_current_at(at) || self.world.remove_shape_at(at),
             _ => match pending_shape(&self.ui, at) {
                 Some(shape) => {
                     self.world.add_shape(shape);
@@ -651,8 +654,9 @@ impl App {
 
         // ---- UI --------------------------------------------------------------------
         let raw_input = win.egui_state.take_egui_input(&win.window);
+        let doomed = if self.ui.tool == Tool::Remove { self.world.pick_current(at) } else { None };
         let shape = if self.ui.tool == Tool::Remove {
-            self.world.scene.pick(at).map(|i| (self.world.scene.shapes[i], true))
+            self.world.scene.pick(at).filter(|_| doomed.is_none()).map(|i| (self.world.scene.shapes[i], true))
         } else {
             pending_shape(&self.ui, at).map(|s| (s, false))
         };
@@ -666,7 +670,7 @@ impl App {
             }
             self.shown = now;
             let hover = self.input.inside && !ctx.is_pointer_over_area();
-            self.overlay.draw(ctx, &self.ui, view, size, hover.then_some(at), pressed, grabbing, shape.filter(|_| hover));
+            self.overlay.draw(ctx, &self.ui, view, size, hover.then_some(at), pressed, grabbing, shape.filter(|_| hover), self.world.currents(), doomed.filter(|_| hover));
         });
         win.egui_state.handle_platform_output(&win.window, full.platform_output);
         let primitives = win.egui_ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -801,7 +805,7 @@ mod tests {
     #[test]
     fn every_tool_has_the_key_its_label_shows() {
         for tool in Tool::LIQUID.into_iter().chain(Tool::SOLID) {
-            let code = [KeyCode::KeyQ, KeyCode::KeyB, KeyCode::KeyJ, KeyCode::KeyC, KeyCode::KeyW, KeyCode::KeyV, KeyCode::KeyE,
+            let code = [KeyCode::KeyQ, KeyCode::KeyB, KeyCode::KeyJ, KeyCode::KeyC, KeyCode::KeyW, KeyCode::KeyV, KeyCode::KeyZ, KeyCode::KeyE,
                 KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD, KeyCode::KeyX]
                 .into_iter()
                 .find(|&c| format!("{c:?}") == format!("Key{}", tool.key()))

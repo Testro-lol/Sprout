@@ -444,6 +444,8 @@ pub struct FluidSim {
     viscosity_rec: u32,
     /// Fastest speed newly spawned particles start with, cells/s (feeds the CFL limit).
     spawn_speed: f32,
+    /// Currents placed in the world (at most `MAX_CURRENTS`).
+    currents: Vec<Current>,
     /// Fluids the tank has held since the last reset: water, syrup, oil.
     present: [bool; 3],
     /// Next permanent particle id (see `Particle::id`).
@@ -701,6 +703,7 @@ impl FluidSim {
             pressure_rec: 24,
             viscosity_rec: 24,
             spawn_speed: 0.0,
+            currents: Vec::new(),
             present: [false; 3],
             next_id: 0,
             levels,
@@ -790,6 +793,16 @@ impl FluidSim {
         self.pending_reset = Some(particles);
     }
 
+    pub fn currents(&self) -> &[Current] {
+        &self.currents
+    }
+
+    /// Replaces the currents (the first `MAX_CURRENTS` are kept). They act from the next
+    /// `record` on and survive a `reset`.
+    pub fn set_currents(&mut self, currents: &[Current]) {
+        self.currents = currents[..currents.len().min(MAX_CURRENTS)].to_vec();
+    }
+
     /// Queues new particles; they appear at the next `record`. Returns how many were
     /// accepted (the queue holds `SPAWN_MAX` per frame).
     pub fn spawn(&mut self, particles: &[Particle]) -> usize {
@@ -827,6 +840,12 @@ impl FluidSim {
         let [cw, sw] = cs(p.contact_angle[0]);
         let [cy, sy] = cs(p.contact_angle[1]);
         let [co, so] = cs(p.contact_angle[2]);
+        let mut current_zone = [[0.0; 4]; MAX_CURRENTS];
+        let mut current_vel = [[0.0; 4]; MAX_CURRENTS];
+        for (i, c) in self.currents.iter().enumerate() {
+            current_zone[i] = [c.pos[0], c.pos[1], c.radius.max(0.01), c.rate];
+            current_vel[i] = [c.vel[0], c.vel[1], 0.0, 0.0];
+        }
         GpuParams {
             grid: [self.grid[0] as i32, self.grid[1] as i32],
             n_slots: self.n_slots,
@@ -855,7 +874,9 @@ impl FluidSim {
             tool_strength: tool.strength,
             frame: self.frame,
             tol: [p.pressure_tol, p.correction_tol, p.viscosity_tol, p.density_tau],
-            ext: [p.speed_cap_cells(self.grid[1]), p.advection_order as f32, p.spray_cfl, 0.0],
+            ext: [p.speed_cap_cells(self.grid[1]), p.advection_order as f32, p.spray_cfl, self.currents.len() as f32],
+            current_zone,
+            current_vel,
         }
     }
 

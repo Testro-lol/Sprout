@@ -23,6 +23,7 @@ pub struct Snapshot {
     pub zoom: f32,
     pub center: [f32; 2],
     pub brush: f32,
+    pub currents: usize,
     pub jet_angle: f32,
     pub jet_speed: f32,
     pub radial_speed: f32,
@@ -154,6 +155,12 @@ pub fn script() -> Vec<(u64, Act)> {
     s.mark().key(KeyG).check("G aims the jet back (J)", |m, s| (s.jet_angle - m.jet_angle + 15.0).abs() < 0.01);
     s.mark().drag(MouseButton::Left, [340.0, 180.0], [400.0, 180.0], 20);
     s.check("jet emits (J)", |m, s| s.particles > m.particles);
+
+    // A current placed in the pool (Z, click) stirs it without adding liquid; X removes it.
+    s.wait(120).mark().key(KeyZ).click([256.0, floor]).wait(90);
+    s.check("place a current (Z)", |m, s| s.currents == 1 && s.particles == m.particles && s.rms_speed > m.rms_speed);
+    s.mark().key(KeyX).click([256.0, floor]).wait(5);
+    s.check("remove the current (X)", |m, s| s.currents == 0 && s.shapes == m.shapes);
 
     // Reset, next map, and a change of resolution with fluid on screen.
     s.mark().key(KeyR).wait(5).check("reset the map (R)", |m, s| s.particles == 0 && s.shapes == 0 && s.map == m.map);

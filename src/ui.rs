@@ -13,7 +13,7 @@ use crate::{
     maps::MAPS,
     render::View,
     scene::Shape,
-    sim::{Material, SimParams, SolverStats},
+    sim::{CURRENT_SPEED, Current, Material, SimParams, SolverStats},
     world::World,
 };
 
@@ -25,6 +25,7 @@ pub enum Tool {
     Drop,
     Grab,
     Push,
+    Current,
     Erase,
     Circle,
     Box,
@@ -33,7 +34,7 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const LIQUID: [Tool; 7] = [Tool::Pour, Tool::Spray, Tool::Jet, Tool::Drop, Tool::Grab, Tool::Push, Tool::Erase];
+    pub const LIQUID: [Tool; 8] = [Tool::Pour, Tool::Spray, Tool::Jet, Tool::Drop, Tool::Grab, Tool::Push, Tool::Current, Tool::Erase];
     pub const SOLID: [Tool; 4] = [Tool::Circle, Tool::Box, Tool::Ramp, Tool::Remove];
 
     pub fn name(self) -> &'static str {
@@ -44,6 +45,7 @@ impl Tool {
             Tool::Drop => "Drop",
             Tool::Grab => "Grab",
             Tool::Push => "Push",
+            Tool::Current => "Current",
             Tool::Erase => "Erase",
             Tool::Circle => "Circle",
             Tool::Box => "Box",
@@ -61,6 +63,7 @@ impl Tool {
             Tool::Drop => "C",
             Tool::Grab => "W",
             Tool::Push => "V",
+            Tool::Current => "Z",
             Tool::Erase => "E",
             Tool::Circle => "A",
             Tool::Box => "S",
@@ -71,15 +74,16 @@ impl Tool {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Tool::Pour => "Hold for a steady stream, like a faucet. Flow sets how fast it runs.",
+            Tool::Pour => "Hold to pour a stream as wide as the brush. Flow sets how fast it runs.",
             Tool::Spray => "Hold to throw droplets outwards from the rim of the brush.",
             Tool::Jet => "Hold for a powered stream. T / G or the wheel aims it (Alt + wheel zooms).",
             Tool::Drop => "Click to drop a round blob. Works while paused.",
             Tool::Grab => "Drag to carry and stir liquid. The right button grabs with any tool.",
             Tool::Push => "Hold to drive liquid outwards from the cursor.",
+            Tool::Current => "Click to place a current that drives the liquid passing through it. T / G or the wheel aim it.",
             Tool::Erase => "Hold to remove liquid under the brush.",
             Tool::Circle | Tool::Box | Tool::Ramp => "Click to place. T / G rotate, F flips a ramp.",
-            Tool::Remove => "Click a highlighted solid to remove it.",
+            Tool::Remove => "Click a highlighted solid or current to remove it.",
         }
     }
 
@@ -90,7 +94,7 @@ impl Tool {
 
     /// Tools whose strength is a force rather than a flow rate.
     pub fn is_force(self) -> bool {
-        matches!(self, Tool::Grab | Tool::Push)
+        matches!(self, Tool::Grab | Tool::Push | Tool::Current)
     }
 
     pub fn places_shape(self) -> bool {
@@ -102,6 +106,7 @@ impl Tool {
         match self {
             Tool::Grab => Color32::from_rgb(120, 228, 200),
             Tool::Push => Color32::from_rgb(196, 160, 255),
+            Tool::Current => CURRENT,
             Tool::Erase | Tool::Remove => DANGER,
             Tool::Circle | Tool::Box | Tool::Ramp => Color32::from_gray(225),
             _ => swatch(material),
@@ -118,6 +123,8 @@ pub const GRIDS: [(&str, [u32; 2]); 4] = [
 
 const ACCENT: Color32 = Color32::from_rgb(110, 190, 255);
 const DANGER: Color32 = Color32::from_rgb(255, 110, 96);
+/// Colour of currents on the canvas.
+const CURRENT: Color32 = Color32::from_rgb(255, 214, 110);
 const WARN: Color32 = Color32::from_rgb(240, 180, 90);
 
 /// Rolling window of frame times.
@@ -152,10 +159,12 @@ pub struct UiState {
     pub brush: f32,
     /// Flow of the liquid tools, particles per second.
     pub pour_rate: f32,
-    /// Strength of grab and push relative to their default.
+    /// Strength of grab, push and newly placed currents relative to their default.
     pub force_strength: f32,
     /// Jet heading in degrees clockwise from straight down.
     pub jet_angle: f32,
+    /// Heading of the next current, degrees clockwise from straight down.
+    pub current_angle: f32,
     /// Rotation of placed boxes and ramps, degrees.
     pub shape_angle: f32,
     /// Width / height ratio of placed boxes and ramps.
@@ -182,6 +191,7 @@ impl Default for UiState {
             pour_rate: 12000.0,
             force_strength: 1.0,
             jet_angle: 0.0,
+            current_angle: 90.0,
             shape_angle: 0.0,
             shape_aspect: 4.0,
             shape_flip: false,
@@ -211,17 +221,22 @@ impl UiState {
         }
     }
 
-    /// T / G: aims the jet, or turns the shape about to be placed.
+    /// T / G: aims the jet or the current, or turns the shape about to be placed.
     pub fn rotate(&mut self, degrees: f32) {
-        if self.tool == Tool::Jet {
-            self.rotate_jet(degrees);
-        } else {
+        if !self.aim(degrees) {
             self.rotate_shape(degrees);
         }
     }
 
-    pub fn rotate_jet(&mut self, degrees: f32) {
-        self.jet_angle = (self.jet_angle + degrees + 180.0).rem_euclid(360.0) - 180.0;
+    /// Turns the jet or the current, whichever is selected. Returns whether one was.
+    pub fn aim(&mut self, degrees: f32) -> bool {
+        let angle = match self.tool {
+            Tool::Jet => &mut self.jet_angle,
+            Tool::Current => &mut self.current_angle,
+            _ => return false,
+        };
+        *angle = (*angle + degrees + 180.0).rem_euclid(360.0) - 180.0;
+        true
     }
 
     pub fn rotate_shape(&mut self, degrees: f32) {
@@ -497,7 +512,7 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
             ui.label("Strength");
             let mut percent = state.force_strength * 100.0;
             ui.add(egui::Slider::new(&mut percent, 10.0..=400.0).logarithmic(true).suffix(" %"))
-                .on_hover_text("How hard Grab and Push move liquid. - and = adjust it.");
+                .on_hover_text("How hard Grab and Push move liquid, and how fast a new Current flows. - and = adjust it.");
             state.force_strength = percent / 100.0;
             ui.end_row();
         } else if state.tool.uses_material() && state.tool != Tool::Drop {
@@ -508,9 +523,14 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
             state.pour_rate = k * 1000.0;
             ui.end_row();
         }
-        if state.tool == Tool::Jet {
+        let aim = match state.tool {
+            Tool::Jet => Some(&mut state.jet_angle),
+            Tool::Current => Some(&mut state.current_angle),
+            _ => None,
+        };
+        if let Some(angle) = aim {
             ui.label("Aim");
-            ui.add(egui::Slider::new(&mut state.jet_angle, -180.0..=180.0).suffix("°"))
+            ui.add(egui::Slider::new(angle, -180.0..=180.0).suffix("°"))
                 .on_hover_text("0° points down, 90° right. T / G or the wheel turn it by 15°.");
             ui.end_row();
         }
@@ -596,15 +616,15 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
                 "Left mouse    use the selected tool\n\
                  Right mouse   grab / stir\n\
                  Middle drag   pan\n\
-                 Wheel         zoom (aims the jet)\n\
-                 Alt+wheel     zoom with the jet\n\
+                 Wheel         zoom (aims jet, current)\n\
+                 Alt+wheel     zoom while aiming\n\
                  Shift+wheel   brush size  ([ ])\n\
                  - / =         flow / strength\n\
                  1 2 3         water, oil, syrup\n\
                  Q B J C       pour, spray, jet, drop\n\
-                 W V E         grab, push, erase\n\
+                 W V Z E       grab, push, current, erase\n\
                  A S D X       circle, box, ramp, remove\n\
-                 T G F         rotate (jet, shape), flip\n\
+                 T G F         aim / rotate, flip\n\
                  Space N R     pause, step, reset\n\
                  PgUp PgDn     previous / next map\n\
                  Home H F11    reset view, panel, fullscreen",
@@ -693,6 +713,8 @@ impl Overlay {
         pressed: bool,
         grabbing: bool,
         shape: Option<(Shape, bool)>,
+        currents: &[Current],
+        doomed: Option<usize>,
     ) {
         let now = ctx.input(|i| i.time);
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -709,6 +731,10 @@ impl Overlay {
         let turn = (state.jet_angle - self.shown_jet + 540.0).rem_euclid(360.0) - 180.0;
         self.shown_jet += turn * k;
 
+        for (i, current) in currents.iter().enumerate() {
+            let color = if doomed == Some(i) { DANGER } else { CURRENT };
+            draw_current(&painter, to_screen(ctx, view, size, current.pos), current.radius * zoom, current.vel, color, now);
+        }
         if let Some((shape, remove)) = shape {
             outline(&painter, ctx, &shape, view, size, remove);
         }
@@ -785,6 +811,11 @@ impl Overlay {
                 let dir = egui::vec2(a.sin(), a.cos());
                 painter.arrow(c, dir * (r + 14.0), glyph);
             }
+            Tool::Current => {
+                let a = state.current_angle.to_radians();
+                let dir = egui::vec2(a.sin(), a.cos());
+                painter.arrow(c - dir * r * 0.6, dir * r * 1.2, glyph);
+            }
             Tool::Push => {
                 for i in 0..8 {
                     let d = Vec2::angled(i as f32 * std::f32::consts::TAU / 8.0);
@@ -804,6 +835,27 @@ impl Overlay {
             }
             _ => {}
         }
+    }
+}
+
+/// Draws a placed current: its zone, and chevrons drifting along it at a pace that follows
+/// its speed. `vel` is in world axes (+y up), `c` and `r` in screen points.
+fn draw_current(painter: &egui::Painter, c: Pos2, r: f32, vel: [f32; 2], color: Color32, now: f64) {
+    let speed = vel[0].hypot(vel[1]).max(1e-3);
+    let dir = egui::vec2(vel[0], -vel[1]) / speed;
+    let side = egui::vec2(-dir.y, dir.x);
+    painter.circle_filled(c, r, color.gamma_multiply(0.04));
+    painter.circle_stroke(c, r, Stroke::new(1.0_f32, color.gamma_multiply(0.45)));
+    const CHEVRONS: usize = 3;
+    let phase = (now * (speed as f64 / CURRENT_SPEED as f64) * 0.6).fract() as f32;
+    for i in 0..CHEVRONS {
+        // Each chevron crosses the zone from tail to head, fading in and out at the ends.
+        let t = (i as f32 + phase) / CHEVRONS as f32;
+        let tip = c + dir * r * (1.5 * t - 0.6);
+        let wing = (r * 0.28).clamp(3.0, 14.0);
+        let stroke = Stroke::new(1.5_f32, color.gamma_multiply(0.9 * (std::f32::consts::PI * t).sin()));
+        painter.line_segment([tip, tip - dir * wing + side * wing], stroke);
+        painter.line_segment([tip, tip - dir * wing - side * wing], stroke);
     }
 }
 

@@ -173,7 +173,7 @@ fn ui_frame(gpu: &Arc<Gpu>, off: &mut Offscreen, world: &mut World, view: View, 
             if frame == 0 {
                 overlay.toast_map(ctx, world.map);
             }
-            overlay.draw(ctx, &state, view, size, Some(cursor), false, false, None);
+            overlay.draw(ctx, &state, view, size, Some(cursor), false, false, None, world.currents(), None);
         });
         deltas.push(out.textures_delta);
         shapes = out.shapes;

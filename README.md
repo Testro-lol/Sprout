@@ -42,14 +42,14 @@ Useful options (run `sprout --help` for all of them):
 |---|---|
 | Left mouse | Use the selected tool |
 | Right mouse | Grab / stir, whatever tool is selected |
-| Middle drag, wheel | Pan, zoom about the cursor (with Jet selected the wheel aims; Alt + wheel zooms) |
+| Middle drag, wheel | Pan, zoom about the cursor (with Jet or Current selected the wheel aims; Alt + wheel zooms) |
 | Shift + wheel, `[` `]` | Brush size |
-| `-` `=` | Flow of the liquid tools, or strength of Grab / Push |
+| `-` `=` | Flow of the liquid tools, or strength of Grab / Push / Current |
 | `1` `2` `3` | Water, oil, syrup |
 | `Q` `B` `J` `C` | Pour, spray, jet, drop |
-| `W` `V` `E` | Grab / stir, push, erase |
-| `A` `S` `D` `X` | Place a circle, box, ramp; remove a solid |
-| `T` `G` `F` | Rotate the jet or the box / ramp by 15°, flip the ramp |
+| `W` `V` `Z` `E` | Grab / stir, push, place a current, erase |
+| `A` `S` `D` `X` | Place a circle, box, ramp; remove a solid or a current |
+| `T` `G` `F` | Turn the jet, the current or the box / ramp by 15°, flip the ramp |
 | `Space` `N` `R` | Pause, single step, reset the map |
 | `PgUp` `PgDn` | Previous / next map |
 | `Home` `H` `F11` `Esc` | Reset view, hide panel, fullscreen, quit |
@@ -61,26 +61,40 @@ substep and iteration counts), the grid resolution and slow motion.
 The liquid tools add the selected liquid; all of them stop with the simulation while it is
 paused (single steps still emit), except Drop.
 
-- **Pour** is a faucet: a steady stream straight down from the brush, gap-free at any
-  frame rate and however fast the brush moves. The flow sets its speed (150 to 400
-  cells/s, as slow as the flow allows through the full width of the brush); below the
-  slowest speed the stream narrows instead, and above the fastest the brush caps the flow.
-  Inside the brush the nozzle holds the liquid at the launch velocity, so each frame's rows
-  join the last frame's without a seam; below it the stream speeds up and narrows under
-  gravity.
+- **Pour** runs a stream straight down out of the round brush: it fills the brush circle,
+  so its top is round, and falls from there. The flow sets its speed (60 to 400 cells/s:
+  whatever carries the flow through the full width of the brush); below the slowest speed
+  the stream narrows instead, and above the fastest the brush caps the flow. The stream is
+  one fixed lattice at rest density (`brush::Stream`) that moves along at the stream's
+  speed and appears as it crosses the back arc of the nozzle, so it has no seams at any
+  frame rate and the flow is exact. Inside the brush the nozzle holds the liquid at the
+  launch velocity; below it the stream is in free fall, speeds up and narrows. Sweeping
+  the brush sideways faster than the stream runs delivers less: the leading side of the
+  nozzle overruns liquid it has just emitted, and the surplus is held back.
 - **Spray** throws sparse droplets outwards from the brush rim at 260 cells/s, at 15 % of
   the flow.
-- **Jet** launches an aimed stream at 320 cells/s; the flow sets its width. Its nozzle
-  holds the liquid in it at the jet velocity like the faucet's, so a submerged jet keeps
-  pushing.
+- **Jet** is the same stream aimed anywhere at 320 cells/s; the flow sets its width. Its
+  nozzle holds the liquid in it at the jet velocity, so a submerged jet keeps pushing.
 - **Drop** stamps a round blob with one click, even while paused.
 - **Grab** carries liquid along with the cursor, **Push** drives it radially outwards, and
   **Erase** removes it. Grab and Push have a strength (10–400 %) instead of a flow; the
   strength also applies to right-mouse grabbing.
+- **Current** places a round zone, as large as the brush, that stays in the world and
+  drives the liquid passing through it along its heading, like a pump or a fan. It raises
+  the velocity along the heading towards the current's speed (150 cells/s at 100 %
+  strength, at up to 12 /s in the centre, fading to nothing at the rim) and leaves
+  everything else alone: liquid that is already faster is not braked, motion across the
+  current is untouched, and no liquid is added or removed. Aim it with `T` / `G`, the
+  wheel or the Aim slider before placing; chevrons on the canvas show where it points and
+  how fast. Up to 8 at a time; **Remove** (`X`) deletes the one under the cursor, and
+  resetting or changing the map clears them. The constants are `CURRENT_SPEED` and
+  `CURRENT_RATE` in `src/sim/params.rs`.
 
 New liquid never packs a cell above rest density, and nothing is added inside a pool:
 painted liquid (spray, drop) only goes into cells without liquid, while a stream (pour,
-jet) may top up the cells its previous rows are just leaving. The particles per cell are
+jet) fills the cells it shares with its own earlier liquid, up to 1.5 times rest density
+(a lattice that is not aligned to the grid puts 3 to 5 particles in a cell). A submerged
+spout is held back the same way: the pool takes what it has room for. The particles per cell are
 counted on the GPU (`count.comp`) for just the window around the
 brush, and only those counts are read back: 0.3 ms per frame at 512 × 288 and 0.4 ms at
 1024 × 576, where reading back every particle cost 1.7 and 34 ms.
@@ -133,7 +147,7 @@ cargo test --release                     # CPU-side unit tests
 ```
 
 `validate` takes a test name (`hydrostatic`, `dam`, `ritter`, `layers`, `viscosity`,
-`viscous`, `buoyancy`, `surface`, `settle`, `convergence`, `tools`) and `--shots DIR` to save a
+`viscous`, `buoyancy`, `surface`, `settle`, `convergence`, `pour`, `current`, `tools`) and `--shots DIR` to save a
 picture of each scenario. Two debug commands are not in `--help`: `sprout probe [DEPTH]`
 prints an energy, step and iteration trace (`--map N` for a map, `--at T` for the duration),
 and `sprout profile` splits a frame into CPU recording and GPU time and times every pass of
