@@ -1,6 +1,8 @@
 //! Sprout: a fast, interactive 2D multi-fluid sandbox.
 
 mod app;
+mod brush;
+mod camera;
 mod gpu;
 mod gui;
 mod headless;
@@ -210,7 +212,7 @@ fn main() {
                 event_loop,
                 gpu,
                 app::AppOptions {
-                    map: if o.selftest { maps::MAPS.len() - 1 } else { o.map },
+                    map: if o.selftest { maps::MAPS.iter().position(|m| m.name == "Empty Tank").expect("built-in empty map") } else { o.map },
                     grid: if o.selftest { [512, 288] } else { o.grid },
                     size: o.size.unwrap_or([1600, 900]),
                     vsync: o.vsync || o.selftest,

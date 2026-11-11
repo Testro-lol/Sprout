@@ -1,0 +1,23 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Counts the live particles in each cell of a window of the grid, for the admission of new
+// liquid under a brush (World::emit): only the window's counts are read back, never the
+// particles themselves.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform CountPC {
+    ivec2 origin;  // first cell of the window
+    ivec2 size;    // window size in cells; counts are stored row by row
+    uint n_slots;
+} C;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= C.n_slots || particles[id].kind == KIND_DEAD) return;
+    ivec2 c = ivec2(floor(particles[id].pos)) - C.origin;
+    if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, C.size))) return;
+    atomicAdd(cell_count[c.y * C.size.x + c.x], 1u);
+}

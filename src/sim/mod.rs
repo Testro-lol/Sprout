@@ -41,7 +41,8 @@ use vulkano::{
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo,
     },
-    sync::GpuFuture,
+    query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType},
+    sync::{GpuFuture, PipelineStage},
 };
 
 use crate::{
@@ -64,8 +65,10 @@ const SORT_INTERVAL: u32 = 128;
 const SORT_MIN_PARTICLES: u32 = 16384;
 const GRID_GROUP: u32 = 16;
 const STATS_RUN: u32 = 64 * 64;
-/// Largest grid the single-workgroup coarse solve takes (cells).
-const COARSEST_CELLS: u32 = 64;
+/// Largest grid the coarsest-level solve takes (cells).
+const COARSEST_CELLS: u32 = 4;
+/// Levels of at most this many cells are all handled by one dispatch (`mg_tail.comp`).
+const TAIL_CELLS: u32 = 1500;
 /// Weight of the multigrid coarse-grid correction. Aggregation (piecewise-constant)
 /// coarsening under-corrects smooth errors; over-correcting compensates (Braess 1995).
 const MG_OMEGA: f32 = 1.8;
@@ -74,6 +77,9 @@ const STEP_WORDS: u64 = 12;
 const SOLVE_WORDS: u64 = 28;
 /// First word of the statistics in `SolveBuf`, cleared by the CPU after each read-back.
 const SOLVE_STATS: u64 = 21;
+/// The blocking helpers stop when less than this share of a substep is left (see
+/// `advance_blocking`).
+const SLIVER: f64 = 0.02;
 /// Host read-back slots in flight.
 const READBACK_RING: usize = 3;
 
@@ -109,6 +115,9 @@ pub struct SolverStats {
     pub dt_cfl: f32,
     /// Speed (cells/s) the latest substep was sized for.
     pub umax: f32,
+    /// Fastest liquid face and fastest particle displacement of the latest substep, cells/s.
+    pub umax_grid: f32,
+    pub umax_part: f32,
 }
 
 impl SolverStats {
@@ -128,6 +137,15 @@ struct MgPc {
     off_c: i32,
     dim_f: [i32; 2],
     dim_c: [i32; 2],
+    mode: u32,
+    omega: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct TailPc {
+    first: u32,
+    last: u32,
     mode: u32,
     omega: f32,
 }
@@ -288,6 +306,11 @@ struct Levels {
     dims: Vec<[u32; 2]>,
     offs: Vec<u32>,
     total: u32,
+    /// First level of the tail: it and every coarser level share one dispatch.
+    tail: usize,
+    /// Offset of each level's 16 x 16 tile flags (levels 0..=tail), and their total number.
+    tile_offs: Vec<u32>,
+    tiles: u32,
 }
 
 impl Levels {
@@ -303,7 +326,18 @@ impl Levels {
             offs.push(total);
             total += d[0] * d[1];
         }
-        Levels { dims, offs, total }
+        let tail = (1..dims.len()).find(|&l| dims[l][0] * dims[l][1] <= TAIL_CELLS).unwrap_or(dims.len() - 1).max(1).min(dims.len() - 1);
+        let mut tile_offs = vec![0; dims.len()];
+        let mut tiles = 0;
+        for l in 0..=tail {
+            tile_offs[l] = tiles;
+            tiles += dims[l][0].div_ceil(GRID_GROUP) * dims[l][1].div_ceil(GRID_GROUP);
+        }
+        Levels { dims, offs, total, tail, tile_offs, tiles }
+    }
+
+    fn tail_pc(&self, mode: u32) -> TailPc {
+        TailPc { first: self.tail as u32, last: self.last() as u32, mode, omega: MG_OMEGA }
     }
 
     /// Index of the coarsest level.
@@ -326,6 +360,11 @@ impl Levels {
             omega: MG_OMEGA,
         }
     }
+
+    /// Push constants of a multigrid kernel on level `l`: the level rides in the mode word.
+    fn mg(&self, l: usize, flag: bool) -> MgPc {
+        self.pc(l, flag as u32 | (l as u32) << 8)
+    }
 }
 
 struct Passes {
@@ -346,19 +385,18 @@ struct Passes {
     visc_dir: Pass,
     rhs: Pass,
     mg_build: Pass,
-    mg_pre: Pass,
-    mg_restrict: Pass,
-    mg_post_black: Pass,
-    mg_post_red: Pass,
-    mg_coarse: Pass,
+    mg_down: Pass,
+    mg_up: Pass,
+    mg_tail: Pass,
     cg_scale: Pass,
     cg_init: Pass,
-    cg_apply: Pass,
-    cg_update: Pass,
-    cg_dir: Pass,
+    /// Even and odd iterations: the two search-direction buffers swap roles.
+    cg_apply: [Pass; 2],
+    cg_update: [Pass; 2],
     cg_reduce: Pass,
     project: Pass,
     claim: Pass,
+    count: Pass,
     stats: Pass,
     sort: Pass,
 }
@@ -371,6 +409,9 @@ struct Readback {
     target: f32,
     /// Resets since creation when it was requested; older ones are stale.
     epoch: u32,
+    /// GPU timestamps before and after the batch's substeps, and how many there were.
+    pool: Arc<QueryPool>,
+    substeps: u32,
 }
 
 pub struct FluidSim {
@@ -396,6 +437,8 @@ pub struct FluidSim {
     epoch: u32,
     /// Latest CFL-limited substep length the GPU reported, s.
     dt_estimate: f32,
+    /// Smoothed GPU time of one substep, s (0 until the first measurement arrives).
+    substep_cost: f32,
     /// Iterations recorded per substep for each solve, adapted to what recent solves used.
     pressure_rec: u32,
     viscosity_rec: u32,
@@ -403,6 +446,8 @@ pub struct FluidSim {
     spawn_speed: f32,
     /// Fluids the tank has held since the last reset: water, syrup, oil.
     present: [bool; 3],
+    /// Next permanent particle id (see `Particle::id`).
+    next_id: u32,
 
     levels: Levels,
     nwg: u32,
@@ -418,11 +463,15 @@ pub struct FluidSim {
     /// One flag per 16 x 16 tile: where the implicit viscosity solve runs.
     tiles: Subbuffer<[u32]>,
     spawn: Subbuffer<[Particle]>,
+    /// Particles per cell in a window of the grid (`cell_counts`).
+    cell_count: Subbuffer<[u32]>,
     counter: Subbuffer<[u32]>,
     step_buf: Subbuffer<[u32]>,
     solve_buf: Subbuffer<[u32]>,
     ind: Subbuffer<[DispatchIndirectCommand]>,
     ind_ready: bool,
+    lev: Subbuffer<[[i32; 4]]>,
+    ptile: Subbuffer<[u32]>,
     params_buf: Subbuffer<GpuParams>,
     /// Every float field, for the one-off clear.
     fields: Vec<Subbuffer<[u32]>>,
@@ -448,7 +497,7 @@ impl FluidSim {
         let levels = Levels::new(grid);
         let mg = levels.total as u64;
         let nwg = grid[0].div_ceil(GRID_GROUP) * grid[1].div_ceil(GRID_GROUP);
-        let entries = levels.dims.len() as u64 + 2;
+        let entries = levels.dims.len() as u64 + 4;
 
         let particles = device_buffer::<Particle>(&gpu, capacity as u64, none);
         let sorted = device_buffer::<Particle>(&gpu, capacity as u64, none);
@@ -464,6 +513,7 @@ impl FluidSim {
         let solid = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let sdf = device_buffer::<f32>(&gpu, nodes, none);
         let spawn = device_buffer::<Particle>(&gpu, SPAWN_MAX as u64, none);
+        let cell_count = device_buffer::<u32>(&gpu, cells, none);
         let counter = device_buffer::<u32>(&gpu, 8, none);
         let step_buf = device_buffer::<u32>(&gpu, STEP_WORDS, none);
         let solve_buf = device_buffer::<u32>(&gpu, SOLVE_WORDS, none);
@@ -472,7 +522,11 @@ impl FluidSim {
         let mgd = device_buffer::<f32>(&gpu, mg, none);
         let mgx = device_buffer::<[f32; 2]>(&gpu, mg, none);
         let mgr = device_buffer::<[f32; 2]>(&gpu, mg, none);
+        let mgz = device_buffer::<[f32; 2]>(&gpu, mg, none);
         let cgp = device_buffer::<[f32; 2]>(&gpu, cells, none);
+        let cgp2 = device_buffer::<[f32; 2]>(&gpu, cells, none);
+        let lev = device_buffer::<[i32; 4]>(&gpu, levels.dims.len() as u64, none);
+        let ptile = device_buffer::<u32>(&gpu, levels.tiles as u64, none);
         let cgq = device_buffer::<[f32; 2]>(&gpu, cells, none);
         let vr = device_buffer::<[f32; 2]>(&gpu, cells, none);
         let vp = device_buffer::<[f32; 2]>(&gpu, cells, none);
@@ -529,6 +583,15 @@ impl FluidSim {
         put(30, surf.as_bytes().clone());
         put(31, pjump.as_bytes().clone());
         put(32, tiles.as_bytes().clone());
+        put(33, lev.as_bytes().clone());
+        put(34, cgp2.as_bytes().clone());
+        put(35, ptile.as_bytes().clone());
+        put(36, mgz.as_bytes().clone());
+        put(37, cell_count.as_bytes().clone());
+        // The same bindings with the two search-direction buffers swapped.
+        let mut swapped = table.clone();
+        swapped.insert(23, cgp2.as_bytes().clone());
+        swapped.insert(34, cgp.as_bytes().clone());
 
         let fields = vec![
             particles.clone().reinterpret::<[u32]>(),
@@ -549,7 +612,10 @@ impl FluidSim {
             mgd.reinterpret::<[u32]>(),
             mgx.reinterpret::<[u32]>(),
             mgr.reinterpret::<[u32]>(),
+            mgz.reinterpret::<[u32]>(),
             cgp.reinterpret::<[u32]>(),
+            cgp2.reinterpret::<[u32]>(),
+            ptile.clone(),
             cgq.reinterpret::<[u32]>(),
             vr.reinterpret::<[u32]>(),
             vp.reinterpret::<[u32]>(),
@@ -579,25 +645,37 @@ impl FluidSim {
             visc_dir: p("visc_dir", spirv!("visc_dir.comp")),
             rhs: p("rhs", spirv!("rhs.comp")),
             mg_build: p("mg_build", spirv!("mg_build.comp")),
-            mg_pre: p("mg_pre", spirv!("mg_pre.comp")),
-            mg_restrict: p("mg_restrict", spirv!("mg_restrict.comp")),
-            mg_post_black: p("mg_post_black", spirv!("mg_post_black.comp")),
-            mg_post_red: p("mg_post_red", spirv!("mg_post_red.comp")),
-            mg_coarse: p("mg_coarse", spirv!("mg_coarse.comp")),
+            mg_down: p("mg_down", spirv!("mg_down.comp")),
+            mg_up: p("mg_up", spirv!("mg_up.comp")),
+            mg_tail: p("mg_tail", spirv!("mg_tail.comp")),
             cg_scale: p("cg_scale", spirv!("cg_scale.comp")),
             cg_init: p("cg_init", spirv!("cg_init.comp")),
-            cg_apply: p("cg_apply", spirv!("cg_apply.comp")),
-            cg_update: p("cg_update", spirv!("cg_update.comp")),
-            cg_dir: p("cg_dir", spirv!("cg_dir.comp")),
+            cg_apply: [p("cg_apply", spirv!("cg_apply.comp")), Pass::new(&gpu, "cg_apply", spirv!("cg_apply.comp"), &swapped)],
+            cg_update: [p("cg_update", spirv!("cg_update.comp")), Pass::new(&gpu, "cg_update", spirv!("cg_update.comp"), &swapped)],
             cg_reduce: p("cg_reduce", spirv!("cg_reduce.comp")),
             project: p("project", spirv!("project.comp")),
             claim: p("claim", spirv!("claim.comp")),
+            count: p("count", spirv!("count.comp")),
             stats: p("stats", spirv!("stats.comp")),
             sort: p("sort", spirv!("sort.comp")),
         };
-        let readbacks = (0..READBACK_RING)
-            .map(|_| Readback { host: readback::<u32>(&gpu, STEP_WORDS + SOLVE_WORDS), busy: false, target: 0.0, epoch: 0 })
+        let readbacks: Vec<Readback> = (0..READBACK_RING)
+            .map(|_| Readback {
+                host: readback::<u32>(&gpu, STEP_WORDS + SOLVE_WORDS),
+                busy: false,
+                target: 0.0,
+                epoch: 0,
+                pool: QueryPool::new(
+                    gpu.device.clone(),
+                    QueryPoolCreateInfo { query_count: 2, ..QueryPoolCreateInfo::query_type(QueryType::Timestamp) },
+                )
+                .unwrap(),
+                substeps: 0,
+            })
             .collect();
+        for r in &readbacks {
+            r.host.write().unwrap().fill(0);
+        }
 
         FluidSim {
             pass,
@@ -619,10 +697,12 @@ impl FluidSim {
             substeps_base: 0,
             epoch: 0,
             dt_estimate: NOMINAL_DT,
-            pressure_rec: 20,
-            viscosity_rec: 20,
+            substep_cost: 0.0,
+            pressure_rec: 24,
+            viscosity_rec: 24,
             spawn_speed: 0.0,
             present: [false; 3],
+            next_id: 0,
             levels,
             nwg,
             particles,
@@ -634,11 +714,14 @@ impl FluidSim {
             sdf,
             tiles,
             spawn,
+            cell_count,
             counter,
             step_buf,
             solve_buf,
             ind,
             ind_ready: false,
+            lev,
+            ptile,
             params_buf,
             fields,
             pending_reset: None,
@@ -682,6 +765,12 @@ impl FluidSim {
         if self.params.fixed_hz > 0.0 { 1.0 / self.params.fixed_hz } else { self.dt_estimate }
     }
 
+    /// GPU time one substep currently takes, s, measured with timestamps around each batch
+    /// and smoothed over about ten batches. 0 before the first measurement.
+    pub fn substep_cost(&self) -> f32 {
+        self.substep_cost
+    }
+
     /// Replaces the solid geometry. Takes effect at the next `record`.
     pub fn set_solids(&mut self, field: SolidField) {
         self.pending_solids = Some(field);
@@ -690,6 +779,10 @@ impl FluidSim {
     /// Replaces every particle. Takes effect at the next `record`.
     pub fn reset(&mut self, mut particles: Vec<Particle>) {
         particles.truncate(self.capacity as usize);
+        for (k, p) in particles.iter_mut().enumerate() {
+            p.id = k as u32;
+        }
+        self.next_id = particles.len() as u32;
         self.present = [false; 3];
         self.note_materials(&particles);
         self.pending_spawn.clear();
@@ -706,7 +799,10 @@ impl FluidSim {
             self.spawn_speed = self.spawn_speed.max(p.vel[0].hypot(p.vel[1]));
         }
         self.note_materials(particles);
-        self.pending_spawn.extend_from_slice(particles);
+        for p in particles {
+            self.pending_spawn.push(Particle { id: self.next_id, ..*p });
+            self.next_id = self.next_id.wrapping_add(1);
+        }
         particles.len()
     }
 
@@ -759,6 +855,7 @@ impl FluidSim {
             tool_strength: tool.strength,
             frame: self.frame,
             tol: [p.pressure_tol, p.correction_tol, p.viscosity_tol, p.density_tau],
+            ext: [p.speed_cap_cells(self.grid[1]), p.advection_order as f32, p.spray_cfl, 0.0],
         }
     }
 
@@ -766,9 +863,10 @@ impl FluidSim {
         self.ind.clone().slice(entry as u64..entry as u64 + 1)
     }
 
-    /// Indirect entries: one per level, the coarse solve, the viscosity grid.
+    /// Indirect entries: one per level, the coarse solve and the scalar reductions of the
+    /// pressure solve; then the viscosity grid and its reductions.
     fn entries(&self) -> u32 {
-        self.levels.dims.len() as u32 + 2
+        self.levels.dims.len() as u32 + 4
     }
 
     fn coarse_entry(&self) -> usize {
@@ -776,19 +874,25 @@ impl FluidSim {
     }
 
     fn visc_entry(&self) -> usize {
-        self.levels.dims.len() + 1
+        self.levels.dims.len() + 2
     }
 
     fn reduce(&self, b: &mut Recorder, mode: u32) {
         let pressure = mode < 4;
         let n_entries = self.entries();
-        let (first, last) = if pressure { (0, n_entries - 1) } else { (n_entries - 1, n_entries) };
+        let (first, last) = if pressure { (0, n_entries - 2) } else { (n_entries - 2, n_entries) };
         self.pass.cg_reduce.bind_raw(b);
         self.pass.cg_reduce.push_raw(
             b,
             ReducePc { mode, n: self.nwg, n_entries, first_entry: first, last_entry: last, pad: [0; 3] },
         );
-        b.dispatch([1, 1, 1]);
+        // The reductions inside the iteration are skipped too once their solve has converged
+        // (the last entry of each solve's range); the first and the closing one always run.
+        if matches!(mode, 1 | 2 | 5 | 6) {
+            b.dispatch_indirect(&self.ind_slice(last as usize - 1));
+        } else {
+            b.dispatch([1, 1, 1]);
+        }
     }
 
     /// Records `substeps` substeps meant to cover `target` seconds of simulated time
@@ -811,10 +915,15 @@ impl FluidSim {
                 cmds.push(DispatchIndirectCommand { x, y, z });
             }
             cmds.push(DispatchIndirectCommand { x: 1, y: 1, z: 1 });
+            cmds.push(DispatchIndirectCommand { x: 1, y: 1, z: 1 });
             let [x, y, z] = self.levels.groups(0);
             cmds.push(DispatchIndirectCommand { x, y, z });
+            cmds.push(DispatchIndirectCommand { x: 1, y: 1, z: 1 });
             let both: Vec<_> = cmds.iter().chain(cmds.iter()).copied().collect();
             b.copy_buffer(CopyBufferInfo::buffers(staging(&gpu, &both), self.ind.clone())).unwrap();
+            let lv = &self.levels;
+            let table: Vec<[i32; 4]> = (0..lv.dims.len()).map(|l| [lv.offs[l] as i32, lv.dims[l][0] as i32, lv.dims[l][1] as i32, lv.tile_offs[l] as i32]).collect();
+            b.copy_buffer(CopyBufferInfo::buffers(staging(&gpu, &table), self.lev.clone())).unwrap();
             self.ind_ready = true;
         }
         if let Some(field) = self.pending_solids.take() {
@@ -835,6 +944,8 @@ impl FluidSim {
             self.substeps_base = self.solver.substeps;
             self.grid_valid = false;
             self.dt_estimate = NOMINAL_DT;
+            // The first substeps of a new scene start from no pressure at all.
+            self.pressure_rec = self.params.pressure_max_iters;
         }
 
         // New particles go into fresh slots while there are any; after that they recycle
@@ -873,6 +984,15 @@ impl FluidSim {
             dispatch(b, particle_groups);
         }
 
+        // Time the substeps on the GPU when a read-back slot is free to carry the result.
+        let timed = (substeps > 0 && !self.readbacks[self.next_readback].busy).then(|| self.readbacks[self.next_readback].pool.clone());
+        if let Some(pool) = &timed {
+            // SAFETY: the pool is not in use: its slot's previous read-back has arrived.
+            unsafe {
+                b.reset_query_pool(pool.clone(), 0..2).unwrap();
+                b.write_timestamp(pool.clone(), 0, PipelineStage::AllCommands).unwrap();
+            }
+        }
         for _ in 0..substeps {
             self.since_sort += 1;
             if self.since_sort >= SORT_INTERVAL && self.n_slots >= SORT_MIN_PARTICLES {
@@ -884,8 +1004,11 @@ impl FluidSim {
             self.substeps_done += 1;
         }
 
+        if let Some(pool) = &timed {
+            unsafe { b.write_timestamp(pool.clone(), 1, PipelineStage::AllCommands) }.unwrap();
+        }
         if substeps > 0 {
-            self.request_readback(b, target);
+            self.request_readback(b, target, substeps);
         }
     }
 
@@ -941,6 +1064,8 @@ impl FluidSim {
             Viscosity::Explicit => self.record_viscosity_explicit(r, grid_groups),
             Viscosity::Implicit => self.record_viscosity(r, grid_groups, v_iters),
         }
+        // rhs.comp marks the tiles that hold pressure unknowns.
+        r.fill(&self.ptile.clone().slice(0..self.nwg as u64), 0);
         ps.rhs.bind_raw(r);
         r.dispatch(grid_groups);
         self.record_pressure(r, p_iters);
@@ -1018,31 +1143,25 @@ impl FluidSim {
     }
 
     /// One V-cycle on the residual in level 0 of mgr, leaving the result in mgx. With
-    /// `indirect`, every dispatch is skipped once the solve has converged.
+    /// `indirect`, every dispatch is skipped once the solve has converged. Levels from
+    /// `levels.tail` down are one dispatch (`mg_tail.comp`).
     fn record_vcycle(&self, b: &mut Recorder, indirect: bool) {
         let ps = &self.pass;
         let lv = &self.levels;
         let go = |b: &mut Recorder, l: usize| {
             if indirect { b.dispatch_indirect(&self.ind_slice(l)) } else { b.dispatch(lv.groups(l)) }
         };
-        let last = lv.last();
-        for l in 0..last {
-            ps.mg_pre.bind_raw(b);
-            ps.mg_pre.push_raw(b, lv.pc(l, 0));
+        for l in 0..lv.tail {
+            ps.mg_down.bind_raw(b);
+            ps.mg_down.push_raw(b, lv.mg(l, false));
             go(b, l);
-            ps.mg_restrict.bind_raw(b);
-            ps.mg_restrict.push_raw(b, lv.pc(l, 0));
-            go(b, l + 1);
         }
-        ps.mg_coarse.bind_raw(b);
-        ps.mg_coarse.push_raw(b, lv.pc(last, 0));
+        ps.mg_tail.bind_raw(b);
+        ps.mg_tail.push_raw(b, lv.tail_pc(0));
         if indirect { b.dispatch_indirect(&self.ind_slice(self.coarse_entry())) } else { b.dispatch([1, 1, 1]) }
-        for l in (0..last).rev() {
-            ps.mg_post_black.bind_raw(b);
-            ps.mg_post_black.push_raw(b, lv.pc(l, 0));
-            go(b, l);
-            ps.mg_post_red.bind_raw(b);
-            ps.mg_post_red.push_raw(b, lv.pc(l, (l == 0) as u32));
+        for l in (0..lv.tail).rev() {
+            ps.mg_up.bind_raw(b);
+            ps.mg_up.push_raw(b, lv.mg(l, l == 0));
             go(b, l);
         }
     }
@@ -1051,10 +1170,15 @@ impl FluidSim {
         let ps = &self.pass;
         let lv = &self.levels;
         let fine = [self.grid[0].div_ceil(GRID_GROUP), self.grid[1].div_ceil(GRID_GROUP), 1];
-        for l in 1..lv.dims.len() {
+        for l in 1..=lv.tail {
             ps.mg_build.bind_raw(b);
-            ps.mg_build.push_raw(b, lv.pc(l - 1, 0));
+            ps.mg_build.push_raw(b, lv.mg(l - 1, false));
             b.dispatch(lv.groups(l));
+        }
+        if lv.tail < lv.last() {
+            ps.mg_tail.bind_raw(b);
+            ps.mg_tail.push_raw(b, lv.tail_pc(1));
+            b.dispatch([1, 1, 1]);
         }
         let half = self.nwg;
         ps.cg_scale.bind_raw(b);
@@ -1065,27 +1189,24 @@ impl FluidSim {
         b.dispatch(fine);
         self.record_vcycle(b, false);
         self.reduce(b, 0);
-        ps.cg_dir.bind_raw(b);
-        ps.cg_dir.push_raw(b, lv.pc(0, 0));
-        b.dispatch_indirect(&self.ind_slice(0));
-        for _ in 0..iters {
-            ps.cg_apply.bind_raw(b);
-            ps.cg_apply.push_raw(b, lv.pc(0, half));
+        for k in 0..iters as usize {
+            // p = z + beta p (beta = 0 on the first pass), q = A p.
+            let apply = &ps.cg_apply[k % 2];
+            apply.bind_raw(b);
+            apply.push_raw(b, lv.pc(0, half));
             b.dispatch_indirect(&self.ind_slice(0));
             self.reduce(b, 1);
-            ps.cg_update.bind_raw(b);
-            ps.cg_update.push_raw(b, lv.pc(0, 0));
+            let update = &ps.cg_update[k % 2];
+            update.bind_raw(b);
+            update.push_raw(b, lv.pc(0, 0));
             b.dispatch_indirect(&self.ind_slice(0));
             self.record_vcycle(b, true);
             self.reduce(b, 2);
-            ps.cg_dir.bind_raw(b);
-            ps.cg_dir.push_raw(b, lv.pc(0, 0));
-            b.dispatch_indirect(&self.ind_slice(0));
         }
         self.reduce(b, 3);
     }
 
-    fn request_readback(&mut self, b: &mut Builder, target: f32) {
+    fn request_readback(&mut self, b: &mut Builder, target: f32, substeps: u32) {
         let k = self.next_readback;
         if self.readbacks[k].busy {
             // Every slot still in flight. Nothing is lost: simulated time is cumulative on
@@ -1101,6 +1222,7 @@ impl FluidSim {
         self.readbacks[k].busy = true;
         self.readbacks[k].target = target;
         self.readbacks[k].epoch = self.epoch;
+        self.readbacks[k].substeps = substeps;
     }
 
     /// Picks up every finished read-back: simulated time, the substep length, and solver
@@ -1116,6 +1238,23 @@ impl FluidSim {
                 Err(_) => continue,
             };
             self.readbacks[slot].busy = false;
+            // A frame whose submission failed (the swapchain went out of date, say) never
+            // ran its copy. The slot is kept zeroed between uses, and the substep counter
+            // of a batch that did run is never zero, so such a read-back is recognisable.
+            if let Ok(mut d) = self.readbacks[slot].host.write() {
+                d.fill(0);
+            }
+            if words[9] == 0 {
+                continue;
+            }
+            let mut ticks = [0u64; 2];
+            if let Ok(true) = self.readbacks[slot].pool.get_results(0..2, &mut ticks, QueryResultFlags::empty())
+                && ticks[1] > ticks[0]
+            {
+                let period = self.gpu.device.physical_device().properties().timestamp_period as f64 * 1e-9;
+                let cost = ((ticks[1] - ticks[0]) as f64 * period / self.readbacks[slot].substeps.max(1) as f64) as f32;
+                self.substep_cost = if self.substep_cost > 0.0 { self.substep_cost + 0.1 * (cost - self.substep_cost) } else { cost };
+            }
             if self.readbacks[slot].epoch != self.epoch {
                 continue;
             }
@@ -1131,6 +1270,8 @@ impl FluidSim {
             st.dt = f(4);
             st.dt_cfl = f(8);
             st.umax = f(10);
+            st.umax_grid = f(6);
+            st.umax_part = f(7);
             let p_it = words[s + 21];
             let v_it = words[s + 22];
             let p_un = words[s + 23] as u64;
@@ -1145,8 +1286,10 @@ impl FluidSim {
                 self.dt_estimate = st.dt_cfl;
             }
             // Record a little more than recent solves needed; grow fast when they ran out.
+            // The margin grows with the count: a viscosity solve of 35 iterations varies by
+            // several from one substep to the next, a pressure solve of 9 by one or two.
             let adapt = |rec: &mut u32, used: u32, unconverged: u64, max: u32| {
-                *rec = if unconverged > 0 { (*rec + *rec / 2 + 2).min(max) } else { (used + 2).clamp(2, max) };
+                *rec = if unconverged > 0 { (*rec + *rec / 2 + 2).min(max) } else { (used + used / 2 + 2).clamp(2, max) };
             };
             adapt(&mut self.pressure_rec, p_it, p_un, self.params.pressure_max_iters);
             adapt(&mut self.viscosity_rec, v_it, v_un, self.params.viscosity_max_iters);
@@ -1183,6 +1326,33 @@ impl FluidSim {
         }
         out.push(("total", (ticks[n - 1] - ticks[0]) as f64 * period));
         out
+    }
+
+    /// Times `n` trivial dispatches (ms each), to measure the fixed cost of a dispatch.
+    pub fn dispatch_floor(&mut self, n: u32, rebind: bool, fine: bool) -> f64 {
+        let mut r = Recorder::new(&self.gpu);
+        let fine_groups = [self.grid[0].div_ceil(GRID_GROUP), self.grid[1].div_ceil(GRID_GROUP), 1];
+        for k in 0..n {
+            if fine {
+                if rebind || k == 0 {
+                    self.pass.cg_scale.bind_raw(&mut r);
+                    self.pass.cg_scale.push_raw(&mut r, self.levels.pc(0, 0));
+                }
+                r.dispatch(fine_groups);
+            } else {
+                if rebind || k == 0 {
+                    self.pass.cg_reduce.bind_raw(&mut r);
+                    self.pass.cg_reduce.push_raw(&mut r, ReducePc { mode: 3, n: self.nwg, n_entries: self.entries(), first_entry: 0, last_entry: 0, pad: [0; 3] });
+                }
+                r.dispatch([1, 1, 1]);
+            }
+        }
+        let cb = r.finish();
+        let mut b = self.gpu.builder();
+        b.execute_commands(cb).unwrap();
+        let t = std::time::Instant::now();
+        submit_and_wait(&self.gpu, b);
+        t.elapsed().as_secs_f64() * 1e3 / n as f64
     }
 
     /// Records a sort of the particle buffer by grid cell. Positions and velocities are
@@ -1241,9 +1411,12 @@ impl FluidSim {
         loop {
             let left = goal - self.sim_time;
             let dt = self.dt_estimate() as f64;
-            // A sliver left over from rounding is not worth a substep of its own: every
-            // substep applies a full density correction however short it is.
-            if left <= 1e-3 * dt {
+            // A sliver left over from rounding must not become a substep of its own: momentum
+            // travels through the grid as fixed-point displacement per substep, so a step of
+            // a microsecond rounds slow flow away (on 1 mm cells, where steps are 0.6 ms,
+            // such slivers stopped a capillary oscillation dead). The goal is therefore met
+            // to within `SLIVER` of a substep.
+            if left <= SLIVER * dt {
                 break;
             }
             let n = if self.params.fixed_hz > 0.0 { (left / dt).round().max(1.0) } else { (left / dt).ceil() };
@@ -1274,7 +1447,7 @@ impl FluidSim {
         loop {
             let left = seconds - (self.sim_time - start);
             let dt = self.dt_estimate() as f64;
-            if left <= 1e-3 * dt {
+            if left <= SLIVER * dt {
                 break;
             }
             let n = ((left / dt).ceil() as u32).clamp(1, 16);
@@ -1284,6 +1457,44 @@ impl FluidSim {
             submit_and_wait(&self.gpu, b);
             self.poll_readbacks();
         }
+    }
+
+    /// Live particles per cell in the window of cells `[lo, hi)` (inside the grid), row by
+    /// row, including those queued by `spawn` but not uploaded yet. Waits for the GPU, but
+    /// reads back only the window's counts.
+    pub fn cell_counts(&self, lo: [i32; 2], hi: [i32; 2]) -> Vec<u32> {
+        assert!(lo[0] >= 0 && lo[1] >= 0 && hi[0] <= self.grid[0] as i32 && hi[1] <= self.grid[1] as i32);
+        let size = [(hi[0] - lo[0]).max(0), (hi[1] - lo[1]).max(0)];
+        let n = (size[0] * size[1]) as u64;
+        if n == 0 {
+            return Vec::new();
+        }
+        let window = self.cell_count.clone().slice(0..n);
+        let host = readback::<u32>(&self.gpu, n);
+        let mut b = self.gpu.builder();
+        b.fill_buffer(window.clone(), 0).unwrap();
+        if self.n_slots > 0 {
+            self.pass.count.bind(&mut b);
+            #[repr(C)]
+            #[derive(Clone, Copy, Pod, Zeroable)]
+            struct CountPc {
+                origin: [i32; 2],
+                size: [i32; 2],
+                n_slots: u32,
+            }
+            self.pass.count.push(&mut b, CountPc { origin: lo, size, n_slots: self.n_slots });
+            dispatch(&mut b, [self.n_slots.div_ceil(PARTICLE_GROUP), 1, 1]);
+        }
+        b.copy_buffer(CopyBufferInfo::buffers(window, host.clone())).unwrap();
+        submit_and_wait(&self.gpu, b);
+        let mut counts = host.read().unwrap().to_vec();
+        for p in &self.pending_spawn {
+            let c = [p.pos[0].floor() as i32 - lo[0], p.pos[1].floor() as i32 - lo[1]];
+            if c[0] >= 0 && c[1] >= 0 && c[0] < size[0] && c[1] < size[1] {
+                counts[(c[1] * size[0] + c[0]) as usize] += 1;
+            }
+        }
+        counts
     }
 
     pub fn download_particles(&self) -> Vec<Particle> {
@@ -1306,7 +1517,8 @@ impl FluidSim {
         let mut b = self.gpu.builder();
         b.copy_buffer(CopyBufferInfo::buffers(self.pres.clone(), host.clone())).unwrap();
         submit_and_wait(&self.gpu, b);
-        let p = host.read().unwrap().iter().map(|v| v[0]).collect();
+        let data = host.read().unwrap();
+        let p = data.iter().map(|v| v[0]).collect();
         (p, self.solver.dt)
     }
 }

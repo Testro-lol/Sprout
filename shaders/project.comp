@@ -47,8 +47,10 @@ void main() {
         }
         vel[i] = me;
     }
+    // Faces of the liquid only (those the projection acted on): spray faces carry single
+    // particles, which report their own speed in particles.comp.
     float m = 0.0;
-    if (face_live(me.z)) m = abs(me.x);
-    if (face_live(me.w)) m = max(m, abs(me.y));
+    if (face_live(me.z) && cf.x != 0.0) m = abs(me.x);
+    if (face_live(me.w) && cf.y != 0.0) m = max(m, abs(me.y));
     report(m);
 }

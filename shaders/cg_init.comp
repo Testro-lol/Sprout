@@ -9,6 +9,10 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 void main() {
+    if (ptile[group_slot()] == 0u) {
+        if (gl_LocalInvocationIndex == 0u) part[M.mode + group_slot()] = vec4(0.0);
+        return;
+    }
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     vec4 acc4 = vec4(0.0);
     if (inside_f(c)) {

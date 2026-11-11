@@ -17,6 +17,12 @@ layout(push_constant) uniform PC {
     uint gather;  // 0 on the first substep after a reset: the grid holds nothing yet
 } pc;
 
+// Gradient of the smoothed oil fraction (per cell) below which unresolved droplets drift
+// freely, and above which the interface counts as resolved and nothing drifts. A sharp
+// interface reads about 0.3 after smoothing.
+const float SLIP_GRAD_MIN = 0.04;
+const float SLIP_GRAD_MAX = 0.12;
+
 uint hash(uint x) {
     x ^= x >> 16;
     x *= 0x7feb352du;
@@ -35,6 +41,74 @@ float sample_sdf(vec2 x, out vec2 grad) {
     float d00 = sdf[k], d10 = sdf[k + 1], d01 = sdf[k + w1], d11 = sdf[k + w1 + 1];
     grad = vec2(mix(d10 - d00, d11 - d01, f.y), mix(d01 - d00, d11 - d10, f.x));
     return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+// Velocity the mouse tool drives a particle towards; `d` points from the particle to the
+// cursor. Grab (1) carries liquid along with the cursor and pulls it in; push (3) drives it
+// radially outwards at the speed in tool_vel.x, with a smooth centre where the direction is
+// undefined; a stream's nozzle (4) holds it at the launch velocity.
+vec2 tool_target(vec2 d) {
+    if (P.tool_mode == 3) return -d / max(length(d), 0.15 * P.tool_radius) * P.tool_vel.x;
+    if (P.tool_mode == 4) return P.tool_vel;
+    return P.tool_vel + d * 4.0;
+}
+
+// Grid velocity at x, bilinear over the live faces around it; components with no live face
+// nearby (spray in free flight) keep `fallback`.
+vec2 sample_vel(vec2 x, vec2 fallback) {
+    vec2 o = fallback;
+    {
+        vec2 gp = x - vec2(0.0, 0.5);
+        ivec2 base = ivec2(floor(gp));
+        vec2 f = gp - vec2(base);
+        float sw = 0.0, su = 0.0;
+        for (int b = 0; b < 2; b++) {
+            for (int a = 0; a < 2; a++) {
+                vec4 q = vel[cidx(base + ivec2(a, b))];
+                if (face_live(q.z)) {
+                    float wt = (a == 0 ? 1.0 - f.x : f.x) * (b == 0 ? 1.0 - f.y : f.y);
+                    sw += wt;
+                    su += wt * q.x;
+                }
+            }
+        }
+        if (sw > 1e-3) o.x = su / sw;
+    }
+    {
+        vec2 gp = x - vec2(0.5, 0.0);
+        ivec2 base = ivec2(floor(gp));
+        vec2 f = gp - vec2(base);
+        float sw = 0.0, su = 0.0;
+        for (int b = 0; b < 2; b++) {
+            for (int a = 0; a < 2; a++) {
+                vec4 q = vel[cidx(base + ivec2(a, b))];
+                if (face_live(q.w)) {
+                    float wt = (a == 0 ? 1.0 - f.x : f.x) * (b == 0 ? 1.0 - f.y : f.y);
+                    sw += wt;
+                    su += wt * q.y;
+                }
+            }
+        }
+        if (sw > 1e-3) o.y = su / sw;
+    }
+    return o;
+}
+
+// One push out of the solids: to the surface, then as far beyond it as the particle was
+// inside, so fluid caught under a newly placed solid keeps its area instead of being
+// flattened onto the outline. Removes the velocity into the solid.
+void collide(inout vec2 x, inout vec2 v) {
+    vec2 n;
+    float d = sample_sdf(x, n);
+    if (d < P.wall_margin) {
+        float l = length(n);
+        if (l > 1e-5) {
+            n /= l;
+            x += n * (P.wall_margin - d + max(-d, 0.0));
+            float vn = dot(v, n);
+            if (vn < 0.0) v -= vn * n;
+        }
+    }
 }
 
 void main() {
@@ -165,13 +239,35 @@ void main() {
                 float d = P.sep_tau;
                 float drho = rho_aq - P.rho.z;
                 float qa = 0.44 * rho_c, qb = 24.0 * nu_c * rho_c / d, qc = 4.0 / 3.0 * abs(drho) * P.gravity * d;
-                float vt = 2.0 * qc / (qb + sqrt(qb * qb + 4.0 * qa * qc));
+                // (No buoyancy, no drift: also keeps 0 / 0 out when gravity and viscosity are both zero.)
+                float vt = qc > 0.0 ? 2.0 * qc / (qb + sqrt(qb * qb + 4.0 * qa * qc)) : 0.0;
                 float share = p.kind == KIND_OIL ? 1.0 - o : -o;
                 // Capped at the CFL distance per step: the step size already accounts for
                 // the slip speed (it enters the particle speed below), so the cap only acts
                 // in the substep where slip first appears.
                 float sep_max = P.cfl / dt;
                 slip = min(vt, sep_max) * sign(drho) * share;
+                // The drift stands in for droplets the grid cannot see. At an interface it
+                // does resolve (a clear gradient of the smoothed oil fraction, the same
+                // field surface tension takes its curvature from) there are none: the cells
+                // are mixed only because the interface passes through them. Drifting there
+                // peels the surface off every blob and lens, however strongly interfacial
+                // tension holds it together (on 1 mm cells a rising oil drop dissolved into
+                // a cloud within half a second).
+                // Whether an interface sheds sub-cell droplets at all is a question of the
+                // Bond number of one cell, drho g dx^2 / sigma: above 1 (3.9 on 1 cm cells)
+                // buoyancy tears cell-sized pieces off and the drift acts everywhere, as
+                // before; well below 1 (0.04 on 1 mm cells) tension holds the interface
+                // together and resolved interfaces do not drift.
+                float bond = abs(drho) * P.gravity / max(P.sigma.w, 1e-9);
+                float hold = clamp(1.0 - bond, 0.0, 1.0);
+                if (slip != 0.0 && hold > 0.0) {
+                    ivec2 pc = clamp(ivec2(p.pos), ivec2(1), P.grid - 2);
+                    int k = cidx(pc);
+                    vec2 g = 0.5 * vec2(surf[k + 1].y - surf[k - 1].y, surf[k + P.grid.x].y - surf[k - P.grid.x].y);
+                    float resolved = 1.0 - clamp((SLIP_GRAD_MAX - length(g)) / (SLIP_GRAD_MAX - SLIP_GRAD_MIN), 0.0, 1.0);
+                    slip *= 1.0 - hold * resolved;
+                }
 
                 // Miscible exchange: relax the particle's syrup fraction towards the local
                 // aqueous mean. Scatter and gather use the same weights, so syrup volume is
@@ -183,6 +279,7 @@ void main() {
         }
 
         // ---- mouse tool ------------------------------------------------------------
+        bool pushed = false;
         if (P.tool_mode != 0) {
             vec2 d = P.tool_pos - p.pos;
             float r2 = dot(d, d) / (P.tool_radius * P.tool_radius);
@@ -193,43 +290,70 @@ void main() {
                 }
                 float fall = 1.0 - r2;
                 float k = clamp(P.tool_strength * fall * dt, 0.0, 1.0);
-                v = mix(v, P.tool_vel + d * 4.0, k);
+                v = mix(v, tool_target(d), k);
+                pushed = true;
             }
         }
 
-        // ---- advect and collide ----------------------------------------------------
-        // No speed cap: the substep is sized so that the fastest particle of the last step
-        // moves at most `cfl` cells. Report this one's displacement speed for the next.
-        vec2 disp = v + corr + vec2(0.0, slip);
+        // ---- speed cap (stabilisation, see params.rs: speed_cap) ------------------------
+        float vcap = P.ext.x;
         {
-            float m = subgroupMax(length(disp));
+            float sp = length(v);
+            if (sp > vcap) v *= vcap / sp;
+        }
+
+        // ---- advect and collide ----------------------------------------------------
+        // Midpoint rule through the projected grid velocity: the particle keeps the velocity
+        // it gathered where it was (v, C), but travels with the velocity half a step along
+        // its path. Forward Euler overshoots the outside of every curved path, which at
+        // several cells per substep inflates rotating flow.
+        // Only the change of the grid velocity along the half step is added to the gathered
+        // velocity (both ends sampled the same, bilinear, way). Travelling with the bilinear
+        // sample itself would move particles with grid-scale modes that the smoother gather
+        // kernel never hands them as velocity, and a resting pool then slowly heats up
+        // (kinetic energy 0.1 cells^2/s^2 after 6 s where it otherwise stays at 0.001).
+        vec2 va = v;
+        if (P.ext.y >= 2.0 && !pushed) {
+            vec2 xm = clamp(p.pos + 0.5 * dt * (v + corr + vec2(0.0, slip)), vec2(2.01), vec2(P.grid) - 2.01);
+            vec2 here = sample_vel(p.pos, v);
+            va = v + sample_vel(xm, here) - here;
+            float sp = length(va);
+            if (sp > vcap) va *= vcap / sp;
+        }
+        // Report this particle's displacement speed: the next substep is sized by the
+        // fastest one (step.comp).
+        // Spray in free flight (no liquid around it) follows a ballistic path that does not
+        // depend on the step length, so it may travel `spray_cfl` times further per substep
+        // than liquid; a handful of droplets then no longer dictates everyone's time step.
+        vec2 disp = va + corr + vec2(0.0, slip);
+        {
+            float mine = length(disp);
+            if (crowd < P.fluid_thr) mine /= P.ext.z;
+            float m = subgroupMax(mine);
             if (subgroupElect() && m > uintBitsToFloat(S.umax_part)) atomicMax(S.umax_part, floatBitsToUint(m));
         }
-        vec2 x = p.pos + dt * disp;
+        // A substep may carry a particle several cells. Walk the path in pieces of at most a
+        // cell and collide after each, so thin solids are not stepped over.
+        vec2 step_d = dt * disp;
+        int pieces = clamp(int(ceil(length(step_d))), 1, 32);
+        step_d /= float(pieces);
+        vec2 x = p.pos;
+        for (int k = 1; k < pieces; k++) {
+            x += step_d;
+            collide(x, v);
+        }
+        x += step_d;
         // Particles squeezed onto the same spot sample the same grid values and would stay
         // together for good, invisible to the density correction. Shake badly over-full
-        // spots apart; nothing at ordinary densities is touched.
+        // spots apart; nothing at ordinary densities is touched. The hash uses the
+        // particle's permanent id, not its slot, so a run repeats exactly.
         float excess = clamp(crowd - 1.5, 0.0, 1.0);
         if (excess > 0.0) {
-            uint h = hash(id ^ hash(floatBitsToUint(p.pos.x) ^ P.frame));
+            uint h = hash(p.id ^ hash(floatBitsToUint(p.pos.x) ^ S.substeps));
             x += (vec2(h & 0xffffu, h >> 16) / 65535.0 - 0.5) * 0.5 * excess;
         }
-        for (int it = 0; it < 2; it++) {
-            vec2 n;
-            float d = sample_sdf(x, n);
-            if (d < P.wall_margin) {
-                float l = length(n);
-                if (l > 1e-5) {
-                    n /= l;
-                    // Out to the surface, then as far beyond it as the particle was inside:
-                    // fluid caught under a newly placed solid keeps its area instead of
-                    // being flattened onto the outline.
-                    x += n * (P.wall_margin - d + max(-d, 0.0));
-                    float vn = dot(v, n);
-                    if (vn < 0.0) v -= vn * n;
-                }
-            }
-        }
+        collide(x, v);
+        collide(x, v);
         x = clamp(x, vec2(2.01), vec2(P.grid) - 2.01);
 
         p.pos = x;

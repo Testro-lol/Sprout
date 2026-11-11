@@ -9,7 +9,8 @@ layout(push_constant) uniform MgPC {
     int off_c;     // offset of the next coarser level
     ivec2 dim_f;
     ivec2 dim_c;
-    uint mode;     // kernel-specific flag
+    uint mode;     // multigrid kernels: bit 0 a kernel-specific flag, bits 8.. the level;
+                   // Krylov kernels (level 0): offset into the partial-sum buffer
     float omega;   // coarse-correction weight
 } M;
 
@@ -23,3 +24,11 @@ const ivec2 NB[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1
 float wcomp(vec4 w, int k) { return k == 0 ? w.x : k == 1 ? w.y : k == 2 ? w.z : w.w; }
 
 #include "reduce.glsl"
+
+// Tile flags (see PTileBuf). A tile without unknowns has nothing to solve, and nothing in
+// it is ever read: every neighbour access checks the diagonal first, and rhs.comp /
+// mg_build.comp keep the diagonals of such tiles at zero.
+uint mg_level() { return M.mode >> 8; }
+bool mg_flag() { return (M.mode & 1u) != 0u; }
+// For kernels dispatched over the cells of level `l`.
+bool tile_on(uint l) { return ptile[uint(lev[l].w) + group_slot()] != 0u; }

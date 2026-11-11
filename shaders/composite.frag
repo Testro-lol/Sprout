@@ -1,7 +1,7 @@
 #version 460
 
-// Resolves the splat accumulation into a liquid surface and draws solids, the backdrop
-// and the brush cursor.
+// Resolves the splat accumulation into a liquid surface and draws solids and the
+// backdrop. (The brush cursor is an egui overlay, see ui.rs.)
 
 layout(set = 0, binding = 0) uniform sampler2D accum;
 layout(std430, set = 0, binding = 1) readonly buffer SdfBuf { float sdf[]; };
@@ -9,12 +9,9 @@ layout(std430, set = 0, binding = 1) readonly buffer SdfBuf { float sdf[]; };
 layout(push_constant) uniform PC {
     vec2 cam;         // world position at the centre of the view, cells
     vec2 half_res;    // half the target size, pixels
-    vec2 tool_pos;    // cells
     ivec2 grid;
     float inv_zoom;   // cells per pixel
     float threshold;  // accumulated weight that counts as liquid
-    float tool_radius;
-    float tool_alpha;
 } pc;
 
 layout(location = 0) out vec4 f_color;
@@ -59,13 +56,6 @@ void main() {
     vec3 sc = mix(vec3(0.30, 0.33, 0.39), vec3(0.62, 0.66, 0.72), 1.0 - smoothstep(-1.4, -0.6, d));
     sc = mix(sc, vec3(0.36, 0.39, 0.45), smoothstep(-0.6, -1.6, d) * 0.0);
     col = mix(col, sc, inside);
-
-    // Brush cursor.
-    if (pc.tool_alpha > 0.0) {
-        float r = length(world - pc.tool_pos);
-        float ring = 1.0 - smoothstep(0.75 * aa, 2.0 * aa, abs(r - pc.tool_radius));
-        col = mix(col, vec3(1.0), ring * pc.tool_alpha);
-    }
 
     f_color = vec4(col, 1.0);
 }

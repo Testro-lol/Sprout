@@ -49,19 +49,28 @@ void main() {
     // (a falling stream), which the projection already answers by narrowing it. Pulling
     // there too would open bubbles.
     // Both directions use the same gain: a stronger push than pull would let any agitated
-    // liquid swell.
+    // liquid swell. For the same reason buried liquid that is not under pressure only pushes
+    // when it is clearly over-full (a quarter above rest, i.e. a clump): pushing every
+    // over-full cell while the under-full ones may not pull rectifies the particle noise
+    // into a steady expansion (in zero gravity a whole pool then stretches towards its free
+    // surface, about 15 % in 50 ms on 1 mm cells).
     float err = clamp(comp[i].w - P.rest_phi, -0.5, 0.5);
-    if (err < 0.0) {
+    {
         bool interior = (aL <= 0.0 || cell[i - 1].w > 0.0) && (aR <= 0.0 || cell[i + 1].w > 0.0)
             && (aB <= 0.0 || cell[i - W].w > 0.0) && (aT <= 0.0 || cell[i + W].w > 0.0);
         // Last substep's pressure, rescaled to this substep's length (pres holds p * dt).
         bool pressed = pres[i].x * (S.dt / S.dt_prev) > 0.5 * me.y * P.gravity * S.dt;
-        if (!(interior && pressed)) err = 0.0;
+        if (interior && !pressed) err = max(err - 0.25, 0.0);
+        else if (!interior && err < 0.0) err = 0.0;
     }
     // A share of the error per unit of time, not per substep, so that the correction does
     // not depend on how the time step happens to be cut.
     float s = min(1.0 - exp(-S.dt / P.tol.w), P.density_k) * err;
 
+    if (diag > 1e-9) {
+        uint t = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        if (ptile[t] == 0u) atomicOr(ptile[t], 1u);
+    }
     mga[i] = diag > 1e-9 ? w : vec4(0.0);
     mgd[i] = diag > 1e-9 ? diag : 0.0;
     prhs[i] = vec4(-div + jump, s / S.dt, 0.0, 0.0);

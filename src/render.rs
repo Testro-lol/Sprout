@@ -1,7 +1,7 @@
 //! Rendering: particles are splatted additively into an off-screen accumulation target,
 //! then one full-screen pass thresholds that into a liquid surface and draws the solids
-//! (from the same signed-distance field the simulation collides against), the backdrop
-//! and the brush cursor. Nothing is read back from the GPU.
+//! (from the same signed-distance field the simulation collides against) and the
+//! backdrop. Nothing is read back from the GPU.
 
 use std::sync::Arc;
 
@@ -73,14 +73,6 @@ impl View {
     }
 }
 
-/// Brush cursor overlay.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Cursor {
-    pub pos: [f32; 2],
-    pub radius: f32,
-    pub alpha: f32,
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SplatPc {
@@ -97,12 +89,9 @@ struct SplatPc {
 struct CompositePc {
     cam: [f32; 2],
     half_res: [f32; 2],
-    tool_pos: [f32; 2],
     grid: [i32; 2],
     inv_zoom: f32,
     threshold: f32,
-    tool_radius: f32,
-    tool_alpha: f32,
 }
 
 struct Accum {
@@ -286,7 +275,6 @@ impl Renderer {
         target: Arc<ImageView>,
         sim: &FluidSim,
         view: View,
-        cursor: Cursor,
         overlay: impl FnOnce(&mut Builder),
     ) {
         let e = target.image().extent();
@@ -383,12 +371,9 @@ impl Renderer {
                 CompositePc {
                     cam: view.center,
                     half_res: half,
-                    tool_pos: cursor.pos,
                     grid: [sim.grid[0] as i32, sim.grid[1] as i32],
                     inv_zoom: 1.0 / view.zoom,
                     threshold: SURFACE_THRESHOLD,
-                    tool_radius: cursor.radius,
-                    tool_alpha: cursor.alpha,
                 },
             )
             .unwrap();

@@ -1,0 +1,168 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// The coarse end of the multigrid hierarchy in a single dispatch.
+//
+// A V-cycle visits every level twice, and on the small levels each visit costs far more in
+// dispatch and barrier overhead (several microseconds apiece) than in arithmetic. Here one
+// work group of 1024 invocations walks all levels from `first` to `last` itself: every
+// invocation takes each 1024th cell of the level in turn, and a barrier separates the
+// sweeps. The arithmetic is that of mg_down / mg_up on the finer levels, plus a short run of
+// sweeps on the coarsest one; the preconditioner stays symmetric.
+//
+//   mode 0  V-cycle on levels first..last: right-hand side in mgr[first], result in mgz[first]
+//   mode 1  Galerkin coarse matrices of levels first+1..last from level first (see mg_build)
+//
+// Writes of one sweep are read by other invocations in the next, which needs the buffer
+// memory barrier next to each control barrier.
+
+layout(local_size_x = 1024) in;
+
+layout(push_constant) uniform TPC {
+    uint first;
+    uint last;
+    uint mode;
+    float omega;   // coarse-correction weight
+} T;
+
+const int N = 1024;
+const int HALF_SWEEPS = 9;
+const ivec2 NB[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+#define SYNC memoryBarrierBuffer(); barrier()
+
+float wcomp(vec4 w, int k) { return k == 0 ? w.x : k == 1 ? w.y : k == 2 ? w.z : w.w; }
+int at(ivec4 L, ivec2 c) { return L.x + c.y * L.y + c.x; }
+bool inside(ivec4 L, ivec2 c) { return all(greaterThanEqual(c, ivec2(0))) && c.x < L.y && c.y < L.z; }
+bool unknown(ivec4 L, ivec2 c) { return inside(L, c) && mgd[at(L, c)] > 0.0; }
+
+void build(ivec4 F, ivec4 C) {
+    for (int t = int(gl_LocalInvocationIndex); t < C.y * C.z; t += N) {
+        ivec2 cc = ivec2(t % C.y, t / C.y);
+        float D = 0.0;
+        vec4 A = vec4(0.0);
+        for (int k = 0; k < 4; k++) {
+            ivec2 c = 2 * cc + ivec2(k & 1, k >> 1);
+            if (!unknown(F, c)) continue;
+            int i = at(F, c);
+            D += mgd[i];
+            vec4 w = mga[i];
+            for (int d = 0; d < 4; d++) {
+                ivec2 n = c + NB[d];
+                if (!unknown(F, n)) continue;
+                float wd = wcomp(w, d);
+                if (all(equal(n >> 1, cc))) D -= wd;
+                else if (d == 0) A.x += wd;
+                else if (d == 1) A.y += wd;
+                else if (d == 2) A.z += wd;
+                else A.w += wd;
+            }
+        }
+        int o = C.x + t;
+        mgd[o] = D > 1e-7 ? D : 0.0;
+        mga[o] = D > 1e-7 ? A : vec4(0.0);
+    }
+}
+
+// One Gauss-Seidel half-sweep over the cells of one colour. With `zero`, the other colour
+// is known to be zero (the first half-sweep from a zero guess) and cells that are not
+// unknowns are cleared.
+void sweep(ivec4 L, int colour, bool zero) {
+    for (int t = int(gl_LocalInvocationIndex); t < L.y * L.z; t += N) {
+        ivec2 c = ivec2(t % L.y, t / L.y);
+        int i = L.x + t;
+        float D = mgd[i];
+        if (D <= 0.0) {
+            if (zero) mgx[i] = vec2(0.0);
+            continue;
+        }
+        if (((c.x + c.y) & 1) != colour) {
+            if (zero) mgx[i] = vec2(0.0);
+            continue;
+        }
+        vec2 sum = mgr[i];
+        if (!zero) {
+            vec4 w = mga[i];
+            for (int d = 0; d < 4; d++) {
+                ivec2 n = c + NB[d];
+                if (unknown(L, n)) sum += wcomp(w, d) * mgx[at(L, n)];
+            }
+        }
+        mgx[i] = sum / D;
+    }
+}
+
+void restrict_to(ivec4 F, ivec4 C) {
+    for (int t = int(gl_LocalInvocationIndex); t < C.y * C.z; t += N) {
+        ivec2 cc = ivec2(t % C.y, t / C.y);
+        vec2 sum = vec2(0.0);
+        for (int k = 0; k < 4; k++) {
+            ivec2 c = 2 * cc + ivec2(k & 1, k >> 1);
+            if (!unknown(F, c)) continue;
+            int i = at(F, c);
+            vec4 w = mga[i];
+            vec2 az = mgd[i] * mgx[i];
+            for (int d = 0; d < 4; d++) {
+                ivec2 n = c + NB[d];
+                if (unknown(F, n)) az -= wcomp(w, d) * mgx[at(F, n)];
+            }
+            sum += mgr[i] - az;
+        }
+        mgr[C.x + t] = sum;
+    }
+}
+
+// Coarse-grid correction fused with the black half-sweep (see mg_up.comp).
+void post_black(ivec4 F, ivec4 C) {
+    for (int t = int(gl_LocalInvocationIndex); t < F.y * F.z; t += N) {
+        ivec2 c = ivec2(t % F.y, t / F.y);
+        if (((c.x + c.y) & 1) == 0) continue;
+        int i = F.x + t;
+        float D = mgd[i];
+        if (D <= 0.0) continue;
+        vec4 w = mga[i];
+        vec2 sum = mgr[i];
+        for (int d = 0; d < 4; d++) {
+            ivec2 n = c + NB[d];
+            if (!unknown(F, n)) continue;
+            sum += wcomp(w, d) * (mgx[at(F, n)] + T.omega * mgx[at(C, n >> 1)]);
+        }
+        mgx[i] = sum / D;
+    }
+}
+
+void main() {
+    int first = int(T.first), last = int(T.last);
+    if (T.mode == 1u) {
+        for (int l = first; l < last; l++) {
+            build(lev[l], lev[l + 1]);
+            SYNC;
+        }
+        return;
+    }
+    for (int l = first; l < last; l++) {
+        sweep(lev[l], 0, true);
+        SYNC;
+        sweep(lev[l], 1, false);
+        SYNC;
+        restrict_to(lev[l], lev[l + 1]);
+        SYNC;
+    }
+    // Coarsest level: a fixed palindromic run of half-sweeps from zero (red, black, ..., red).
+    sweep(lev[last], 0, true);
+    SYNC;
+    for (int s = 1; s < HALF_SWEEPS; s++) {
+        sweep(lev[last], s & 1, false);
+        SYNC;
+    }
+    for (int l = last - 1; l >= first; l--) {
+        post_black(lev[l], lev[l + 1]);
+        SYNC;
+        sweep(lev[l], 0, false);
+        SYNC;
+    }
+    // Hand the finished level to mg_up of the level above.
+    ivec4 F = lev[first];
+    for (int t = int(gl_LocalInvocationIndex); t < F.y * F.z; t += N) mgz[F.x + t] = mgx[F.x + t];
+}

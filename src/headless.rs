@@ -14,7 +14,7 @@ use vulkano::{
 use crate::{
     gpu::{Builder, Gpu},
     gui::GuiPainter,
-    render::{Cursor, Renderer, View},
+    render::{Renderer, View},
     ui::{self, UiState},
     sim::{FluidSim, ToolState, submit_and_wait},
     world::World,
@@ -66,13 +66,13 @@ impl Offscreen {
     /// Renders the simulation and blocks until the GPU is done. Does not read pixels.
     pub fn draw(&mut self, sim: &FluidSim, view: View) {
         let mut b = self.gpu.builder();
-        self.renderer.render(&mut b, self.view.clone(), sim, view, Cursor::default(), |_| {});
+        self.renderer.render(&mut b, self.view.clone(), sim, view, |_| {});
         submit_and_wait(&self.gpu, b);
     }
 
     /// Renders the simulation and returns RGBA8 pixels.
     pub fn capture(&mut self, sim: &FluidSim, view: View) -> Vec<u8> {
-        self.capture_with(sim, view, Cursor::default(), |_| {}, |_| {})
+        self.capture_with(sim, view, |_| {}, |_| {})
     }
 
     /// Like `capture`, with hooks that record before the render passes and inside the
@@ -81,13 +81,12 @@ impl Offscreen {
         &mut self,
         sim: &FluidSim,
         view: View,
-        cursor: Cursor,
         before: impl FnOnce(&mut Builder),
         overlay: impl FnOnce(&mut Builder),
     ) -> Vec<u8> {
         let mut b = self.gpu.builder();
         before(&mut b);
-        self.renderer.render(&mut b, self.view.clone(), sim, view, cursor, overlay);
+        self.renderer.render(&mut b, self.view.clone(), sim, view, overlay);
         b.copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(self.view.image().clone(), self.host.clone()))
             .unwrap();
         submit_and_wait(&self.gpu, b);
@@ -162,24 +161,29 @@ fn ui_frame(gpu: &Arc<Gpu>, off: &mut Offscreen, world: &mut World, view: View, 
 
     // egui sizes windows over two passes and fades them in; run enough frames for the
     // panel to settle, keeping every texture update along the way.
+    // The canvas overlay as the app draws it: the brush cursor and the map's toast.
+    let mut overlay = ui::Overlay::default();
+    let cursor = [world.sim.grid[0] as f32 * 0.62, world.sim.grid[1] as f32 * 0.7];
     let mut deltas = Vec::new();
     let mut shapes = Vec::new();
     for frame in 0..30 {
         let input = egui::RawInput { time: Some(frame as f64 / 30.0), ..input.clone() };
         let out = ctx.run(input, |ctx| {
             ui::build(ctx, &mut state, world);
+            if frame == 0 {
+                overlay.toast_map(ctx, world.map);
+            }
+            overlay.draw(ctx, &state, view, size, Some(cursor), false, false, None);
         });
         deltas.push(out.textures_delta);
         shapes = out.shapes;
     }
     let primitives = ctx.tessellate(shapes, 1.0);
-    let cursor = Cursor { pos: [world.sim.grid[0] as f32 * 0.62, world.sim.grid[1] as f32 * 0.7], radius: state.brush, alpha: 0.55 };
     // The two hooks need the painter one after the other, never at once.
     let painter = RefCell::new(painter);
     let pixels = off.capture_with(
         &world.sim,
         view,
-        cursor,
         |b| {
             for d in &deltas {
                 painter.borrow_mut().update_textures(b, d);
@@ -254,17 +258,20 @@ pub fn probe(gpu: Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), map:
     let samples = 20;
     println!("probe: {} particles, {seconds} s", world.sim.slots());
     println!(
-        "{:>7} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9} {:>8} {:>6} {:>6}",
-        "t", "ke", "pe", "ke+pe", "max_speed", "mean_y", "top_y", "dt ms", "p it", "v it"
+        "{:>7} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9} {:>8} {:>6} {:>6} {:>8} {:>8}",
+        "t", "ke", "pe", "ke+pe", "max_speed", "mean_y", "top_y", "dt ms", "p it", "v it", "u grid", "u part"
     );
+    let mut worst = (0.0f32, 0.0f32);
     for s in 0..=samples {
         let d = diagnose(&world.sim.download_particles(), &world.sim.params);
+        let _ = world.sim.download_pressure();
         let st = world.sim.solver;
         println!(
-            "{:7.3} {:10.3} {:10.1} {:10.1} {:10.2} {:9.3} {:9.3} {:8.3} {:6} {:6}",
+            "{:7.3} {:10.3} {:10.1} {:10.1} {:10.2} {:9.3} {:9.3} {:8.3} {:6} {:6} {:8.1} {:8.1}",
             world.sim.sim_time(), d.ke, d.pe, d.ke + d.pe, d.max_speed, d.mean_y, d.top_y, st.dt * 1e3,
-            st.pressure_iters_max, st.viscosity_iters_max
+            st.pressure_iters_max, st.viscosity_iters_max, st.umax_grid, st.umax_part
         );
+        worst = (worst.0.max(st.pressure_residual_max), worst.1.max(st.viscosity_residual_max));
         world.sim.solver.reset_extremes();
         if s < samples {
             world.sim.advance_blocking(seconds as f64 / samples as f64, ToolState::default());
@@ -272,8 +279,8 @@ pub fn probe(gpu: Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), map:
     }
     let st = world.sim.solver;
     println!(
-        "substeps {}  unconverged pressure {} viscosity {}",
-        st.substeps, st.pressure_unconverged, st.viscosity_unconverged
+        "substeps {}  unconverged pressure {} viscosity {}  worst residual pressure {:.1e} viscosity {:.1e}",
+        st.substeps, st.pressure_unconverged, st.viscosity_unconverged, worst.0, worst.1
     );
     if let Some(path) = out {
         let size = [1280, 720];
@@ -402,6 +409,10 @@ pub fn profile(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], ma
         exec += (t2 - t1).as_secs_f64();
     }
     let substeps = (world.sim.solver.substeps - s0) as f64;
+    for (rebind, fine) in [(true, false), (false, false), (true, true), (false, true)] {
+        let ms = world.sim.dispatch_floor(2000, rebind, fine);
+        println!("dispatch floor: {:.2} us per {} dispatch{}", ms * 1e3, if fine { "full-grid cg_scale" } else { "single-group" }, if rebind { " (rebinding each time)" } else { "" });
+    }
     let passes = world.sim.profile_passes();
     let line: Vec<String> = passes.iter().map(|(n, ms)| format!("{n} {ms:.3}")).collect();
     println!("one substep, GPU ms by pass: {}", line.join(", "));

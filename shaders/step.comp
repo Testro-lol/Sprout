@@ -20,7 +20,8 @@
 layout(local_size_x = 1) in;
 
 void main() {
-    float u = max(uintBitsToFloat(S.umax_grid), uintBitsToFloat(S.umax_part));
+    // No particle travels faster than the speed cap, whatever a face reads.
+    float u = max(min(uintBitsToFloat(S.umax_grid), P.ext.x), uintBitsToFloat(S.umax_part));
     u = max(u, P.ext_speed);
     float dt_cfl = P.cfl / (u + sqrt(5.0 * max(P.gravity, 0.0)) + 1e-6);
     float dt;

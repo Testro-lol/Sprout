@@ -1,0 +1,71 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "mg.glsl"
+
+// The way up of a V-cycle on one level, in a single pass over its cells: the coarse-grid
+// correction z + omega * z_parent and one Gauss-Seidel sweep, black first, then red (the
+// mirror image of mg_down, so the cycle is a symmetric preconditioner, as conjugate
+// gradients requires).
+//
+// A Gauss-Seidel update overwrites a cell's own value, so a black cell only needs its red
+// neighbours' corrected values, and a red cell only its black neighbours' new ones. Those
+// come from the work group's shared copy, or are computed again for a neighbour in another
+// tile. The pass reads the pre-smoothed values (mgx) and the finished coarser level (mgz)
+// and writes the finished values of this level to mgz, so no tile ever reads what another
+// is writing. On level 0 (flag set) it also forms the partial sums r.z and r.r that
+// conjugate gradients needs next.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared vec2 sz[256];
+
+// New value of black cell n (an unknown).
+vec2 black(ivec2 n) {
+    int i = fidx(n);
+    vec4 w = mga[i];
+    vec2 sum = mgr[i];
+    for (int d = 0; d < 4; d++) {
+        ivec2 m = n + NB[d];
+        if (!unknown_f(m)) continue;
+        sum += wcomp(w, d) * (mgx[fidx(m)] + M.omega * mgz[cidx_c(m >> 1)]);
+    }
+    return sum / mgd[i];
+}
+
+void main() {
+    if (!tile_on(mg_level())) {
+        if (mg_flag() && gl_LocalInvocationIndex == 0u) part[group_slot()] = vec4(0.0);
+        return;
+    }
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 lc = ivec2(gl_LocalInvocationID.xy);
+    bool red = ((c.x + c.y) & 1) == 0;
+    bool unk = unknown_f(c);
+    vec2 z = vec2(0.0);
+    if (unk && !red) z = black(c);
+    sz[gl_LocalInvocationIndex] = z;
+    barrier();
+    vec4 acc4 = vec4(0.0);
+    if (inside_f(c)) {
+        int i = fidx(c);
+        if (unk) {
+            vec2 r = mgr[i];
+            if (red) {
+                vec4 w = mga[i];
+                vec2 sum = r;
+                for (int d = 0; d < 4; d++) {
+                    ivec2 n = c + NB[d];
+                    if (!unknown_f(n)) continue;
+                    ivec2 ln = lc + NB[d];
+                    bool here = all(greaterThanEqual(ln, ivec2(0))) && all(lessThan(ln, ivec2(16)));
+                    sum += wcomp(w, d) * (here ? sz[ln.y * 16 + ln.x] : black(n));
+                }
+                z = sum / mgd[i];
+            }
+            acc4 = vec4(r * z, r * r);
+        }
+        mgz[i] = z;
+    }
+    if (mg_flag()) group_sum(acc4, group_slot());
+}

@@ -55,7 +55,11 @@ pub struct Particle {
     pub c: [f32; 4],
     pub s: f32,
     pub kind: u32,
-    pub pad: [f32; 2],
+    /// Permanent identity, assigned by `FluidSim` when the particle enters the tank. It
+    /// survives the periodic sort and seeds the per-particle random numbers, so that a run
+    /// does not depend on the order particles happen to sit in memory.
+    pub id: u32,
+    pub pad: f32,
 }
 
 impl Particle {
@@ -111,7 +115,16 @@ pub struct SimParams {
     // ---- time step -------------------------------------------------------------------
     /// Courant number: the most a particle may travel in one substep, in cells.
     pub cfl: f32,
-    /// Longest substep, s.
+    /// Particle advection: 1 = forward Euler, 2 = midpoint rule through the grid velocity.
+    pub advection_order: u32,
+    /// Spray in free flight (less than half the rest density around it) may travel this many
+    /// times `cfl` per substep: its path is ballistic and does not depend on the step. 1 makes
+    /// the fastest droplet set the step for the whole tank again.
+    pub spray_cfl: f32,
+    /// Longest substep, s. At CFL 4 a slowly moving pool would otherwise take 1/60 s steps,
+    /// in which particles converging on a spot travel up to three cells before the density
+    /// correction sees them (refilling a hole then left 13 to 21 particles in one cell
+    /// instead of 9).
     pub dt_max: f32,
     /// Fixed substep rate in Hz for comparisons; 0 picks the step from the CFL condition.
     pub fixed_hz: f32,
@@ -137,6 +150,12 @@ pub struct SimParams {
     pub fluid_thr: f32,
     /// Largest curvature surface tension acts on, 1/cells (radius 1/kappa_max cells).
     pub kappa_max: f32,
+    /// Particle speed cap, as a multiple of the free-fall speed across the height of the
+    /// tank, sqrt(2 g H). At 1 a particle can still reach the lid from the floor, so nothing
+    /// that stays inside the tank is slowed visibly; what it removes are the few impact-jet
+    /// particles (about 0.1 %) that would otherwise set the time step for everything else.
+    /// 0 switches the cap off. Inactive without gravity.
+    pub speed_cap: f32,
 }
 
 impl Default for SimParams {
@@ -151,8 +170,10 @@ impl Default for SimParams {
             contact_angle: [90.0, 90.0, 90.0],
             droplet: 1.0,
             diffuse: 1.5,
-            cfl: 2.0,
-            dt_max: 1.0 / 60.0,
+            cfl: 4.0,
+            advection_order: 2,
+            spray_cfl: 4.0,
+            dt_max: 1.0 / 80.0,
             fixed_hz: 0.0,
             pressure_tol: 1e-4,
             pressure_max_iters: 60,
@@ -164,6 +185,7 @@ impl Default for SimParams {
             rest_phi: 1.0,
             fluid_thr: 0.5,
             kappa_max: 0.5,
+            speed_cap: 1.0,
         }
     }
 }
@@ -204,6 +226,12 @@ impl SimParams {
         self.nu[i] / (self.cell_size * self.cell_size)
     }
 
+    /// The particle speed cap in cells/s for a tank `height` cells tall (infinite when off).
+    pub fn speed_cap_cells(&self, height: u32) -> f32 {
+        let g = self.g_cells();
+        if self.speed_cap > 0.0 && g > 0.0 { self.speed_cap * (2.0 * g * height as f32).sqrt() } else { 1e30 }
+    }
+
     /// Explicit surface tension is stable only for steps below the capillary-wave limit
     /// (Brackbill et al. 1992): dt < sqrt(rho_min dx³ / (2 pi sigma)). Returns that limit with a
     /// safety factor of 0.5, in seconds (grid units: dx = 1).
@@ -239,7 +267,10 @@ impl SimParams {
             "sigma_oil" => self.sigma_oil = v.max(0.0),
             "droplet" => self.droplet = v.max(0.05),
             "diffuse" => self.diffuse = v,
-            "cfl" => self.cfl = v.clamp(0.05, 4.0),
+            "cfl" => self.cfl = v.clamp(0.05, 8.0),
+            "advection_order" => self.advection_order = if v >= 2.0 { 2 } else { 1 },
+            "speed_cap" => self.speed_cap = v.max(0.0),
+            "spray_cfl" => self.spray_cfl = v.clamp(1.0, 8.0),
             "dt_max" => self.dt_max = v.max(1e-5),
             "fixed_hz" | "substep_hz" => self.fixed_hz = if v <= 0.0 { 0.0 } else { v.max(30.0) },
             "pressure_tol" => self.pressure_tol = v.max(1e-7),
@@ -258,13 +289,16 @@ impl SimParams {
     }
 }
 
+/// Speed the push tool drives liquid outwards at, cells/s (carried in `ToolState::vel[0]`).
+pub const PUSH_SPEED: f32 = 220.0;
+
 /// What the mouse is doing to the fluid this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ToolState {
     pub pos: [f32; 2],
     pub vel: [f32; 2],
     pub radius: f32,
-    /// 0 = idle, 1 = grab / stir, 2 = erase.
+    /// 0 = idle, 1 = grab / stir, 2 = erase, 3 = push (speed in `vel[0]`), 4 = jet nozzle.
     pub mode: i32,
     pub strength: f32,
 }
@@ -280,13 +314,31 @@ impl ToolState {
         ToolState { pos, radius, mode: 2, ..Default::default() }
     }
 
+    /// Drives the fluid under the brush radially outwards at `PUSH_SPEED`.
+    pub fn push(pos: [f32; 2], radius: f32) -> ToolState {
+        ToolState { pos, vel: [PUSH_SPEED, 0.0], radius, mode: 3, strength: 40.0 }
+    }
+
+    /// Holds the liquid inside a stream's nozzle (faucet or jet) at the launch velocity
+    /// `vel`. Rows then leave at exactly the speed they were laid out for, so consecutive
+    /// frames join without a gap (left alone, new rows take up the faster flow of the
+    /// accelerating stream below at once and run ahead); and a nozzle whose outlet is
+    /// already full keeps pushing.
+    pub fn nozzle(pos: [f32; 2], vel: [f32; 2], radius: f32) -> ToolState {
+        ToolState { pos, vel, radius, mode: 4, strength: 1000.0 }
+    }
+
     /// Fastest velocity the tool can impose on a particle, cells/s.
     pub fn speed(&self) -> f32 {
-        if self.mode == 1 { self.vel[0].hypot(self.vel[1]) + 4.0 * self.radius } else { 0.0 }
+        match self.mode {
+            1 => self.vel[0].hypot(self.vel[1]) + 4.0 * self.radius,
+            3 | 4 => self.vel[0].hypot(self.vel[1]),
+            _ => 0.0,
+        }
     }
 }
 
-/// Must match `uniform Params` in `shaders/common.glsl` (std140, 192 bytes).
+/// Must match `uniform Params` in `shaders/common.glsl` (std140, 208 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GpuParams {
@@ -323,10 +375,12 @@ pub struct GpuParams {
     /// Relative tolerances: pressure, density correction, viscosity; then the time constant
     /// of the density correction, s.
     pub tol: [f32; 4],
+    /// Particle speed cap (cells/s, huge = off); advection order; spray CFL multiple; unused.
+    pub ext: [f32; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<Particle>() == 48);
-const _: () = assert!(std::mem::size_of::<GpuParams>() == 192);
+const _: () = assert!(std::mem::size_of::<GpuParams>() == 208);
 
 #[cfg(test)]
 mod tests {

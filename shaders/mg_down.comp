@@ -1,0 +1,69 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "mg.glsl"
+
+// The way down of a V-cycle on one level, in a single pass over its cells:
+//
+//  1. Pre-smoothing from a zero initial guess, one red-black Gauss-Seidel sweep, red first.
+//     From zero the red half-sweep is just z = r / D, so black cells compute their red
+//     neighbours on the fly.
+//  2. Restriction of the residual r - A z to the next level (sum over each 2 x 2 aggregate).
+//     After the sweep the residual of a black cell is zero and that of a red cell is the sum
+//     of its couplings to its black neighbours' values. Those are taken from the work
+//     group's shared copy; for a neighbour in another tile they are computed again.
+//
+// Tiles are 16 x 16 cells, so aggregates never straddle two work groups.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared vec2 sz[256];
+
+// Value of black cell n (an unknown) after the sweep.
+vec2 black(ivec2 n) {
+    int i = fidx(n);
+    vec4 w = mga[i];
+    vec2 sum = mgr[i];
+    for (int d = 0; d < 4; d++) {
+        ivec2 m = n + NB[d];
+        if (!unknown_f(m)) continue;
+        int j = fidx(m);
+        sum += wcomp(w, d) * mgr[j] / mgd[j];
+    }
+    return sum / mgd[i];
+}
+
+void main() {
+    if (!tile_on(mg_level())) return;
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 lc = ivec2(gl_LocalInvocationID.xy);
+    bool red = ((c.x + c.y) & 1) == 0;
+    bool unk = unknown_f(c);
+    vec2 z = vec2(0.0);
+    if (inside_f(c)) {
+        int i = fidx(c);
+        if (unk) z = red ? mgr[i] / mgd[i] : black(c);
+        mgx[i] = z;
+    }
+    sz[gl_LocalInvocationIndex] = z;
+    barrier();
+    if (((lc.x | lc.y) & 1) != 0) return;
+    ivec2 C = c >> 1;
+    if (any(greaterThanEqual(C, M.dim_c))) return;
+    vec2 sum = vec2(0.0);
+    // The two red cells of the aggregate: (0, 0) and (1, 1).
+    for (int k = 0; k < 2; k++) {
+        ivec2 q = c + ivec2(k);
+        if (!unknown_f(q)) continue;
+        vec4 w = mga[fidx(q)];
+        ivec2 lq = lc + ivec2(k);
+        for (int d = 0; d < 4; d++) {
+            ivec2 n = q + NB[d];
+            if (!unknown_f(n)) continue;
+            ivec2 ln = lq + NB[d];
+            bool here = all(greaterThanEqual(ln, ivec2(0))) && all(lessThan(ln, ivec2(16)));
+            sum += wcomp(w, d) * (here ? sz[ln.y * 16 + ln.x] : black(n));
+        }
+    }
+    mgr[cidx_c(C)] = sum;
+}

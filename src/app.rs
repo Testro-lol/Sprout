@@ -21,18 +21,19 @@ use winit::{
 };
 
 use crate::{
+    brush,
+    camera::Camera,
     gpu::Gpu,
     gui::GuiPainter,
     maps::MAPS,
     pacing::{Pacer, Plan},
-    render::{Cursor, Renderer, View},
+    render::Renderer,
     scene::Shape,
     selftest::{self, Act, Snapshot},
     sim::{KIND_OIL, Material, ToolState},
-    ui::{self, Tool, UiActions, UiState},
-    world::{Nozzle, World},
+    ui::{self, Overlay, Tool, UiActions, UiState},
+    world::{Source, World},
 };
-
 
 pub struct AppOptions {
     pub map: usize,
@@ -84,8 +85,10 @@ struct App {
     world: World,
     ui: UiState,
     input: Input,
-    view: View,
-    view_is_fit: bool,
+    camera: Camera,
+    overlay: Overlay,
+    /// Tool and liquid of the last frame, to announce changes.
+    shown: (Tool, Material),
     last_frame: Instant,
     pacer: Pacer,
     step_once: bool,
@@ -108,17 +111,19 @@ pub fn run(event_loop: EventLoop<()>, gpu: Arc<Gpu>, opts: AppOptions) -> bool {
     let mut world = World::new(gpu.clone(), opts.grid, opts.map);
     for (k, v) in &opts.overrides {
         world.sim.params.set(k, *v);
+        world.scale_locked |= k == "cell_size";
     }
     let ui = UiState { vsync: opts.vsync, grid: opts.grid, ..Default::default() };
     let mut app = App {
-        view: View::fit(opts.grid, opts.size),
+        camera: Camera::new(opts.grid, opts.size),
+        overlay: Overlay::default(),
+        shown: (ui.tool, ui.material),
         gpu,
         opts,
         win: None,
         world,
         ui,
         input: Input::default(),
-        view_is_fit: true,
         last_frame: Instant::now(),
         pacer: Pacer::new(),
         step_once: false,
@@ -137,6 +142,24 @@ fn pick_present_mode(available: &[PresentMode], vsync: bool) -> PresentMode {
     let prefer: &[PresentMode] =
         if vsync { &[PresentMode::Fifo] } else { &[PresentMode::Mailbox, PresentMode::Immediate, PresentMode::Fifo] };
     prefer.iter().copied().find(|m| available.contains(m)).unwrap_or(PresentMode::Fifo)
+}
+
+/// The tool a key selects (`Tool::key` names it in the UI).
+fn tool_for_key(code: KeyCode) -> Option<Tool> {
+    Some(match code {
+        KeyCode::KeyQ => Tool::Pour,
+        KeyCode::KeyB => Tool::Spray,
+        KeyCode::KeyJ => Tool::Jet,
+        KeyCode::KeyC => Tool::Drop,
+        KeyCode::KeyW => Tool::Grab,
+        KeyCode::KeyV => Tool::Push,
+        KeyCode::KeyE => Tool::Erase,
+        KeyCode::KeyA => Tool::Circle,
+        KeyCode::KeyS => Tool::Box,
+        KeyCode::KeyD => Tool::Ramp,
+        KeyCode::KeyX => Tool::Remove,
+        _ => return None,
+    })
 }
 
 /// The solid a shape tool would place at `c` right now.
@@ -224,12 +247,15 @@ impl Win {
         }
     }
 
-    /// A frame longer than this is too slow: a quarter over the display's refresh interval,
-    /// and never stricter than 55 frames per second.
-    fn slow_frame(&self) -> f32 {
+    /// GPU time a frame may spend on the simulation, s: four fifths of the refresh interval
+    /// when presenting with vsync (the rest is for rendering), of 1/60 s otherwise.
+    fn sim_budget(&self, vsync: bool) -> f32 {
         let refresh = self.window.current_monitor().and_then(|m| m.refresh_rate_millihertz());
-        let interval = refresh.map_or(0.0, |mhz| 1000.0 / mhz.max(1) as f32);
-        (1.25 * interval).max(1.0 / 55.0)
+        let interval = match refresh {
+            Some(mhz) if vsync => 1000.0 / mhz.max(1) as f32,
+            _ => 1.0 / 60.0,
+        };
+        0.8 * interval
     }
 
     fn size(&self) -> [u32; 2] {
@@ -239,16 +265,27 @@ impl Win {
 }
 
 impl App {
-    fn reset_view(&mut self) {
+    fn reset_view(&mut self, animate: bool) {
         if let Some(win) = &self.win {
-            self.view = View::fit(self.world.sim.grid, win.size());
-            self.view_is_fit = true;
+            self.camera.fit(self.world.sim.grid, win.size(), animate);
         }
     }
 
+    fn egui(&self) -> Option<egui::Context> {
+        self.win.as_ref().map(|w| w.egui_ctx.clone())
+    }
+
     fn load_map(&mut self, map: usize) {
+        let changed = map != self.world.map;
         self.world.load_map(map);
         self.pacer.reset();
+        if let Some(ctx) = self.egui() {
+            if changed {
+                self.overlay.toast_map(&ctx, self.world.map);
+            } else {
+                self.overlay.toast(&ctx, "Reset", MAPS[map].name, egui::Color32::from_gray(235));
+            }
+        }
     }
 
     fn change_grid(&mut self, grid: [u32; 2]) {
@@ -262,10 +299,17 @@ impl App {
             win.renderer.invalidate();
         }
         self.ui.brush *= grid[0] as f32 / self.world.sim.grid[0] as f32;
+        let locked = self.world.scale_locked;
         self.world = World::new(self.gpu.clone(), grid, map);
         self.world.sim.params = params;
+        self.world.scale_locked = locked;
+        self.world.apply_map_scale();
         self.ui.grid = grid;
-        self.reset_view();
+        self.reset_view(false);
+        if let Some(ctx) = self.egui() {
+            let name = ui::GRIDS.iter().find(|g| g.1 == grid).map_or("Custom", |g| g.0);
+            self.overlay.toast(&ctx, "Quality", name, egui::Color32::from_gray(235));
+        }
     }
 
     fn apply(&mut self, actions: UiActions, event_loop: Option<&ActiveEventLoop>) {
@@ -283,7 +327,7 @@ impl App {
             self.change_grid(grid);
         }
         if actions.reset_view {
-            self.reset_view();
+            self.reset_view(true);
         }
         if actions.vsync_changed && let Some(win) = &mut self.win {
             win.recreate = true;
@@ -296,26 +340,22 @@ impl App {
     fn key(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
         let mut a = UiActions::default();
         let n_maps = MAPS.len();
+        if let Some(tool) = tool_for_key(code) {
+            self.ui.tool = tool;
+        }
         match code {
             KeyCode::Space => self.ui.paused = !self.ui.paused,
             KeyCode::KeyN | KeyCode::Period => a.step = true,
             KeyCode::KeyR => a.reset = true,
-            KeyCode::Digit1 => self.ui.material = Material::Water,
-            KeyCode::Digit2 => self.ui.material = Material::Oil,
-            KeyCode::Digit3 => self.ui.material = Material::Syrup,
-            KeyCode::KeyQ => self.ui.tool = Tool::Pour,
-            KeyCode::KeyW => self.ui.tool = Tool::Grab,
-            KeyCode::KeyE => self.ui.tool = Tool::Erase,
-            KeyCode::KeyA => self.ui.tool = Tool::Circle,
-            KeyCode::KeyS => self.ui.tool = Tool::Box,
-            KeyCode::KeyD => self.ui.tool = Tool::Ramp,
-            KeyCode::KeyX => self.ui.tool = Tool::Remove,
+            KeyCode::Digit1 => self.ui.pick_material(Material::Water),
+            KeyCode::Digit2 => self.ui.pick_material(Material::Oil),
+            KeyCode::Digit3 => self.ui.pick_material(Material::Syrup),
             KeyCode::BracketLeft => self.ui.scale_brush(1.0 / 1.15),
             KeyCode::BracketRight => self.ui.scale_brush(1.15),
             KeyCode::Minus => self.ui.scale_rate(1.0 / 1.25),
             KeyCode::Equal => self.ui.scale_rate(1.25),
-            KeyCode::KeyT => self.ui.rotate_shape(15.0),
-            KeyCode::KeyG => self.ui.rotate_shape(-15.0),
+            KeyCode::KeyT => self.ui.rotate(15.0),
+            KeyCode::KeyG => self.ui.rotate(-15.0),
             KeyCode::KeyF => self.ui.shape_flip = !self.ui.shape_flip,
             KeyCode::KeyH => self.ui.show_panel = !self.ui.show_panel,
             KeyCode::Home | KeyCode::Digit0 => a.reset_view = true,
@@ -335,11 +375,12 @@ impl App {
 
     fn pointer_moved(&mut self, px: [f32; 2]) {
         if self.input.middle {
-            self.view.center[0] -= (px[0] - self.input.cursor_px[0]) / self.view.zoom;
-            self.view.center[1] += (px[1] - self.input.cursor_px[1]) / self.view.zoom;
-            self.view_is_fit = false;
+            self.camera.pan([px[0] - self.input.cursor_px[0], px[1] - self.input.cursor_px[1]]);
         }
         self.input.cursor_px = px;
+        if let Some(win) = &self.win {
+            self.input.cursor_world = self.camera.view.screen_to_world(px, win.size());
+        }
         self.input.inside = true;
     }
 
@@ -360,6 +401,8 @@ impl App {
     fn wheel(&mut self, lines: f32) {
         if self.input.modifiers.shift_key() || self.input.modifiers.control_key() {
             self.ui.scale_brush(1.12f32.powf(lines));
+        } else if self.ui.tool == Tool::Jet && !self.input.modifiers.alt_key() {
+            self.ui.rotate_jet(lines * 15.0);
         } else {
             self.zoom_at_cursor(1.15f32.powf(lines));
         }
@@ -372,7 +415,22 @@ impl App {
         }
         let ps = self.world.sim.download_particles();
         let speed2: f32 = ps.iter().map(|p| p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sum();
+        let direction = brush::jet_direction(self.ui.jet_angle);
+        let mut axial = 0.0;
+        let mut outlet_count = 0;
+        let mut radial = 0.0;
+        for p in &ps {
+            let d = [p.pos[0] - self.input.cursor_world[0], p.pos[1] - self.input.cursor_world[1]];
+            let distance = d[0].hypot(d[1]);
+            if distance < self.ui.brush * 0.7 {
+                axial += p.vel[0] * direction[0] + p.vel[1] * direction[1];
+                outlet_count += 1;
+            }
+            if distance > 1e-4 { radial += (p.vel[0] * d[0] + p.vel[1] * d[1]) / distance; }
+        }
         Snapshot {
+            jet_speed: axial / outlet_count.max(1) as f32,
+            radial_speed: radial / ps.len().max(1) as f32,
             particles: ps.len(),
             oil: ps.iter().filter(|p| p.kind == KIND_OIL).count(),
             syrup: ps.iter().filter(|p| p.kind != KIND_OIL).map(|p| p.s).sum(),
@@ -381,9 +439,10 @@ impl App {
             substeps: self.world.sim.substeps_done(),
             grid: self.world.sim.grid,
             map: self.world.map,
-            zoom: self.view.zoom,
-            center: self.view.center,
+            zoom: self.camera.target().zoom,
+            center: self.camera.target().center,
             brush: self.ui.brush,
+            jet_angle: self.ui.jet_angle,
             panel: self.ui.show_panel,
         }
     }
@@ -400,7 +459,7 @@ impl App {
                 Act::Key(code) => self.key(code, event_loop),
                 Act::Move(cells) => {
                     let size = self.win.as_ref().map_or(self.opts.size, |w| w.size());
-                    self.pointer_moved(self.view.world_to_screen(cells, size));
+                    self.pointer_moved(self.camera.view.world_to_screen(cells, size));
                 }
                 Act::Press(button) => self.button(button, true),
                 Act::Release(button) => self.button(button, false),
@@ -425,16 +484,23 @@ impl App {
         self.selftest = Some(test);
     }
 
+    /// A press of the left button: the tools that act once per click.
     fn click(&mut self) {
-        match self.ui.tool {
-            Tool::Remove => {
-                self.world.remove_shape_at(self.input.cursor_world);
-            }
-            _ => {
-                if let Some(shape) = pending_shape(&self.ui, self.input.cursor_world) {
+        let at = self.input.cursor_world;
+        let (tool, material, radius) = (self.ui.tool, self.ui.material, self.ui.brush);
+        let done = match tool {
+            Tool::Drop => self.world.stamp(material, at, radius) > 0,
+            Tool::Remove => self.world.remove_shape_at(at),
+            _ => match pending_shape(&self.ui, at) {
+                Some(shape) => {
                     self.world.add_shape(shape);
+                    true
                 }
-            }
+                None => false,
+            },
+        };
+        if done && let Some(ctx) = self.egui() {
+            self.overlay.ripple_for(&ctx, at, if tool == Tool::Remove { 2.0 } else { radius }, tool, material);
         }
     }
 
@@ -478,14 +544,7 @@ impl App {
 
     fn zoom_at_cursor(&mut self, factor: f32) {
         let Some(win) = &self.win else { return };
-        let size = win.size();
-        let fit = View::fit(self.world.sim.grid, size).zoom;
-        let before = self.view.screen_to_world(self.input.cursor_px, size);
-        self.view.zoom = (self.view.zoom * factor).clamp(fit * 0.5, fit * 24.0);
-        let after = self.view.screen_to_world(self.input.cursor_px, size);
-        self.view.center[0] += before[0] - after[0];
-        self.view.center[1] += before[1] - after[1];
-        self.view_is_fit = false;
+        self.camera.zoom_at(self.input.cursor_px, factor, self.world.sim.grid, win.size());
     }
 
     fn redraw(&mut self) {
@@ -508,9 +567,7 @@ impl App {
                     win.views = images.into_iter().map(|i| ImageView::new_default(i).unwrap()).collect();
                     win.renderer.invalidate_targets();
                     win.recreate = false;
-                    if self.view_is_fit {
-                        self.view = View::fit(self.world.sim.grid, size);
-                    }
+                    self.camera.resized(self.world.sim.grid, size);
                 }
                 // The window is mid-resize; try again next frame.
                 Err(_) => return,
@@ -537,7 +594,8 @@ impl App {
         let fixed = self.world.sim.params.fixed_hz > 0.0;
         let mut plan = Plan { substeps: 0, target: 0.0, expected: 0.0 };
         if !self.ui.paused {
-            plan = self.pacer.plan(frame_dt, dt, fixed, self.ui.time_scale, win.slow_frame());
+            let cost = self.world.sim.substep_cost();
+            plan = self.pacer.plan(frame_dt, dt, fixed, self.ui.time_scale, cost, win.sim_budget(self.ui.vsync));
         } else if self.step_once {
             plan = Plan { substeps: 1, target: dt, expected: dt };
         }
@@ -547,8 +605,10 @@ impl App {
         self.ui.speed = if self.ui.paused { 1.0 } else { self.pacer.speed() };
 
         // ---- input -> world --------------------------------------------------------
+        self.camera.update(frame_dt, size);
+        let view = self.camera.view;
         let input = &mut self.input;
-        input.cursor_world = self.view.screen_to_world(input.cursor_px, size);
+        input.cursor_world = view.screen_to_world(input.cursor_px, size);
         let raw_vel = [
             (input.cursor_world[0] - input.prev_world[0]) / frame_dt.max(1e-4),
             (input.cursor_world[1] - input.prev_world[1]) / frame_dt.max(1e-4),
@@ -556,41 +616,57 @@ impl App {
         let blend = (frame_dt * 30.0).min(1.0);
         input.velocity[0] += (raw_vel[0] - input.velocity[0]) * blend;
         input.velocity[1] += (raw_vel[1] - input.velocity[1]) * blend;
-
-        let mut tool = ToolState { pos: input.cursor_world, vel: input.velocity, radius: self.ui.brush, ..Default::default() };
-        if input.right || (input.left && self.ui.tool == Tool::Grab) {
-            tool = ToolState::grab(input.cursor_world, input.velocity, self.ui.brush);
-        } else if input.left && self.ui.tool == Tool::Erase {
-            tool = ToolState::erase(input.cursor_world, self.ui.brush);
-        } else if input.left && self.ui.tool == Tool::Pour {
-            // The stream is laid out for the time the simulation is about to advance, so
-            // nothing pours while paused (single steps still do).
-            let elapsed = plan.expected;
-            let nozzle = Nozzle {
-                material: self.ui.material,
-                from: input.prev_world,
-                to: input.cursor_world,
-                radius: self.ui.brush,
-                rate: self.ui.pour_rate,
-                drag: input.velocity,
-            };
-            self.world.pour(&nozzle, elapsed);
-        }
         input.prev_world = input.cursor_world;
+
+        let ppp = win.egui_ctx.pixels_per_point();
+        let over_panel = win.egui_ctx.layer_id_at(egui::pos2(input.cursor_px[0] / ppp, input.cursor_px[1] / ppp))
+            .is_some_and(|layer| layer.order != egui::Order::Background);
+        let on_canvas = input.inside && !over_panel && !input.middle;
+        let held = on_canvas && input.left && !input.right;
+        let (at, radius, material) = (input.cursor_world, self.ui.brush, self.ui.material);
+        let source = match self.ui.tool {
+            Tool::Pour => Some(Source::Pour),
+            Tool::Spray => Some(Source::Spray),
+            Tool::Jet => Some(Source::Jet { angle: self.ui.jet_angle }),
+            _ => None,
+        };
+        let mut tool = ToolState::default();
+        if on_canvas && (input.right || (input.left && self.ui.tool == Tool::Grab)) {
+            tool = ToolState::grab(at, input.velocity, radius);
+            tool.strength *= self.ui.force_strength;
+        } else if held && self.ui.tool == Tool::Push {
+            tool = ToolState::push(at, radius);
+            tool.strength *= self.ui.force_strength;
+        } else if held && self.ui.tool == Tool::Erase {
+            tool = ToolState::erase(at, radius);
+        } else if held && let Some(source) = source {
+            // The stroke is laid out for the time the simulation is about to advance, so
+            // nothing is emitted while paused (single steps still emit).
+            self.world.emit(source, material, at, radius, self.ui.pour_rate, plan.expected);
+            tool = source.nozzle(at, radius, self.ui.pour_rate);
+        }
+        if !(held && source.is_some()) {
+            self.world.end_stroke();
+        }
 
         // ---- UI --------------------------------------------------------------------
         let raw_input = win.egui_state.take_egui_input(&win.window);
-        let preview = pending_shape(&self.ui, self.input.cursor_world);
+        let shape = if self.ui.tool == Tool::Remove {
+            self.world.scene.pick(at).map(|i| (self.world.scene.shapes[i], true))
+        } else {
+            pending_shape(&self.ui, at).map(|s| (s, false))
+        };
         let mut actions = UiActions::default();
-        let hover = self.world.scene.pick(self.input.cursor_world).map(|i| self.world.scene.shapes[i]);
+        let (pressed, grabbing) = (on_canvas && (self.input.left || self.input.right), on_canvas && self.input.right);
         let full = win.egui_ctx.run(raw_input, |ctx| {
             actions = ui::build(ctx, &mut self.ui, &mut self.world);
-            if self.input.inside && !ctx.is_pointer_over_area() {
-                let shape = if self.ui.tool == Tool::Remove { hover } else { preview };
-                if let Some(shape) = shape {
-                    ui::outline(ctx, &shape, self.view, size, self.ui.tool == Tool::Remove);
-                }
+            let now = (self.ui.tool, self.ui.material);
+            if now.0 != self.shown.0 || (now.1 != self.shown.1 && self.ui.tool.uses_material()) {
+                self.overlay.toast_tool(ctx, &self.ui);
             }
+            self.shown = now;
+            let hover = self.input.inside && !ctx.is_pointer_over_area();
+            self.overlay.draw(ctx, &self.ui, view, size, hover.then_some(at), pressed, grabbing, shape.filter(|_| hover));
         });
         win.egui_state.handle_platform_output(&win.window, full.platform_output);
         let primitives = win.egui_ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -603,14 +679,8 @@ impl App {
             self.world.sim.request_stats(&mut b);
         }
         win.painter.update_textures(&mut b, &full.textures_delta);
-        let show_ring = self.input.inside && !win.egui_ctx.is_pointer_over_area();
-        let cursor = Cursor {
-            pos: self.input.cursor_world,
-            radius: self.ui.brush,
-            alpha: if show_ring && preview.is_none() && self.ui.tool != Tool::Remove { 0.55 } else { 0.0 },
-        };
         let painter = &mut win.painter;
-        win.renderer.render(&mut b, win.views[image_index as usize].clone(), &self.world.sim, self.view, cursor, |b| {
+        win.renderer.render(&mut b, win.views[image_index as usize].clone(), &self.world.sim, view, |b| {
             painter.paint(b, &primitives, full.pixels_per_point, size)
         });
         win.painter.free_textures(&full.textures_delta);
@@ -651,7 +721,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.win.is_none() {
             let win = Win::new(event_loop, &self.gpu, &self.opts);
-            self.view = View::fit(self.world.sim.grid, win.size());
+            self.camera = Camera::new(self.world.sim.grid, win.size());
             self.win = Some(win);
             self.last_frame = Instant::now();
         }
@@ -674,7 +744,19 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(m) => self.input.modifiers = m.state(),
             WindowEvent::CursorEntered { .. } => self.input.inside = true,
-            WindowEvent::CursorLeft { .. } => self.input.inside = false,
+            WindowEvent::CursorLeft { .. } => {
+                self.input.inside = false;
+                self.input.left = false;
+                self.input.right = false;
+                self.input.middle = false;
+            }
+            WindowEvent::Focused(false) => {
+                self.input.left = false;
+                self.input.right = false;
+                self.input.middle = false;
+                self.input.velocity = [0.0; 2];
+                self.input.modifiers = ModifiersState::empty();
+            }
             WindowEvent::CursorMoved { position, .. } => self.pointer_moved([position.x as f32, position.y as f32]),
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
@@ -708,6 +790,23 @@ impl ApplicationHandler for App {
         }
         if let Some(win) = &self.win {
             win.window.request_redraw();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tool_has_the_key_its_label_shows() {
+        for tool in Tool::LIQUID.into_iter().chain(Tool::SOLID) {
+            let code = [KeyCode::KeyQ, KeyCode::KeyB, KeyCode::KeyJ, KeyCode::KeyC, KeyCode::KeyW, KeyCode::KeyV, KeyCode::KeyE,
+                KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD, KeyCode::KeyX]
+                .into_iter()
+                .find(|&c| format!("{c:?}") == format!("Key{}", tool.key()))
+                .unwrap_or_else(|| panic!("no key for {}", tool.name()));
+            assert_eq!(tool_for_key(code), Some(tool));
         }
     }
 }

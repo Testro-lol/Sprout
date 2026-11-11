@@ -81,6 +81,41 @@ pub struct SolidField {
     pub solid: Vec<[f32; 4]>,
 }
 
+#[cfg(test)]
+impl SolidField {
+    /// Size of the smallest group of open cells connected through open faces.
+    pub fn smallest_region(&self, grid: [u32; 2]) -> usize {
+        let (w, h) = (grid[0] as usize, grid[1] as usize);
+        let mut seen = vec![false; w * h];
+        let mut smallest = usize::MAX;
+        for start in 0..w * h {
+            if self.solid[start][3] == 0.0 || seen[start] {
+                continue;
+            }
+            let (mut stack, mut size) = (vec![start], 0);
+            seen[start] = true;
+            while let Some(k) = stack.pop() {
+                size += 1;
+                let (i, j) = (k % w, k / w);
+                let links = [
+                    (i > 0, k.wrapping_sub(1), self.solid[k][0]),
+                    (i + 1 < w, k + 1, if i + 1 < w { self.solid[k + 1][0] } else { 0.0 }),
+                    (j > 0, k.wrapping_sub(w), self.solid[k][1]),
+                    (j + 1 < h, k + w, if j + 1 < h { self.solid[k + w][1] } else { 0.0 }),
+                ];
+                for (ok, n, a) in links {
+                    if ok && a > 0.0 && !seen[n] {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
+                }
+            }
+            smallest = smallest.min(size);
+        }
+        smallest
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Scene {
     pub grid: [u32; 2],
@@ -89,6 +124,8 @@ pub struct Scene {
 
 /// Cells with less open volume than this are treated as solid.
 const MIN_OPEN: f32 = 0.1;
+/// Enclosed groups of open cells smaller than this are filled in (see `seal_pockets`).
+pub(crate) const MIN_POCKET: usize = 16;
 
 /// Fraction of the segment between two SDF samples that lies outside the solid.
 fn open_fraction(d0: f32, d1: f32) -> f32 {
@@ -166,9 +203,19 @@ impl Scene {
                 open[j * w + i] = if acc * 0.25 < MIN_OPEN { 0.0 } else { acc * 0.25 };
             }
         }
-        let open_at = |i: isize, j: isize| -> f32 {
-            if i < 0 || j < 0 || i >= w as isize || j >= h as isize { 0.0 } else { open[j as usize * w + i as usize] }
+        // A face is only open between two cells that can both hold liquid. A face leading
+        // into a solid cell would look like a free surface to the pressure solve and
+        // swallow fluid.
+        let faces = |open: &[f32], sdf: &[f32], i: usize, j: usize| -> [f32; 2] {
+            let here = open[j * w + i] > 0.0;
+            let left = here && i > 0 && open[j * w + i - 1] > 0.0;
+            let below = here && j > 0 && open[(j - 1) * w + i] > 0.0;
+            [
+                if left { open_fraction(sdf[j * nw + i], sdf[(j + 1) * nw + i]) } else { 0.0 },
+                if below { open_fraction(sdf[j * nw + i], sdf[j * nw + i + 1]) } else { 0.0 },
+            ]
         };
+        Self::seal_pockets(&mut open, &mut sdf, [w, h], |open, sdf, i, j| faces(open, sdf, i, j));
 
         // Kernel-smoothed solid occupancy: what the particle scatter would report if the
         // solid were filled with rest-density liquid. Adding it to the liquid occupancy
@@ -186,23 +233,56 @@ impl Scene {
                         occ += ka * kb * solid_at(i as isize + a as isize - 1, j as isize + b as isize - 1);
                     }
                 }
-                // A face is only open between two cells that can both hold liquid. A face
-                // leading into a solid cell would look like a free surface to the pressure
-                // solve and swallow fluid.
-                let (ii, jj) = (i as isize, j as isize);
-                let here = open_at(ii, jj) > 0.0;
-                let mut au = open_fraction(sdf[j * nw + i], sdf[(j + 1) * nw + i]);
-                let mut av = open_fraction(sdf[j * nw + i], sdf[j * nw + i + 1]);
-                if !(here && open_at(ii - 1, jj) > 0.0) {
-                    au = 0.0;
-                }
-                if !(here && open_at(ii, jj - 1) > 0.0) {
-                    av = 0.0;
-                }
+                let [au, av] = faces(&open, &sdf, i, j);
                 solid[j * w + i] = [au, av, occ, open[j * w + i]];
             }
         }
         SolidField { sdf, solid }
+    }
+
+    /// Turns enclosed pockets into solid: groups of open cells, connected through open
+    /// faces, that are too small to hold liquid with a free surface. Two touching shapes
+    /// leave such slivers in the crack between them (a cell or two, sealed on every side).
+    /// Liquid that leaks in through the gap in the distance field has nowhere to go: its
+    /// pressure and density-correction system is singular, the potential grows without
+    /// bound, and once it overflows the whole tank loses its volume correction. The node
+    /// distances of a sealed cell are pushed inside the solid as well, so particles are
+    /// expelled from it and the renderer draws it filled.
+    fn seal_pockets(open: &mut [f32], sdf: &mut [f32], [w, h]: [usize; 2], faces: impl Fn(&[f32], &[f32], usize, usize) -> [f32; 2]) {
+        let nw = w + 1;
+        let mut label = vec![u32::MAX; w * h];
+        let mut stack = Vec::new();
+        let mut members = Vec::new();
+        for start in 0..w * h {
+            if open[start] == 0.0 || label[start] != u32::MAX {
+                continue;
+            }
+            members.clear();
+            label[start] = start as u32;
+            stack.push(start);
+            while let Some(k) = stack.pop() {
+                members.push(k);
+                let (i, j) = (k % w, k / w);
+                let [left, below] = faces(open, sdf, i, j);
+                let right = if i + 1 < w { faces(open, sdf, i + 1, j)[0] } else { 0.0 };
+                let above = if j + 1 < h { faces(open, sdf, i, j + 1)[1] } else { 0.0 };
+                for (n, a) in [(k.wrapping_sub(1), left), (k + 1, right), (k.wrapping_sub(w), below), (k + w, above)] {
+                    if a > 0.0 && label[n] == u32::MAX {
+                        label[n] = start as u32;
+                        stack.push(n);
+                    }
+                }
+            }
+            if members.len() < MIN_POCKET {
+                for &k in &members {
+                    open[k] = 0.0;
+                    let (i, j) = (k % w, k / w);
+                    for node in [j * nw + i, j * nw + i + 1, (j + 1) * nw + i, (j + 1) * nw + i + 1] {
+                        sdf[node] = sdf[node].min(-0.5);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -281,6 +361,24 @@ mod tests {
             }
         }
         assert!(cut_cells > 100, "the shapes should cut through many cells");
+    }
+
+    /// Two ramps meeting at their tips leave a sealed crack; it must be filled in, or the
+    /// liquid that leaks into it makes the pressure system singular.
+    #[test]
+    fn cracks_between_touching_shapes_are_filled() {
+        let mut scene = Scene::new([512, 288]);
+        scene.shapes.push(Shape::Ramp { c: [218.4, 89.6], half: [36.8, 16.0], angle: 0.0, flip: true });
+        scene.shapes.push(Shape::Ramp { c: [292.0, 89.6], half: [36.8, 16.0], angle: 0.0, flip: false });
+        let field = scene.rasterize();
+        assert!(field.smallest_region(scene.grid) >= MIN_POCKET);
+        // A large enclosed region (a sealed box) is left alone.
+        let mut boxed = Scene::new([128, 128]);
+        for (c, half) in [([64.0, 40.0], [30.0, 2.0]), ([64.0, 80.0], [30.0, 2.0]), ([36.0, 60.0], [2.0, 22.0]), ([92.0, 60.0], [2.0, 22.0])] {
+            boxed.shapes.push(Shape::Box { c, half, angle: 0.0 });
+        }
+        let field = boxed.rasterize();
+        assert_eq!(field.solid[60 * 128 + 64][3], 1.0, "the inside of a sealed box stays open");
     }
 
     #[test]

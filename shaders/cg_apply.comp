@@ -3,26 +3,45 @@
 #include "common.glsl"
 #include "mg.glsl"
 
-// q = A p and the partial sums of p.q (into the second half of the partial buffer).
+// The new search direction p = z + beta p_old, q = A p, and the partial sums of p.q (into
+// the second half of the partial buffer), in one pass. A cell needs the new direction of
+// its four neighbours as well, so the old one is read from one buffer and the new one
+// written to another; the two swap roles every iteration (two descriptor sets, see
+// mod.rs). On the first iteration beta is zero and the old buffer is not read.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+vec2 direction(int i) {
+    vec2 z = mgz[i];
+    vec2 b = K.p_beta;
+    if (b.x == 0.0 && b.y == 0.0) return z;
+    vec2 po = cgp[i];
+    return vec2(b.x != 0.0 ? z.x + b.x * po.x : z.x, b.y != 0.0 ? z.y + b.y * po.y : z.y);
+}
+
 void main() {
+    if (ptile[group_slot()] == 0u) {
+        if (gl_LocalInvocationIndex == 0u) part[M.mode + group_slot()] = vec4(0.0);
+        return;
+    }
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     vec4 acc4 = vec4(0.0);
     if (inside_f(c)) {
         int i = fidx(c);
         float D = mgd[i];
         if (D > 0.0) {
-            vec2 p = cgp[i];
+            vec2 p = direction(i);
             vec4 w = mga[i];
             vec2 q = D * p;
             for (int d = 0; d < 4; d++) {
                 ivec2 n = c + NB[d];
-                if (unknown_f(n)) q -= wcomp(w, d) * cgp[fidx(n)];
+                if (unknown_f(n)) q -= wcomp(w, d) * direction(fidx(n));
             }
+            cgp2[i] = p;
             cgq[i] = q;
             acc4 = vec4(0.0, 0.0, p * q);
+        } else {
+            cgp2[i] = vec2(0.0);
         }
     }
     group_sum(acc4, M.mode + group_slot());

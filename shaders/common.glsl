@@ -14,7 +14,7 @@ struct Particle {
     vec4 c;     // APIC affine matrix (du/dx, du/dy, dv/dx, dv/dy), 1 / s
     float s;    // syrup volume fraction of an aqueous particle (0 = water, 1 = syrup)
     uint kind;  // 0 = dead slot, 1 = aqueous (water <-> syrup), 2 = oil
-    float pad0;
+    uint id;    // permanent identity (survives sorting); seeds the per-particle random numbers
     float pad1;
 };
 
@@ -50,6 +50,7 @@ layout(std140, set = 0, binding = 0) uniform Params {
     float tool_strength;
     uint frame;
     vec4 tol;             // relative tolerance: pressure, density correction, viscosity; density-correction time constant (s)
+    vec4 ext;             // particle speed cap (cells / s, huge = off); advection order (1 Euler, 2 midpoint); CFL multiple allowed to spray; unused
 } P;
 
 layout(std430, set = 0, binding = 1) buffer ParticleBuf { Particle particles[]; };
@@ -113,9 +114,13 @@ layout(std430, set = 0, binding = 17) buffer SolveBuf {
 layout(std430, set = 0, binding = 18) buffer IndBuf { uint ind[]; };
 layout(std430, set = 0, binding = 19) buffer PartBuf { vec4 part[]; };   // per-workgroup partial sums
 layout(std430, set = 0, binding = 20) buffer MgDBuf { float mgd[]; };    // multigrid diagonals
-layout(std430, set = 0, binding = 21) buffer MgXBuf { vec2 mgx[]; };     // multigrid solution (z)
+layout(std430, set = 0, binding = 21) buffer MgXBuf { vec2 mgx[]; };     // multigrid: z after pre-smoothing
+layout(std430, set = 0, binding = 36) buffer MgZBuf { vec2 mgz[]; };     // multigrid: finished z of each level
 layout(std430, set = 0, binding = 22) buffer MgRBuf { vec2 mgr[]; };     // multigrid right-hand side (r)
+// Search direction of the pressure solve: the previous one and the one being built. The two
+// buffers swap bindings every iteration.
 layout(std430, set = 0, binding = 23) buffer CgPBuf { vec2 cgp[]; };
+layout(std430, set = 0, binding = 34) buffer CgP2Buf { vec2 cgp2[]; };
 layout(std430, set = 0, binding = 24) buffer CgQBuf { vec2 cgq[]; };
 layout(std430, set = 0, binding = 25) buffer VisRBuf { vec2 vr[]; };     // viscosity residual
 layout(std430, set = 0, binding = 26) buffer VisPBuf { vec2 vp[]; };     // viscosity search direction
@@ -129,6 +134,15 @@ layout(std430, set = 0, binding = 30) buffer SurfBuf { vec4 surf[]; };
 layout(std430, set = 0, binding = 31) buffer JumpBuf { vec2 pjump[]; };
 // One word per 16 x 16 tile: non-zero where the implicit viscosity solve has work to do.
 layout(std430, set = 0, binding = 32) buffer TileBuf { uint tiles[]; };
+
+// Multigrid level table: offset into the level buffers, width, height, and the offset of the
+// level's tile flags in PTileBuf.
+layout(std430, set = 0, binding = 33) readonly buffer LevBuf { ivec4 lev[]; };
+// One word per 16 x 16 tile of every dispatched multigrid level: non-zero where the tile
+// holds pressure unknowns. Kernels skip the other tiles outright (air, mostly).
+layout(std430, set = 0, binding = 35) buffer PTileBuf { uint ptile[]; };
+// Particles per cell in a window of the grid (count.comp), for the brush tools.
+layout(std430, set = 0, binding = 37) buffer CountBuf { uint cell_count[]; };
 
 const float MASS_SCALE = 1048576.0;  // 2^20
 const float MOM_SCALE = 4194304.0;   // 2^22, momentum is stored in cells / step

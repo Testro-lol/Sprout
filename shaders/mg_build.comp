@@ -11,9 +11,35 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+shared uint s_state;   // bit 0: tile active now, bit 1: it was active in the last substep
+
 void main() {
+    // A coarse tile is active when any of the four fine tiles under it is. One that stays
+    // inactive is skipped; one that has just gone inactive gets its matrix cleared once.
+    if (gl_LocalInvocationIndex == 0u) {
+        uint l = mg_level();
+        ivec2 T = ivec2(gl_WorkGroupID.xy);
+        ivec2 tf = (M.dim_f + 15) >> 4;
+        uint on = 0u;
+        for (int k = 0; k < 4; k++) {
+            ivec2 t = 2 * T + ivec2(k & 1, k >> 1);
+            if (t.x < tf.x && t.y < tf.y) on |= ptile[uint(lev[l].w) + uint(t.y * tf.x + t.x)];
+        }
+        uint slot = uint(lev[l + 1u].w) + group_slot();
+        uint was = ptile[slot];
+        ptile[slot] = on != 0u ? 1u : 0u;
+        s_state = (on != 0u ? 1u : 0u) | (was != 0u ? 2u : 0u);
+    }
+    barrier();
+    uint state = s_state;
+    if (state == 0u) return;
     ivec2 C = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(C, M.dim_c))) return;
+    if ((state & 1u) == 0u) {
+        mgd[cidx_c(C)] = 0.0;
+        mga[cidx_c(C)] = vec4(0.0);
+        return;
+    }
     float D = 0.0;
     vec4 A = vec4(0.0);
     for (int k = 0; k < 4; k++) {

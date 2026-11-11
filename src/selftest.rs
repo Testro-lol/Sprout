@@ -23,6 +23,9 @@ pub struct Snapshot {
     pub zoom: f32,
     pub center: [f32; 2],
     pub brush: f32,
+    pub jet_angle: f32,
+    pub jet_speed: f32,
+    pub radial_speed: f32,
     pub panel: bool,
 }
 
@@ -133,11 +136,35 @@ pub fn script() -> Vec<(u64, Act)> {
     s.drag(MouseButton::Middle, [256.0, 60.0], [226.0, 60.0], 10);
     s.check("pan (middle drag)", |m, s| (s.center[0] - m.center[0]).abs() > 5.0);
     s.key(Home).check("reset view (Home)", |m, s| s.zoom == m.zoom && s.center == m.center);
+    // The view eases back; let it settle before clicking at positions in the grid again.
+    s.wait(40);
     s.mark().key(KeyH).wait(2).check("hide the panel (H)", |m, s| s.panel != m.panel);
     s.key(KeyH);
 
+    // New emitters: a single stamp while paused, and continuous spray / jet.
+    s.key(Space).key(KeyC).key(Digit1).mark().click([360.0, 180.0]);
+    s.check("drop stamps while paused (C)", |m, s| s.particles > m.particles + 500 && s.substeps == m.substeps);
+    s.mark().wait(10).check("drop does not repeat", |m, s| s.particles == m.particles);
+    // (Round-off in the scripted pointer may bring an empty rim cell or two into the disk.)
+    s.mark().click([360.0, 180.0]).check("repeat drop does not overfill", |m, s| s.particles < m.particles + 20);
+    s.key(Space).key(KeyB).mark().drag(MouseButton::Left, [340.0, 180.0], [400.0, 180.0], 20);
+    s.check("spray emits (B)", |m, s| s.particles > m.particles);
+    s.key(KeyJ).mark().push(Act::Wheel(6.0)).wait(2);
+    s.check("wheel aims jet without zoom", |m, s| (s.jet_angle - m.jet_angle - 90.0).abs() < 0.01 && s.zoom == m.zoom);
+    s.mark().key(KeyG).check("G aims the jet back (J)", |m, s| (s.jet_angle - m.jet_angle + 15.0).abs() < 0.01);
+    s.mark().drag(MouseButton::Left, [340.0, 180.0], [400.0, 180.0], 20);
+    s.check("jet emits (J)", |m, s| s.particles > m.particles);
+
     // Reset, next map, and a change of resolution with fluid on screen.
     s.mark().key(KeyR).wait(5).check("reset the map (R)", |m, s| s.particles == 0 && s.shapes == 0 && s.map == m.map);
+    // Isolate repulsion from gravity and other liquid: a fresh round blob.
+    s.key(Space).key(KeyC).click([360.0, 180.0]).key(KeyV).mark();
+    s.key(Space).push(Act::Press(MouseButton::Left)).wait(8).push(Act::Release(MouseButton::Left));
+    s.check("push repels without adding liquid (V)", |m, s| s.particles == m.particles && s.radial_speed > m.radial_speed + 10.0);
+    s.key(KeyR).wait(5).key(KeyJ).push(Act::Move([256.0, 140.0])).wait(2).push(Act::Press(MouseButton::Left));
+    s.wait(120).mark().wait(360);
+    s.check("held jet keeps outlet power after 3s", |m, s| s.jet_speed > 100.0 && s.jet_speed > m.jet_speed * 0.7 && s.particles > m.particles);
+    s.push(Act::Release(MouseButton::Left)).key(KeyR).wait(5);
     s.mark().key(PageDown).wait(30).check("next map (PageDown)", |m, s| s.map != m.map && s.particles > 10_000);
     s.mark().push(Act::Grid([384, 216])).wait(60);
     s.check("change quality", |m, s| s.grid == [384, 216] && s.map == m.map && s.particles > 10_000 && s.substeps > 5);
