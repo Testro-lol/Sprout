@@ -1,0 +1,53 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Settling of suspensions (README, "Suspensions"): the grains of a concentrate (mud,
+// sludge, oobleck) fall through its diluent at the terminal velocity of a grain of
+// diameter `grain` (the drag law the oil droplets use, particles.comp), as a flux of
+// concentration between vertically adjacent cells of the family:
+//     F = v_t s_above (1 - s_below) min(occupancy above, occupancy below)
+// the hindered (Kynch) flux s (1 - s) v_t of a uniform suspension, limited so that a cell
+// never gives more concentrate than it holds or takes more than it has room for. Each cell's
+// gain is shared out over its particles in proportion to the room each has (1 - s) and its
+// loss in proportion to what each holds (s), with the particles' scatter weights
+// (particles.comp): the concentrate is conserved exactly and every s stays in [0, 1]. Moving the
+// particles instead (as the oil drift does) needs a population of pure grains and pure
+// liquid, whose noise at 4 particles per cell drives convection 4 times faster than the
+// settling itself (measured; README).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Flux (cell volumes / s) of family f's concentrate from cell `up` into cell `dn` below it.
+float flux(int up, int dn, int f, float vt) {
+    float ou = famocc[up * P.n_fam + f], od = famocc[dn * P.n_fam + f];
+    if (ou <= 1e-3 || od <= 1e-3) return 0.0;
+    float su = f == 0 ? comp[up].z : mixb[up * (P.n_fam - 1) + f - 1];
+    float sd = f == 0 ? comp[dn].z : mixb[dn * (P.n_fam - 1) + f - 1];
+    if (su <= 0.0 || sd < 0.0) return 0.0;
+    float F = vt * su * (1.0 - sd) * min(ou, od);
+    return min(F, min(su * ou, (1.0 - sd) * od) / S.dt);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    int W = P.grid.x;
+    for (int f = 0; f < P.n_fam; f++) {
+        int row = P.fams[f].x, dl = P.fams[f].y;
+        float d = mats[row].b.z;
+        float occ = famocc[i * P.n_fam + f];
+        vec2 ds = vec2(0.0);
+        if (d > 0.0 && occ > 1e-3 && c.y > 0 && c.y < P.grid.y - 1) {
+            float drho = mats[row].a.x - mats[dl].a.x;
+            float T = has_cap(CAP_THERMAL) ? therm[i].x : P.heat.x;
+            float vt = terminal(drho, mats[dl].a.x, exp(row_lnu(uint(dl), 1.0, T, has_cap(CAP_THERMAL))), d);
+            float gain = drho > 0.0 ? flux(i + W, i, f, vt) : flux(i - W, i, f, vt);
+            float loss = drho > 0.0 ? flux(i, i - W, f, vt) : flux(i, i + W, f, vt);
+            float s = f == 0 ? comp[i].z : mixb[i * (P.n_fam - 1) + f - 1];
+            ds = S.dt * vec2(gain / max(occ * (1.0 - s), 1e-6), loss / max(occ * s, 1e-6));
+        }
+        dsettle[i * P.n_fam + f] = ds;
+    }
+}

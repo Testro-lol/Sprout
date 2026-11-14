@@ -1,0 +1,120 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Heat conduction on the grid, explicit, in energy form.
+//
+// grid_prep.comp left each cell's temperature T, heat capacity C (sum of particle weights x
+// volumetric heat capacity) and conductivity k. This pass works out the energy each cell
+// gains in the substep:
+//   - from liquid neighbours, through the open part of the shared face, with the harmonic
+//     mean of the two conductivities (what crosses a face leaves one cell and enters the
+//     other, so conduction conserves energy exactly);
+//   - from a solid held at a temperature (scene.rs: a hot or cold shape), through the closed
+//     part of a face, over the half cell between the cell centre and the wall;
+//   - from the air at a free surface: a film coefficient (params.rs: air_cooling) plus
+//     grey-body radiation with the liquid's emissivity. Air itself is not simulated; it is a
+//     reservoir at the ambient temperature.
+//   - across a face between two different liquids (the cells' leading materials differ),
+//     more than conduction over the two half cells: the heat transfer coefficient of the
+//     interface (params.rs: contact_heat), convection and boiling in a boundary layer far
+//     thinner than a cell. That part is taken in a form that cannot overshoot (each face
+//     moves at most a quarter of the way to the pair's common temperature), so it does not
+//     shorten the time step however large the coefficient;
+// and stores it as the change of enthalpy temperature of the cell's particles,
+// dT = dE * PPC / C, which they gather next substep (particles.comp). Latent heat needs no
+// handling here: it is part of the enthalpy temperature (common.glsl: phase_of).
+//
+// Particles in one cell also exchange heat among themselves. Conduction between cells only
+// moves the cell's mean: without this a drop of lava in water, or a particle chilled by the
+// Cool brush, kept its own temperature forever. Each particle (a parcel of radius r, its
+// share of the cell) relaxes towards the temperature of the particles in its cell at the rate
+// of the slowest conduction mode of a cylinder of that radius, 5.78 k / (r² rho c); every
+// particle of a cell takes the same share lambda of its difference, and the target is the
+// heat-capacity-weighted mean of exactly those particles (hcell, by position, not spread
+// with the scatter kernel), so the exchange sums to zero over the cell and moves no heat
+// between cells. (Relaxing towards the kernel-weighted temperature of the 3 x 3 cells around
+// a particle did: it diffused heat between cells some 17 times faster than conduction.)
+//
+// Exchange with air and solids goes into the ledger, so the energy budget can be checked.
+// Sparse cells conduct in proportion to their occupancy, which also keeps the explicit
+// step stable for them; the time step is limited on the CPU (SimParams::dt_thermal).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const float PHI_MIN = 0.04;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    vec4 me = therm[i];
+    float emis = dheat[i].x;
+    float phi = cell[i].x;
+    // Exchange inside the cell: r^2 = (cell area / PPC) / pi, in cells; heat capacity per
+    // volume of liquid relative to water's (me.y / PPC is the cell's, phi its liquid volume).
+    float k = S.dt * P.heat.y;
+    ivec2 hsum = hcell[i];
+    vec2 own = vec2(0.0);
+    if (hsum.x > 0 && me.y > 0.0 && phi > 0.0) {
+        float rate = 5.78 * me.z * 3.14159265 / (P.inv_ppc * me.y * P.inv_ppc / phi);
+        own = vec2(1.0 - exp(-k * rate), float(hsum.y) / float(hsum.x));  // mean (T + 273.15) / T_SCALE
+    }
+    if (phi <= PHI_MIN || me.y <= 0.0 || c.x < 1 || c.y < 1 || c.x >= P.grid.x - 1 || c.y >= P.grid.y - 1) {
+        dheat[i] = vec4(0.0, own, 0.0);
+        return;
+    }
+    phi = min(phi, 1.0);
+    int W = P.grid.x;
+    int nb[4] = int[4](i - 1, i + 1, i - W, i + W);
+    float open[4] = float[4](solid[i].x, solid[i + 1].x, solid[i].y, solid[i + W].y);
+    float Tk = me.x + 273.15, Ta = P.heat.x + 273.15;
+    float cond = 0.0, air = 0.0, wall = 0.0, contact = 0.0;
+    float cpc = me.y * P.inv_ppc;  // heat capacity of the cell, cell volumes of water
+    float hc = P.heat2.w;
+    int lead = int(fract(sprop[i].w) * 128.0 + 0.5);
+    for (int q = 0; q < 4; q++) {
+        int n = nb[q];
+        float a = open[q];
+        float pn = cell[n].x;
+        vec4 o = therm[n];
+        if (a > 0.0) {
+            // Liquid against liquid through the part of the face both cells fill; against
+            // air through the part only this cell fills. Summed up a column of cells, the
+            // exposed parts add up to the whole surface however ragged it is.
+            float pl = (pn > PHI_MIN && o.y > 0.0) ? min(pn, 1.0) : 0.0;
+            if (pl > 0.0) {
+                float gc = 2.0 * me.z * o.z / max(me.z + o.z, 1e-12);
+                cond += a * min(phi, pl) * gc * (o.x - me.x);
+                if (hc > 0.0 && int(fract(sprop[n].w) * 128.0 + 0.5) != lead) {
+                    // Each half cell conducts at least as well as the boundary layer.
+                    float g1 = max(2.0 * me.z, hc), g2 = max(2.0 * o.z, hc);
+                    float gx = max(g1 * g2 / (g1 + g2) - gc, 0.0) * a * min(phi, pl);
+                    float cn = o.y * P.inv_ppc;
+                    float x = gx * k * (1.0 / cpc + 1.0 / cn);
+                    contact += 0.25 * (1.0 - exp(-4.0 * x)) * cpc * cn / (cpc + cn) * (o.x - me.x);
+                }
+            }
+            float exposed = max(phi - pl, 0.0);
+            if (exposed > 0.0 && solid[n].w > 0.02) {
+                // Free surface: film + radiation, linearised about the two temperatures.
+                float h = P.heat.z + emis * P.heat.w * (Ta * Ta + Tk * Tk) * (Ta + Tk);
+                air += a * exposed * h * (P.heat.x - me.x);
+            }
+        }
+        if (a < 1.0) {
+            float ts = max(solid_t[n], solid_t[i]);
+            if (ts > 0.5 * NO_TEMP) wall += (1.0 - a) * phi * 2.0 * me.z * (ts - me.x);
+        }
+    }
+    // The exchange with a reservoir is unconditionally stable in this form: the cell
+    // relaxes towards it and cannot overshoot, however thin the cell.
+    air *= k;
+    wall *= k;
+    float lim = cpc * abs(P.heat.x - me.x);
+    air = clamp(air, -lim, lim);
+    float e = k * cond + contact + air + wall;
+    dheat[i] = vec4(e / cpc, own, 0.0);
+    if (air > 0.0) ledger_add(0, air); else ledger_add(1, -air);
+    if (wall > 0.0) ledger_add(2, wall); else ledger_add(3, -wall);
+}

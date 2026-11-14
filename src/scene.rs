@@ -79,7 +79,21 @@ pub struct SolidField {
     /// Per cell: open fraction of the left face, open fraction of the bottom face,
     /// kernel-smoothed solid occupancy, open volume fraction.
     pub solid: Vec<[f32; 4]>,
+    /// Per cell: the number of its region (bits 0-4) and, for one cell at the top of each
+    /// region, `REGION_VENT`. A region is a group of open cells connected through open
+    /// faces; liquid cannot pass from one to another. See `sealed_vent` in sim/params.rs.
+    pub region: Vec<u32>,
+    /// Per cell: the temperature the solid there is held at, °C, or `NO_TEMP` where solids
+    /// insulate (the default) or there is none. Empty = no solid has a temperature.
+    pub temp: Vec<f32>,
 }
+
+/// `SolidField::temp` of an insulating solid (matches `NO_TEMP` in common.glsl).
+pub const NO_TEMP: f32 = -1e9;
+
+/// Regions beyond this many share the last number.
+pub const REGION_MAX: u32 = 31;
+pub const REGION_VENT: u32 = 256;
 
 #[cfg(test)]
 impl SolidField {
@@ -120,6 +134,10 @@ impl SolidField {
 pub struct Scene {
     pub grid: [u32; 2],
     pub shapes: Vec<Shape>,
+    /// Temperature each shape is held at, °C, by index; `None` (also for shapes beyond the
+    /// end of the list) is an insulating solid. A hot plate or a block of ice: a reservoir
+    /// that exchanges heat with the liquid touching it and never changes temperature.
+    pub temps: Vec<Option<f32>>,
 }
 
 /// Cells with less open volume than this are treated as solid.
@@ -142,7 +160,7 @@ fn open_fraction(d0: f32, d1: f32) -> f32 {
 
 impl Scene {
     pub fn new(grid: [u32; 2]) -> Self {
-        Scene { grid, shapes: Vec::new() }
+        Scene { grid, shapes: Vec::new(), temps: Vec::new() }
     }
 
     fn wall_sdf(&self, p: [f32; 2]) -> f32 {
@@ -187,6 +205,8 @@ impl Scene {
                 }
             }
         }
+
+        Self::union_depth(&mut sdf, [nw, nh]);
 
         // Open volume per cell from four bilinear sub-samples.
         let mut open = vec![0.0f32; w * h];
@@ -237,7 +257,144 @@ impl Scene {
                 solid[j * w + i] = [au, av, occ, open[j * w + i]];
             }
         }
-        SolidField { sdf, solid }
+        let region = Self::regions(&solid, [w, h]);
+        // Cells in or against a shape that is held at a temperature.
+        let mut temp = Vec::new();
+        if self.temps.iter().any(|t| t.is_some()) {
+            temp = vec![NO_TEMP; w * h];
+            for (s, t) in self.shapes.iter().zip(&self.temps) {
+                let Some(t) = *t else { continue };
+                let (c, r) = s.bound();
+                let r = r + 2.0;
+                let i0 = (c[0] - r).floor().max(0.0) as usize;
+                let i1 = ((c[0] + r).ceil().max(0.0) as usize).min(w);
+                let j0 = (c[1] - r).floor().max(0.0) as usize;
+                let j1 = ((c[1] + r).ceil().max(0.0) as usize).min(h);
+                for j in j0..j1 {
+                    for i in i0..i1 {
+                        if s.sdf([i as f32 + 0.5, j as f32 + 0.5]) < 0.75 {
+                            temp[j * w + i] = t;
+                        }
+                    }
+                }
+            }
+        }
+        SolidField { sdf, solid, region, temp }
+    }
+
+    /// Inside the solids, makes the node distances measure to the outline of the union of
+    /// the shapes rather than to the nearest outline of any one of them. Where two shapes
+    /// overlap (the crown of two ramps, a box placed on a wall) the minimum of their own
+    /// distances points at the faces each has inside the other: a particle pushed out along
+    /// it lands on that internal seam, still inside, and stays there (Canopy's wedges held
+    /// particles a cell and more inside). Nodes next to open ones keep their value; deeper
+    /// ones take a chamfer distance (steps of 1 and sqrt 2) from those, never shallower than
+    /// before, so the field still points out of the solid wherever a particle is.
+    fn union_depth(sdf: &mut [f32], [nw, nh]: [usize; 2]) {
+        const FAR: f32 = 1e9;
+        let inside = |d: f32| d < 0.0;
+        // Depth below the surface, positive inside; FAR where it is still to be found.
+        let mut depth: Vec<f32> = vec![0.0; nw * nh];
+        for j in 0..nh {
+            for i in 0..nw {
+                let k = j * nw + i;
+                if !inside(sdf[k]) {
+                    continue;
+                }
+                let mut edge = false;
+                for (di, dj) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                    let (a, b) = (i as i32 + di, j as i32 + dj);
+                    if a >= 0 && b >= 0 && (a as usize) < nw && (b as usize) < nh && !inside(sdf[b as usize * nw + a as usize]) {
+                        edge = true;
+                        break;
+                    }
+                }
+                depth[k] = if edge { -sdf[k] } else { FAR };
+            }
+        }
+        const D: f32 = std::f32::consts::SQRT_2;
+        let relax = |depth: &mut Vec<f32>, k: usize, n: usize, step: f32| {
+            if depth[n] + step < depth[k] {
+                depth[k] = depth[n] + step;
+            }
+        };
+        for j in 0..nh {
+            for i in 0..nw {
+                let k = j * nw + i;
+                if depth[k] == 0.0 {
+                    continue;
+                }
+                if i > 0 { relax(&mut depth, k, k - 1, 1.0); }
+                if j > 0 {
+                    relax(&mut depth, k, k - nw, 1.0);
+                    if i > 0 { relax(&mut depth, k, k - nw - 1, D); }
+                    if i + 1 < nw { relax(&mut depth, k, k - nw + 1, D); }
+                }
+            }
+        }
+        for j in (0..nh).rev() {
+            for i in (0..nw).rev() {
+                let k = j * nw + i;
+                if depth[k] == 0.0 {
+                    continue;
+                }
+                if i + 1 < nw { relax(&mut depth, k, k + 1, 1.0); }
+                if j + 1 < nh {
+                    relax(&mut depth, k, k + nw, 1.0);
+                    if i + 1 < nw { relax(&mut depth, k, k + nw + 1, D); }
+                    if i > 0 { relax(&mut depth, k, k + nw - 1, D); }
+                }
+            }
+        }
+        for (d, &depth) in sdf.iter_mut().zip(&depth) {
+            if inside(*d) && depth < FAR {
+                *d = d.min(-depth);
+            }
+        }
+    }
+
+    /// Numbers the regions of open cells and picks each one's vent (see `SolidField::region`):
+    /// the leftmost cell of its top row.
+    fn regions(solid: &[[f32; 4]], [w, h]: [usize; 2]) -> Vec<u32> {
+        let mut region = vec![u32::MAX; w * h];
+        let mut stack = Vec::new();
+        let mut count = 0;
+        for start in 0..w * h {
+            if solid[start][3] == 0.0 || region[start] != u32::MAX {
+                continue;
+            }
+            let id = count.min(REGION_MAX);
+            count += 1;
+            let mut vent = start;
+            region[start] = id;
+            stack.push(start);
+            while let Some(k) = stack.pop() {
+                // Rows are numbered upwards, so the larger index of two rows is the higher.
+                if k / w > vent / w || (k / w == vent / w && k < vent) {
+                    vent = k;
+                }
+                let (i, j) = (k % w, k / w);
+                let links = [
+                    (i > 0, k.wrapping_sub(1), solid[k][0]),
+                    (i + 1 < w, k + 1, if i + 1 < w { solid[k + 1][0] } else { 0.0 }),
+                    (j > 0, k.wrapping_sub(w), solid[k][1]),
+                    (j + 1 < h, k + w, if j + 1 < h { solid[k + w][1] } else { 0.0 }),
+                ];
+                for (ok, n, a) in links {
+                    if ok && a > 0.0 && region[n] == u32::MAX {
+                        region[n] = id;
+                        stack.push(n);
+                    }
+                }
+            }
+            region[vent] |= REGION_VENT;
+        }
+        for r in &mut region {
+            if *r == u32::MAX {
+                *r = 0;
+            }
+        }
+        region
     }
 
     /// Turns enclosed pockets into solid: groups of open cells, connected through open
@@ -318,6 +475,30 @@ mod tests {
         assert!(flipped.sdf([-8.0, 2.0]) > 0.0);
     }
 
+    /// Inside two overlapping shapes the field measures to the outline of their union: at the
+    /// face one has inside the other it is as deep as the solid there, so a particle pushed
+    /// out along it leaves the solid instead of stopping on that internal seam.
+    #[test]
+    fn overlapping_shapes_have_no_internal_seam() {
+        let mut scene = Scene::new([128, 64]);
+        // One block 40..80 x 20..30 made of two boxes that overlap over 59.5..60.5.
+        scene.shapes.push(Shape::Box { c: [50.25, 25.0], half: [10.25, 5.0], angle: 0.0 });
+        scene.shapes.push(Shape::Box { c: [69.75, 25.0], half: [10.25, 5.0], angle: 0.0 });
+        let f = scene.rasterize();
+        let nw = 129;
+        let at = |i: usize, j: usize| f.sdf[j * nw + i];
+        // Between the two internal faces, 3 below the block's top: about 3 deep, not half a
+        // cell (each box alone is only 0.5 deep there; the nodes next to the outline keep
+        // their own value, which is that shallow at the seam, so it comes out at 2.5).
+        assert!((-3.6..-2.4).contains(&at(60, 27)), "seam node {}", at(60, 27));
+        // Deeper in, the seam is gone: the depth along the row changes by less than a cell.
+        for i in 44..76 {
+            assert!((at(i, 26) - at(i + 1, 26)).abs() < 0.6, "{} -> {} at x = {i}", at(i, 26), at(i + 1, 26));
+        }
+        // Outside and on the outline nothing changed.
+        assert!((at(60, 33) - 3.0).abs() < 1e-4 && at(40, 25).abs() < 1e-4);
+    }
+
     #[test]
     fn open_fraction_follows_the_crossing() {
         assert_eq!(open_fraction(1.0, 2.0), 1.0);
@@ -379,6 +560,27 @@ mod tests {
         }
         let field = boxed.rasterize();
         assert_eq!(field.solid[60 * 128 + 64][3], 1.0, "the inside of a sealed box stays open");
+    }
+
+    /// Every region of open cells has exactly one vent, in its top row; a box drawn in the
+    /// tank is a region of its own.
+    #[test]
+    fn every_region_has_one_vent_at_its_top() {
+        let mut boxed = Scene::new([128, 128]);
+        for (c, half) in [([64.0, 40.0], [30.0, 2.0]), ([64.0, 80.0], [30.0, 2.0]), ([36.0, 60.0], [2.0, 22.0]), ([92.0, 60.0], [2.0, 22.0])] {
+            boxed.shapes.push(Shape::Box { c, half, angle: 0.0 });
+        }
+        let field = boxed.rasterize();
+        let id = |i: usize, j: usize| field.region[j * 128 + i] & REGION_MAX;
+        assert_ne!(id(64, 60), id(64, 100), "inside and outside the box");
+        assert_eq!(id(10, 10), id(64, 100));
+        for target in [id(64, 60), id(64, 100)] {
+            let cells: Vec<usize> = (0..128 * 128).filter(|&k| field.solid[k][3] > 0.0 && field.region[k] & REGION_MAX == target).collect();
+            let vents: Vec<usize> = cells.iter().copied().filter(|&k| field.region[k] & REGION_VENT != 0).collect();
+            assert_eq!(vents.len(), 1);
+            assert_eq!(vents[0] / 128, cells.iter().map(|k| k / 128).max().unwrap(), "the vent is in the top row");
+        }
+        assert!(field.region.iter().zip(&field.solid).all(|(r, s)| s[3] > 0.0 || r & REGION_VENT == 0), "no vent in a solid cell");
     }
 
     #[test]

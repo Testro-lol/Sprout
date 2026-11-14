@@ -5,7 +5,7 @@
 
 // The one per-particle pass of a substep. For every live particle:
 //   1. gather  (grid -> particle): APIC velocity + affine matrix from the projected grid,
-//      local composition for oil / aqueous slip and water / syrup mixing
+//      local composition for the drift between phase groups and for mixing with the diluent
 //   2. advect, collide with the solid SDF, apply the mouse tool and the currents
 //   3. scatter (particle -> grid): mass and momentum to the faces, composition to the cells
 // Gather reads only float fields and scatter writes only the integer accumulators, so the
@@ -17,11 +17,13 @@ layout(push_constant) uniform PC {
     uint gather;  // 0 on the first substep after a reset: the grid holds nothing yet
 } pc;
 
-// Gradient of the smoothed oil fraction (per cell) below which unresolved droplets drift
+// Gradient of the smoothed share of a phase group (per cell) below which unresolved droplets drift
 // freely, and above which the interface counts as resolved and nothing drifts. A sharp
 // interface reads about 0.3 after smoothing.
 const float SLIP_GRAD_MIN = 0.04;
 const float SLIP_GRAD_MAX = 0.12;
+
+const uint KIND_FRESH = 0x10000u;  // params.rs: KIND_FRESH (spawned since the last substep)
 
 uint hash(uint x) {
     x ^= x >> 16;
@@ -94,21 +96,39 @@ vec2 sample_vel(vec2 x, vec2 fallback) {
     return o;
 }
 
-// One push out of the solids: to the surface, then as far beyond it as the particle was
-// inside, so fluid caught under a newly placed solid keeps its area instead of being
-// flattened onto the outline. Removes the velocity into the solid.
-void collide(inout vec2 x, inout vec2 v) {
+// One push out of the solids: to the surface, then (with `beyond`) as far beyond it as the
+// particle was inside, so fluid caught under a newly placed solid keeps its area instead of
+// being flattened onto the outline. Removes the velocity into the solid.
+// Returns whether it pushed.
+bool collide(inout vec2 x, inout vec2 v, bool beyond) {
     vec2 n;
     float d = sample_sdf(x, n);
     if (d < P.wall_margin) {
         float l = length(n);
         if (l > 1e-5) {
             n /= l;
-            x += n * (P.wall_margin - d + max(-d, 0.0));
+            x += n * (P.wall_margin - d + (beyond ? max(-d, 0.0) : 0.0));
             float vn = dot(v, n);
             if (vn < 0.0) v -= vn * n;
+            return true;
         }
     }
+    return false;
+}
+
+// A particle's share of its cell's sums for the exchange inside the cell (heat.comp: hcell):
+// its heat capacity and heat capacity x (T + 273.15) / T_SCALE, in fixed point, the second
+// weighted with the rounded first.
+ivec2 heat_quanta(float C, float T) {
+    int ci = int(floor(C * MASS_SCALE + 0.5));
+    return ivec2(ci, int(floor(float(ci) * (T + 273.15) / T_SCALE + 0.5)));
+}
+
+// Enthalpy temperature that keeps a particle's heat content, C (t + 273.15) (the ledger's
+// and `heat_content`'s count), when its heat capacity changes from c0 to c1 because its
+// concentration did (mixing, settling).
+float keep_heat(float t, float c0, float c1) {
+    return c0 == c1 ? t : (t + 273.15) * c0 / c1 - 273.15;
 }
 
 void main() {
@@ -118,8 +138,23 @@ void main() {
     if (p.kind == KIND_DEAD) return;
 
     float dt = S.dt;
-    float rho_p = particle_density(p);
+    uint row = (p.kind & 255u) - 1u;
+    ivec4 Mia = mats[row].ia;  // group, diluent, weight channel, concentration channel
+    bool thermal = has_cap(CAP_THERMAL);
+    int fam = mats[row].ib.x;
 
+    // Frozen particles, and those too viscous to flow (set glass, a lava crust), belong to a
+    // rigid body (rigid.comp): no drift, no shake, and they move exactly with the body.
+    bool frozen = false;
+    if (has_cap(CAP_RIGID)) {
+        vec2 ph = thermal ? phase_of(p.t, thermal_of(row, p.s)) : vec2(P.heat.x, 0.0);
+        frozen = ph.y > 0.5 || row_lnu(row, p.s, ph.x, thermal) >= P.heat2.x;
+    }
+    // Viscoelastic stress (upper-convected Maxwell; README, "Viscoelasticity"). A particle
+    // that has not run a substep yet starts unstressed (its slot may hold an old stress).
+    bool elastic = has_cap(CAP_ELASTIC);
+    vec4 tau = vec4(0.0);
+    if (elastic && (p.kind & KIND_FRESH) == 0u && mats[row].el.x > 0.0) tau = pstress[id];
     if (pc.gather != 0u) {
         vec2 v = p.vel;
         vec4 C = p.c;
@@ -186,9 +221,65 @@ void main() {
                 C.zw = 4.0 * (sud - u * sd) / sw;
             }
         }
-        C = clamp(C, vec4(-1.0 / dt), vec4(1.0 / dt));
-        {
-            float cl = length(corr), cmax = 0.5 / dt;
+        // A frozen particle moves with the rigid body around it (rigid.comp), exactly, also
+        // where its cell is too empty or too mixed to count as rigid itself (edges, surface).
+        bool held = false;
+        // Likewise a yield-stress liquid's particle in a cell too sparse to be liquid (the
+        // surface of a resting pile), next to a plug.
+        bool plug = has_cap(CAP_RIGID) && (mats[row].rheo.x > 0.0 || mats[row].temp.w > 0.0)
+            && cell[cidx(clamp(ivec2(p.pos), ivec2(0), P.grid - 1))].w <= 0.0;
+        // And any particle in a cell of a rigid body: its gather would otherwise mix in the
+        // liquid faces around the body (a skin one cell thick would not hold).
+        bool in_body = has_cap(CAP_RIGID) && rl[cidx(clamp(ivec2(p.pos), ivec2(1), P.grid - 2))].x >= 0;
+        if ((frozen || plug || in_body) && has_cap(CAP_RIGID)) {
+            ivec2 pc0 = clamp(ivec2(p.pos), ivec2(1), P.grid - 2);
+            const ivec2 order[9] = ivec2[9](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1), ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+            for (int k = 0; k < 9 && !held; k++) {
+                int root = rl[cidx(pc0 + order[k])].x;
+                if (root < 0 || rl[root].y < 0) continue;
+                vec3 u;
+                if (body_motion(uint(rl[root].y), root, p.pos, u)) {
+                    v = u.xy;
+                    C = vec4(0.0, -u.z, u.z, 0.0);
+                    held = true;  // its density correction is dropped below, unless in a clump
+                }
+            }
+        }
+        // dtau/dt = L tau + tau L^T - tau / lambda + G (L + L^T), L the velocity gradient (the
+        // APIC matrix), relaxation taken implicitly; capped at elastic_stress_max x G.
+        if (elastic) {
+            float G = mats[row].el.x;
+            if (G > 0.0) {
+                mat2 L = mat2(C.x, C.z, C.y, C.w);  // columns: L = [[du/dx, du/dy], [dv/dx, dv/dy]]
+                // Stabilisation (params.rs: elastic_step_max): at most this much deformation
+                // per substep enters the stress (an impact's velocity gradient over one cell
+                // would otherwise grow it exponentially within a few substeps).
+                float lnorm = length(vec4(C)) * dt;
+                if (P.elastic.w > 0.0 && lnorm > P.elastic.w) L *= P.elastic.w / lnorm;
+                mat2 T = mat2(tau.x, tau.z, tau.z, tau.y);
+                mat2 D = L * T + T * transpose(L) + G * (L + transpose(L));
+                float lam = max(mats[row].el.y, 1e-4);
+                T = (T + dt * D) / (1.0 + dt / lam);
+                tau = vec4(T[0][0], T[1][1], 0.5 * (T[1][0] + T[0][1]), 0.0);
+                float tn = length(tau.xyz);
+                if (P.elastic.z > 0.0 && tn > P.elastic.z * G) tau *= P.elastic.z * G / tn;
+                // A particle with no liquid around it (spray, a droplet torn off) holds no
+                // stress the grid can carry: scattered alone, its stress pushed on the faces
+                // around it with nothing to balance it, and a slime blob that hit the floor
+                // went on shattering into a mist of single droplets.
+                // (Detached: less than one cell's worth of liquid in the 3 x 3 cells around.)
+                ivec2 pc1 = clamp(ivec2(p.pos), ivec2(1), P.grid - 2);
+                float around = 0.0;
+                for (int b = -1; b <= 1; b++)
+                    for (int a = -1; a <= 1; a++) around += min(cell[cidx(pc1 + ivec2(a, b))].x, 1.0);
+                if (around < 1.0) tau = vec4(0.0);
+            }
+            pstress[id] = tau;
+        }
+        // Stabilisation (params.rs: apic_clamp, correction_step_max; 0 = off).
+        if (P.apic_clamp > 0.0) C = clamp(C, vec4(-P.apic_clamp / dt), vec4(P.apic_clamp / dt));
+        if (P.corr.x > 0.0) {
+            float cl = length(corr), cmax = P.corr.x / dt;
             if (cl > cmax) corr *= cmax / cl;
         }
 
@@ -198,85 +289,240 @@ void main() {
             ivec2 base = ivec2(floor(gp - 0.5));
             vec2 f = gp - vec2(base);
             bspline(f, w);
-            float sw = 0.0, srho = 0.0, soil = 0.0, saq = 0.0, ssyr = 0.0;
+            // sw: weight of cells holding liquid; sg: shares of
+            // groups 1..3; sfw, sfs: weight and concentration of the cells that hold the
+            // particle's own family (or, for a diluent, family 0).
+            float sw = 0.0, sfw = 0.0, sfs = 0.0;
+            vec3 sg = vec3(0.0);
+            bool more = (P.group_mask & 12u) != 0u;
+            bool groups = (P.group_mask & (P.group_mask - 1u)) != 0u;
+            int nmix = P.n_fam - 1;
             for (int b = 0; b < 3; b++) {
                 for (int a = 0; a < 3; a++) {
-                    vec4 q = comp[cidx(base + ivec2(a, b))];
+                    int ci = cidx(base + ivec2(a, b));
+                    vec4 q = comp[ci];
                     float wt = w[a].x * w[b].y;
                     crowd += wt * q.w;
                     if (q.x > 0.0) {
                         sw += wt;
-                        srho += wt * q.x;
-                        soil += wt * q.y;
-                        if (q.y < 0.999) {
-                            saq += wt;
-                            ssyr += wt * q.z;
+                        sg.x += wt * q.y;
+                        if (more) sg.yz += wt * aux[ci].zw;
+                        float sb = fam > 0 ? mixb[ci * nmix + fam - 1] : q.z;
+                        if (sb >= 0.0) {
+                            sfw += wt;
+                            sfs += wt * sb;
                         }
                     }
                 }
             }
+            // Heat: take the change of enthalpy temperature the grid worked out for the
+            // cells this particle scattered to last substep (heat.comp). Same weights both
+            // ways, so the energy the cells exchanged is exactly what the particles gain.
+            // A particle spawned since then did not scatter and takes nothing.
+            // Settling (settle.comp) hands each cell a change of its family's concentration;
+            // taken with the same weights, the concentrate's volume is conserved exactly.
+            // Water that is the primary family's diluent takes part as concentration 0.
+            bool dil0 = fam < 0 && P.primary >= 0 && P.fams[0].y == int(row);
+            int sf = dil0 ? 0 : fam;
+            if (has_cap(CAP_SETTLE) && sf >= 0 && (p.kind & KIND_FRESH) == 0u && mats[dil0 ? uint(P.primary) : row].b.z > 0.0) {
+                vec2 ds = vec2(0.0);
+                for (int b = 0; b < 3; b++)
+                    for (int a = 0; a < 3; a++) ds += w[a].x * w[b].y * dsettle[cidx(base + ivec2(a, b)) * P.n_fam + sf];
+                float s0 = dil0 ? 0.0 : p.s;
+                float s1 = clamp(s0 + (1.0 - s0) * ds.x - s0 * ds.y, 0.0, 1.0);
+                float c0 = thermal ? thermal_of(row, p.s).w : 0.0;
+                if (dil0 && s1 > 0.0) {
+                    row = uint(P.primary);
+                    Mia = mats[row].ia;
+                    fam = 0;
+                    p.kind = (p.kind & ~255u) | (row + 1u);
+                }
+                if (!dil0 || s1 > 0.0) p.s = s1;
+                if (thermal) p.t = keep_heat(p.t, c0, thermal_of(row, p.s).w);
+            }
+            // With it, the exchange among the particles of its own cell: lambda (dheat.y) of the
+            // difference between their mean temperature (dheat.z) and this particle's, at the
+            // temperature it scattered (capped at the boiling point, like the scatter).
+            if (thermal && (p.kind & KIND_FRESH) == 0u) {
+                float dT = 0.0;
+                for (int b = 0; b < 3; b++)
+                    for (int a = 0; a < 3; a++) dT += w[a].x * w[b].y * dheat[cidx(base + ivec2(a, b))].x;
+                vec4 own = dheat[cidx(clamp(ivec2(floor(p.pos)), ivec2(0), P.grid - 1))];
+                if (own.y > 0.0) {
+                    // Against its own temperature exactly as it entered the cell's sums
+                    // (heat_quanta): the exchange then sums to zero over the cell whatever
+                    // the rounding. (The unrounded temperature left the cell's mean a
+                    // constant 1e-3 K off where many particles share one temperature, as in
+                    // a block of ice, and every particle took that every substep.)
+                    vec4 th = thermal_of(row, p.s);
+                    float tb = Mia.y >= 0 ? mix(mats[Mia.y].th2.z, mats[row].th2.z, p.s) : mats[row].th2.z;
+                    ivec2 q = heat_quanta(th.w, min(phase_of(p.t, th).x, tb));
+                    dT += own.y * (own.z - float(q.y) / float(q.x)) * T_SCALE;
+                }
+                p.t += dT;
+            }
             if (sw > 1e-4) {
-                // Slip between the two immiscible phases (a drift-flux / algebraic slip
-                // model). Where oil and the aqueous phase share a cell, below the scale the
-                // grid can resolve, they would otherwise move as one fluid and never
-                // separate. Instead oil rises through the mixture and the aqueous phase
-                // sinks, each in proportion to the other's share, so the volume flux of
-                // the pair cancels and pure regions do not slip at all.
+                // Drift between immiscible phases (a drift-flux / algebraic slip model).
+                // Where two phase groups share a cell, below the scale the grid can
+                // resolve, they would otherwise move as one fluid and never separate.
+                // Instead every particle drifts relative to the mixture towards where its
+                // density belongs, in proportion to the share of the other groups, so the
+                // volume flux of the drift cancels and pure regions do not drift at all.
                 //
-                // The slip speed is the terminal velocity of a droplet of the minority
-                // phase as large as the unresolved scale (P.sep_tau holds its diameter in
-                // cells) in the majority phase, with the drag law C_d = 24/Re + 0.44
-                // (Stokes at low Reynolds number, Newton at high):
+                // The drift speed is the terminal velocity of a droplet as large as the
+                // unresolved scale (P.sep_tau holds its diameter in cells) in the cell's
+                // majority phase, with the drag law C_d = 24/Re + 0.44 (Stokes at low
+                // Reynolds number, Newton at high):
                 //   (4/3) |drho| g d = 24 nu_c rho_c v / d + 0.44 rho_c v^2
-                // It therefore follows the cell size and the viscosity of the fluids: a
-                // droplet hardly drifts through syrup.
-                float o = soil / sw;
-                float s_aq = saq > 1e-4 ? ssyr / saq : 0.0;
-                float rho_aq = aqueous_density(s_aq);
-                bool oil_cont = o > 0.5;
-                float rho_c = oil_cont ? P.rho.z : rho_aq;
-                float nu_c = oil_cont ? P.nu.z : aqueous_viscosity(s_aq) / rho_aq;
-                float d = P.sep_tau;
-                float drho = rho_aq - P.rho.z;
-                float qa = 0.44 * rho_c, qb = 24.0 * nu_c * rho_c / d, qc = 4.0 / 3.0 * abs(drho) * P.gravity * d;
-                // (No buoyancy, no drift: also keeps 0 / 0 out when gravity and viscosity are both zero.)
-                float vt = qc > 0.0 ? 2.0 * qc / (qb + sqrt(qb * qb + 4.0 * qa * qc)) : 0.0;
-                float share = p.kind == KIND_OIL ? 1.0 - o : -o;
-                // Capped at the CFL distance per step: the step size already accounts for
-                // the slip speed (it enters the particle speed below), so the cap only acts
-                // in the substep where slip first appears.
-                float sep_max = P.cfl / dt;
-                slip = min(vt, sep_max) * sign(drho) * share;
-                // The drift stands in for droplets the grid cannot see. At an interface it
-                // does resolve (a clear gradient of the smoothed oil fraction, the same
-                // field surface tension takes its curvature from) there are none: the cells
-                // are mixed only because the interface passes through them. Drifting there
-                // peels the surface off every blob and lens, however strongly interfacial
-                // tension holds it together (on 1 mm cells a rising oil drop dissolved into
-                // a cloud within half a second).
-                // Whether an interface sheds sub-cell droplets at all is a question of the
-                // Bond number of one cell, drho g dx^2 / sigma: above 1 (3.9 on 1 cm cells)
-                // buoyancy tears cell-sized pieces off and the drift acts everywhere, as
-                // before; well below 1 (0.04 on 1 mm cells) tension holds the interface
-                // together and resolved interfaces do not drift.
-                float bond = abs(drho) * P.gravity / max(P.sigma.w, 1e-9);
-                float hold = clamp(1.0 - bond, 0.0, 1.0);
-                if (slip != 0.0 && hold > 0.0) {
-                    ivec2 pc = clamp(ivec2(p.pos), ivec2(1), P.grid - 2);
-                    int k = cidx(pc);
-                    vec2 g = 0.5 * vec2(surf[k + 1].y - surf[k - 1].y, surf[k + P.grid.x].y - surf[k - P.grid.x].y);
-                    float resolved = 1.0 - clamp((SLIP_GRAD_MAX - length(g)) / (SLIP_GRAD_MAX - SLIP_GRAD_MIN), 0.0, 1.0);
-                    slip *= 1.0 - hold * resolved;
+                // drho is the particle's density less the mean density of the other groups
+                // in the cell. It therefore follows the cell size and the viscosity of the
+                // fluids: a droplet hardly drifts through syrup.
+                sg /= sw;
+                int g = Mia.x;
+                float fg = g == 0 ? 1.0 - sg.x - sg.y - sg.z : sg[g - 1];
+                float others = 1.0 - fg;
+                // A frozen particle drifts too unless a rigid body holds it: a fragment of lava
+                // quenched in water, too small to form a body, sinks like the drop it was
+                // (it used to stay suspended for good).
+                if (others > 1e-4 && groups && !held) {
+                    // The density difference is that of the particle's group against the
+                    // others, each its local mean (as the drift-flux model has it: phases drift,
+                    // not particles). The particle's own density against the mixture, divided by
+                    // the others' share, read a water particle in syrup-rich water as lighter
+                    // than its phase and, where only a trace of oil was near, gave it a drift
+                    // amplified by 1 / that trace: miscible water and syrup started to unmix,
+                    // and an aqueous film stayed on the walls inside the oil of an overturn.
+                    // Only particles with another group around them get here (a few near the
+                    // interfaces): they gather the groups' densities and viscosities.
+                    vec4 sgr = vec4(0.0);  // share x density of each group
+                    // Viscosity of each group where it is the majority, and the weight of those cells.
+                    vec4 snu = vec4(0.0), snw = vec4(0.0);
+                    for (int b = 0; b < 3; b++) {
+                        for (int a = 0; a < 3; a++) {
+                            int ci = cidx(base + ivec2(a, b));
+                            vec4 q = comp[ci];
+                            if (q.x <= 0.0) continue;
+                            float wt = w[a].x * w[b].y;
+                            sgr += wt * grho[ci];
+                            vec4 ax = aux[ci];
+                            // One-hot of the cell's majority group (indexed writes would go to
+                            // local memory).
+                            vec4 fc = vec4(1.0 - q.y - ax.z - ax.w, q.y, ax.zw);
+                            float top = max(max(fc.x, fc.y), max(fc.z, fc.w));
+                            vec4 oh = vec4(equal(fc, vec4(top)));
+                            oh /= max(oh.x + oh.y + oh.z + oh.w, 1.0);
+                            snu += (wt * ax.x) * oh;
+                            snw += wt * oh;
+                        }
+                    }
+                    sgr /= sw;
+                    float rho_g = fg > 1e-4 ? sgr[g] / fg : row_density(row, p.s);
+                    float rho_o = (sgr.x + sgr.y + sgr.z + sgr.w - sgr[g]) / others;
+                    float drho = rho_g - rho_o;
+                    ivec2 pcell = clamp(ivec2(p.pos), ivec2(1), P.grid - 2);
+                    int k = cidx(pcell);
+                    // The continuous phase is the group that leads around the particle (the
+                    // same neighbourhood the shares come from), with its density and viscosity.
+                    // Taken from the particle's own cell instead, a droplet or film one cell
+                    // thick was its own continuous phase: syrup-rich water inside oil sank as
+                    // if through syrup, 1000 times too slowly, and stayed on the walls.
+                    vec4 fsv = vec4(1.0 - sg.x - sg.y - sg.z, sg);
+                    int G = fsv.x >= max(fsv.y, max(fsv.z, fsv.w)) ? 0 : fsv.y >= max(fsv.z, fsv.w) ? 1 : fsv.z >= fsv.w ? 2 : 3;
+                    float rho_c = sgr[G] / max(fsv[G], 1e-4);
+                    float nu_c = snw[G] > 1e-6 ? snu[G] / snw[G] : aux[k].x;
+                    float vt = terminal(drho, rho_c, nu_c, P.sep_tau);
+                    // Capped at the CFL distance per step: the step size already accounts for
+                    // the slip speed (it enters the particle speed below), so the cap only acts
+                    // in the substep where slip first appears.
+                    float sep_max = P.corr.z > 0.0 ? P.cfl / dt : 1e30;  // params.rs: slip_cap
+                    slip = -min(vt, sep_max) * sign(drho) * others;
+                    // The drift stands in for droplets the grid cannot see. At an interface it
+                    // does resolve (a clear gradient of the smoothed group share, the same
+                    // field surface tension takes its curvature from) there are none: the cells
+                    // are mixed only because the interface passes through them. Drifting there
+                    // peels the surface off every blob and lens, however strongly interfacial
+                    // tension holds it together (on 1 mm cells a rising oil drop dissolved into
+                    // a cloud within half a second).
+                    // Whether an interface sheds sub-cell droplets at all is a question of the
+                    // Bond number of one cell, drho g dx^2 / sigma: above 1 (3.9 for oil in
+                    // water on 1 cm cells) buoyancy tears cell-sized pieces off and the drift
+                    // acts everywhere; well below 1 (0.04 on 1 mm cells) tension holds the
+                    // interface together and resolved interfaces do not drift.
+                    // The other group of the pair is the largest one besides the particle's.
+                    vec4 fs = vec4(1.0 - sg.x - sg.y - sg.z, sg);
+                    fs[g] = -1.0;
+                    int h = fs.x >= max(fs.y, max(fs.z, fs.w)) ? 0 : fs.y >= max(fs.z, fs.w) ? 1 : fs.z >= fs.w ? 2 : 3;
+                    float bond = abs(drho) * P.gravity / max(P.pair[g][h], 1e-9);
+                    float hold = clamp(1.0 - bond, 0.0, 1.0);
+                    if (slip != 0.0 && hold > 0.0) {
+                        int hi = max(g, h);
+                        int W = P.grid.x;
+                        vec2 gr;
+                        if (hi == 1) gr = 0.5 * vec2(surf[k + 1].y - surf[k - 1].y, surf[k + W].y - surf[k - W].y);
+                        else if (hi == 2) gr = 0.5 * vec2(surf2[k + 1].x - surf2[k - 1].x, surf2[k + W].x - surf2[k - W].x);
+                        else gr = 0.5 * vec2(surf2[k + 1].y - surf2[k - 1].y, surf2[k + W].y - surf2[k - W].y);
+                        float resolved = 1.0 - clamp((SLIP_GRAD_MAX - length(gr)) / (SLIP_GRAD_MAX - SLIP_GRAD_MIN), 0.0, 1.0);
+                        slip *= 1.0 - hold * resolved;
+                    }
                 }
 
-                // Miscible exchange: relax the particle's syrup fraction towards the local
-                // aqueous mean. Scatter and gather use the same weights, so syrup volume is
-                // conserved to round-off.
-                if (p.kind == KIND_AQUEOUS && saq > 1e-4) {
-                    p.s = clamp(p.s + (ssyr / saq - p.s) * (1.0 - exp(-P.diffuse * dt)), 0.0, 1.0);
+                // Miscible exchange within a family (a material and its diluent): relax the
+                // particle's concentration towards the local mean of its family. Scatter
+                // and gather use the same weights, so each component is conserved to
+                // round-off (sum_p sum_i w_ip (mean_i - s_p) = 0).
+                // The first row of the tank and its primary family (water and syrup) are one
+                // liquid on the grid (grid_prep.comp): the diluent takes part directly, as
+                // concentration 0, and becomes a particle of the family when it gains any.
+                bool diluent0 = fam < 0 && P.primary >= 0 && P.fams[0].y == int(row);
+                if (fam >= 0 || diluent0) {
+                    if (sfw > 1e-4) {
+                        float s0 = diluent0 ? 0.0 : p.s;
+                        float s1 = clamp(s0 + (sfs / sfw - s0) * (1.0 - exp(-mats[diluent0 ? uint(P.primary) : row].a.w * dt)), 0.0, 1.0);
+                        float c0 = thermal ? thermal_of(row, p.s).w : 0.0;
+                        if (!diluent0) {
+                            p.s = s1;
+                        } else if (s1 > 0.0) {
+                            row = uint(P.primary);
+                            Mia = mats[row].ia;
+                            p.kind = (p.kind & ~255u) | (row + 1u);
+                            p.s = s1;
+                        }
+                        if (thermal) p.t = keep_heat(p.t, c0, thermal_of(row, p.s).w);
+                    }
+                }
+                if (fam < 0 && has_cap(CAP_FAMILIES) && (p.kind & 255u) - 1u == row && mats[row].ib.x < 0) {
+                    // A pure diluent next to another of its concentrates joins that family
+                    // at concentration 0, which is the same liquid, so nothing changes but
+                    // its bookkeeping; from the next substep on it takes part in that
+                    // family's exchange. A particle holds one concentrate: the primary
+                    // family if it has gained any of it above, else the first family (in
+                    // table order) found around it.
+                    for (int j = P.primary >= 0 ? 1 : 0; j < P.n_fam; j++) {
+                        if (P.fams[j].y != int(row)) continue;
+                        float found = 0.0;
+                        if (j == 0) {
+                            found = sfw;
+                        } else {
+                            for (int b = 0; b < 3; b++)
+                                for (int a = 0; a < 3; a++)
+                                    if (mixb[cidx(base + ivec2(a, b)) * nmix + j - 1] >= 0.0) found += w[a].x * w[b].y;
+                        }
+                        if (found > 1e-4) {
+                            row = uint(P.fams[j].x);
+                            Mia = mats[row].ia;
+                            p.kind = (p.kind & ~255u) | (row + 1u);
+                            p.s = 0.0;
+                            break;
+                        }
+                    }
                 }
             }
         }
+
+        // A particle held by a body moves exactly with it; only where the body holds a clump
+        // (rigid.comp keeps the correction on the faces around one) does it take the density
+        // correction, which spreads the clump out again.
+        if (held && crowd <= REST_PHI + max(P.corr.y, 0.05)) corr = vec2(0.0);
 
         // ---- mouse tool ------------------------------------------------------------
         bool pushed = false;
@@ -289,16 +535,74 @@ void main() {
                     return;
                 }
                 float fall = 1.0 - r2;
+                if (P.tool_mode >= 5) {
+                    // Heat (5) or cool (6): a volumetric power, P.heat2.y kelvin per second
+                    // for water at the centre; a liquid of lower heat capacity warms faster.
+                    if (thermal) {
+                        float e = P.heat2.y * fall * dt;
+                        float C = thermal_of(row, p.s).w;
+                        if (P.tool_mode == 6) e = min(e, max(phase_of(p.t, thermal_of(row, p.s)).x + 150.0, 0.0) * C);  // not below -150 deg C
+                        p.t += (P.tool_mode == 5 ? e : -e) / C;
+                        ledger_add(P.tool_mode == 5 ? 4 : 5, e * P.inv_ppc);
+                    }
+                } else {
                 float k = clamp(P.tool_strength * fall * dt, 0.0, 1.0);
+                // Push and Grab set the velocity after the pressure solve, at up to 2 m/s,
+                // where the density correction moves particles half a cell per substep at
+                // most: driven on, liquid against the floor, a wall or a frozen body packed
+                // into cells of thousands of particles, where the fixed-point sums wrap
+                // around (params.rs: tool_crowd_max). A particle already in a crowd is left
+                // to the solver, which spreads the crowd out again; the brush keeps driving
+                // the liquid behind it.
+                if (P.tool_crowd_max > 0.0 && P.tool_mode != 4)
+                    k *= clamp((P.tool_crowd_max - crowd) / (0.25 * P.tool_crowd_max), 0.0, 1.0);
                 v = mix(v, tool_target(d), k);
                 pushed = true;
+                }
+            }
+        }
+
+        // ---- boiling ------------------------------------------------------------------------
+        // There is no gas phase: liquid heated past its boiling point by its latent heat of
+        // vaporisation leaves the simulation, taking that heat with it (ledger entry 6), and
+        // is counted as lost. What it had dissolved stays behind as particles of its residue
+        // (salt from brine), one per `residue share` of evaporated concentrate on average.
+        if (thermal) {
+            vec4 th = thermal_of(row, p.s);
+            vec2 bo = mats[row].th2.zw;
+            if (Mia.y >= 0) bo = mix(mats[Mia.y].th2.zw, bo, p.s);
+            if (p.t >= bo.x + bo.y) {
+                // Heat content counted from absolute zero, as the ledger's other entries and
+                // `heat_content` count it.
+                float e = th.w * (p.t + 273.15);
+                int res = mats[row].ib.w;
+                float share = mats[row].el.w * (Mia.y >= 0 ? p.s : 1.0);
+                atomicAdd(ledger[16u + row], 1u);
+                if (res >= 0 && float(hash(p.id ^ 0x9e3779b9u) >> 8) / 16777216.0 < share) {
+                    atomicAdd(ledger[80u + uint(res)], 1u);
+                    row = uint(res);
+                    Mia = mats[row].ia;
+                    p.kind = row + 1u;
+                    p.s = 1.0;
+                    p.t = bo.x - thermal_of(row, 1.0).z;  // the residue is a solid (common.glsl: phase_of)
+                    e -= thermal_of(row, 1.0).w * (p.t + 273.15);
+                } else {
+                    ledger_add(6, max(e, 0.0) * P.inv_ppc);
+                    particles[id].kind = KIND_DEAD;
+                    return;
+                }
+                ledger_add(6, max(e, 0.0) * P.inv_ppc);
             }
         }
 
         // ---- currents (params.rs: Current) -------------------------------------------
         // Raise the velocity along each current towards its speed; never brake, and leave
-        // the motion across it alone.
-        for (int i = 0; i < int(P.ext.w); i++) {
+        // the motion across it alone. Like Push, a current aimed at the floor or a wall
+        // packs liquid faster than the density correction spreads it (75 particles in a
+        // cell at full speed into a corner): a particle already in a crowd is not driven on
+        // (params.rs: tool_crowd_max).
+        float drive = P.tool_crowd_max > 0.0 ? clamp((P.tool_crowd_max - crowd) / (0.25 * P.tool_crowd_max), 0.0, 1.0) : 1.0;
+        for (int i = 0; i < int(P.ext.w) && drive > 0.0; i++) {
             vec4 zone = P.current_zone[i];
             vec2 d = p.pos - zone.xy;
             float r2 = dot(d, d) / (zone.z * zone.z);
@@ -307,7 +611,7 @@ void main() {
                 float speed = length(target);
                 vec2 dir = target / max(speed, 1e-6);
                 float fall = (1.0 - r2) * (1.0 - r2);
-                v += dir * max(speed - dot(v, dir), 0.0) * (1.0 - exp(-zone.w * fall * dt));
+                v += dir * max(speed - dot(v, dir), 0.0) * (1.0 - exp(-zone.w * fall * dt)) * drive;
             }
         }
 
@@ -329,12 +633,23 @@ void main() {
         // kernel never hands them as velocity, and a resting pool then slowly heats up
         // (kinetic energy 0.1 cells^2/s^2 after 6 s where it otherwise stays at 0.001).
         vec2 va = v;
-        if (P.ext.y >= 2.0 && !pushed) {
+        if (P.ext.y >= 2.0 && !pushed && !held) {
             vec2 xm = clamp(p.pos + 0.5 * dt * (v + corr + vec2(0.0, slip)), vec2(2.01), vec2(P.grid) - 2.01);
             vec2 here = sample_vel(p.pos, v);
             va = v + sample_vel(xm, here) - here;
             float sp = length(va);
             if (sp > vcap) va *= vcap / sp;
+            // Spray (no liquid around it) stopped by still liquid: the midpoint lands in that
+            // liquid and cancels nearly all of the motion (keeps under a tenth of it). The
+            // particle takes the velocity it travels with. Otherwise, on the surface
+            // of liquid that does not move (a yield-stress pile, a frozen crust), it never
+            // fell, while the gravity of every substep piled up in the velocity it gathered
+            // from the air faces around it, which its own scatter kept feeding: it sat there
+            // at the speed cap (sludge at rest, Mud Flats, Cold Snap), drawn as fast white
+            // water, and launched itself when nudged off. (Only ever slower: taking the
+            // midpoint velocity always fed back into the faces and drove spray to the cap; at
+            // under a half, droplets landing on a sloshing pool changed how it settled.)
+            if (crowd < LIQUID_THR && dot(va, va) < 0.01 * dot(v, v)) v = va;
         }
         // Report this particle's displacement speed: the next substep is sized by the
         // fastest one (step.comp).
@@ -344,7 +659,7 @@ void main() {
         vec2 disp = va + corr + vec2(0.0, slip);
         {
             float mine = length(disp);
-            if (crowd < P.fluid_thr) mine /= P.ext.z;
+            if (crowd < LIQUID_THR) mine /= P.ext.z;
             float m = subgroupMax(mine);
             if (subgroupElect() && m > uintBitsToFloat(S.umax_part)) atomicMax(S.umax_part, floatBitsToUint(m));
         }
@@ -356,27 +671,59 @@ void main() {
         vec2 x = p.pos;
         for (int k = 1; k < pieces; k++) {
             x += step_d;
-            collide(x, v);
+            collide(x, v, true);
         }
         x += step_d;
         // Particles squeezed onto the same spot sample the same grid values and would stay
         // together for good, invisible to the density correction. Shake badly over-full
         // spots apart; nothing at ordinary densities is touched. The hash uses the
         // particle's permanent id, not its slot, so a run repeats exactly.
+        // Frozen particles too: a frozen clump is no more able to spread on its own than a
+        // liquid one (at rest occupancy a body is never shaken).
+        // (params.rs: crowd_jitter, 0 = off)
         float excess = clamp(crowd - 1.5, 0.0, 1.0);
-        if (excess > 0.0) {
+        if (excess > 0.0 && P.crowd_jitter > 0.0) {
             uint h = hash(p.id ^ hash(floatBitsToUint(p.pos.x) ^ S.substeps));
-            x += (vec2(h & 0xffffu, h >> 16) / 65535.0 - 0.5) * 0.5 * excess;
+            x += (vec2(h & 0xffffu, h >> 16) / 65535.0 - 0.5) * P.crowd_jitter * excess;
         }
-        collide(x, v);
-        collide(x, v);
+        collide(x, v, true);
+        bool again = collide(x, v, true);
+        // Where the push beyond the surface carried a particle across a narrow gap into
+        // another solid, it is still deep inside after both: a last push to the surface only.
+        // (Not for one just inside, as in the wedge under a tilted box resting on the floor:
+        // pushed only to the surface there, particles stayed packed in it.)
+        // (Terrace Falls once held a particle 18 cells deep in a block.)
+        if (again) {
+            vec2 g;
+            if (sample_sdf(x, g) < -1.0) collide(x, v, false);
+        }
         x = clamp(x, vec2(2.01), vec2(P.grid) - 2.01);
 
         p.pos = x;
         p.vel = v;
         p.c = C;
+        p.kind &= ~KIND_FRESH;
         particles[id] = p;
-        rho_p = particle_density(p);
+    }
+    float rho_p = row_density(row, p.s);
+    // Thermal state for the scatter: temperature (capped at the boiling point) and, where
+    // the particle is frozen, the density of the solid.
+    float CT = 0.0;
+    if (thermal) {
+        vec4 th = thermal_of(row, p.s);
+        vec2 ph = phase_of(p.t, th);
+        float tb = Mia.y >= 0 ? mix(mats[Mia.y].th2.z, mats[row].th2.z, p.s) : mats[row].th2.z;
+        rho_p *= expansion(row, p.s, ph.x);
+        if (ph.y > 0.0) {
+            float rs = Mia.y >= 0 ? mix(mats[Mia.y].b.w, mats[row].b.w, p.s) : mats[row].b.w;
+            rho_p = mix(rho_p, rs, ph.y);
+        }
+        CT = th.w * (min(ph.x, tb) + 273.15) / T_SCALE;
+        // The particles of each cell by position, for the exchange among them (heat.comp).
+        int hc = cidx(clamp(ivec2(floor(p.pos)), ivec2(0), P.grid - 1));
+        ivec2 q = heat_quanta(th.w, min(ph.x, tb));
+        atomicAdd(hcell[hc].x, q.x);
+        atomicAdd(hcell[hc].y, q.y);
     }
 
     // ---- scatter ---------------------------------------------------------------------
@@ -390,7 +737,7 @@ void main() {
         bspline(f, w);
         for (int b = 0; b < 3; b++) {
             for (int a = 0; a < 3; a++) {
-                int k = cidx(base + ivec2(a, b)) * ACC_STRIDE;
+                int k = cidx(base + ivec2(a, b)) * P.acc_stride;
                 float m = w[a].x * w[b].y * rho_p;
                 vec2 d = vec2(a, b) - f;
                 atomicAdd(acc[k + 0], int(floor(m * MASS_SCALE + 0.5)));
@@ -405,7 +752,7 @@ void main() {
         bspline(f, w);
         for (int b = 0; b < 3; b++) {
             for (int a = 0; a < 3; a++) {
-                int k = cidx(base + ivec2(a, b)) * ACC_STRIDE;
+                int k = cidx(base + ivec2(a, b)) * P.acc_stride;
                 float m = w[a].x * w[b].y * rho_p;
                 vec2 d = vec2(a, b) - f;
                 atomicAdd(acc[k + 2], int(floor(m * MASS_SCALE + 0.5)));
@@ -418,16 +765,28 @@ void main() {
         ivec2 base = ivec2(floor(gp - 0.5));
         vec2 f = gp - vec2(base);
         bspline(f, w);
-        bool oil = p.kind == KIND_OIL;
+        int cw = Mia.z, cs = Mia.w;
+        int ct = thermal ? int(P.heat2.z) : -1;
+        int cg = thermal ? group_heat_chan(Mia.x) : -1;
+        int ce = elastic && tau != vec4(0.0) ? int(P.elastic.x) : -1;
+        vec3 te = tau.xyz / P.elastic.y * STRESS_FIX;
         for (int b = 0; b < 3; b++) {
             for (int a = 0; a < 3; a++) {
-                int k = cidx(base + ivec2(a, b)) * ACC_STRIDE;
+                int k = cidx(base + ivec2(a, b)) * P.acc_stride;
                 int wi = int(floor(w[a].x * w[b].y * MASS_SCALE + 0.5));
                 atomicAdd(acc[k + 4], wi);
-                if (oil) {
-                    atomicAdd(acc[k + 5], wi);
-                } else if (p.s > 0.0) {
-                    atomicAdd(acc[k + 6], int(floor(w[a].x * w[b].y * p.s * MASS_SCALE + 0.5)));
+                if (cw >= 0) atomicAdd(acc[k + cw], wi);
+                if (cs >= 0 && p.s > 0.0) atomicAdd(acc[k + cs], int(floor(w[a].x * w[b].y * p.s * MASS_SCALE + 0.5)));
+                if (ct >= 0) {
+                    int h = int(floor(w[a].x * w[b].y * CT * MASS_SCALE + 0.5));
+                    atomicAdd(acc[k + ct], h);
+                    if (cg >= 0) atomicAdd(acc[k + cg], h);
+                }
+                if (ce >= 0) {
+                    vec3 q = floor(w[a].x * w[b].y * te + 0.5);
+                    atomicAdd(acc[k + ce], int(q.x));
+                    atomicAdd(acc[k + ce + 1], int(q.y));
+                    atomicAdd(acc[k + ce + 2], int(q.z));
                 }
             }
         }

@@ -2,9 +2,10 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 
-// Counts live particles per material. Each invocation folds a run of slots so the shared
-// counters see few atomic operations.
-//   counter[4] live   counter[5] oil   counter[6] syrup volume (1/256 particle)
+// Counts live particles, and per table row the particles of that material and the sum of
+// their concentrations. Each invocation folds a run of slots so the shared counters see few
+// atomic operations.
+//   counter[4] live   counter[8 + 2 m] particles of row m   counter[9 + 2 m] their concentration (1/256 particle)
 
 layout(local_size_x = 64) in;
 
@@ -14,15 +15,28 @@ void main() {
     uint first = gl_GlobalInvocationID.x * RUN;
     if (first >= P.n_slots) return;
     uint last = min(first + RUN, P.n_slots);
-    uint live = 0u, oil = 0u, syr = 0u;
+    uint live = 0u;
+    // Runs are mostly one material: fold while the row stays the same.
+    uint cur = 0u, n = 0u, conc = 0u;
     for (uint id = first; id < last; id++) {
-        uint kind = particles[id].kind;
+        uint kind = particles[id].kind & 255u;
         if (kind == KIND_DEAD) continue;
         live++;
-        if (kind == KIND_OIL) oil++;
-        else syr += uint(particles[id].s * 256.0 + 0.5);
+        if (kind != cur) {
+            if (n > 0u) {
+                atomicAdd(counter[8u + 2u * (cur - 1u)], n);
+                atomicAdd(counter[9u + 2u * (cur - 1u)], conc);
+            }
+            cur = kind;
+            n = 0u;
+            conc = 0u;
+        }
+        n++;
+        conc += uint(clamp(particles[id].s, 0.0, 1.0) * 256.0 + 0.5);
+    }
+    if (n > 0u) {
+        atomicAdd(counter[8u + 2u * (cur - 1u)], n);
+        atomicAdd(counter[9u + 2u * (cur - 1u)], conc);
     }
     if (live > 0u) atomicAdd(counter[4], live);
-    if (oil > 0u) atomicAdd(counter[5], oil);
-    if (syr > 0u) atomicAdd(counter[6], syr);
 }

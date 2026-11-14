@@ -34,7 +34,7 @@ bool interior(ivec2 c) { return all(greaterThanEqual(c, ivec2(1))) && all(lessTh
 uint tile_of(ivec2 c) { return uint((c.y >> 4) * ((P.grid.x + 15) >> 4) + (c.x >> 4)); }
 bool tile_active() { return tiles[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x] != 0u; }
 
-// Below this viscous diffusion number nu dt / dx^2 a cell needs no implicit solve: the
-// explicit step with the same operator is accurate there (its stability limit is ~0.12).
-// Pure water on 1 cm cells sits near 1e-5.
-const float IMPLICIT_MIN = 1e-3;
+// Below the viscous diffusion number nu dt / dx^2 in P.corr.w (params.rs:
+// implicit_viscosity_min, default 1e-3) a cell needs no implicit solve: the explicit step
+// with the same operator is accurate there (its stability limit is ~0.12). Pure water on
+// 1 cm cells sits near 1e-5.

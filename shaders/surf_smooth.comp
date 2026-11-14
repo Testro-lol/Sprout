@@ -3,7 +3,7 @@
 #include "common.glsl"
 
 // Smoothed indicator fields for surface tension: liquid volume fraction (liquid vs air)
-// and oil volume fraction (oil vs the aqueous phase). Particle occupancy is noisy at the
+// and the share of each phase group but the first (oil-like, liquid metal, silicate melt). Particle occupancy is noisy at the
 // particle scale; a 5 x 5 binomial filter, renormalised over open cells so that solids do
 // not read as air, makes it smooth enough to take curvature from. Solids are excluded
 // rather than counted, which on its own is a 90 degree contact angle; surf_curv bends the
@@ -16,7 +16,8 @@ const float B5[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(c, P.grid))) return;
-    vec2 sum = vec2(0.0);
+    vec2 sum = vec2(0.0), sum2 = vec2(0.0);
+    bool more = (P.group_mask & 12u) != 0u;  // liquid metal or silicate melt in the tank
     float wsum = 0.0;
     for (int b = -2; b <= 2; b++) {
         for (int a = -2; a <= 2; a++) {
@@ -25,13 +26,19 @@ void main() {
             int j = cidx(n);
             float open = solid[j].w;
             if (open <= 0.02) continue;
-            float phi = clamp(cell[j].x / (P.rest_phi * open), 0.0, 1.0);
+            float phi = clamp(cell[j].x / (REST_PHI * open), 0.0, 1.0);
             float w = B5[a + 2] * B5[b + 2];
             sum += w * vec2(phi, phi * comp[j].y);
+            if (more) sum2 += w * phi * aux[j].zw;
             wsum += w;
         }
     }
     vec4 o = surf[cidx(c)];
     o.xy = wsum > 0.0 ? sum / wsum : vec2(0.0);
     surf[cidx(c)] = o;
+    if (more) {
+        vec4 o2 = surf2[cidx(c)];
+        o2.xy = wsum > 0.0 ? sum2 / wsum : vec2(0.0);
+        surf2[cidx(c)] = o2;
+    }
 }

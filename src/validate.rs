@@ -9,28 +9,33 @@ use crate::{
     render::View,
     maps::fill_rect,
     scene::{Scene, Shape, WALL},
-    sim::{Current, KIND_AQUEOUS, KIND_OIL, Material, NOMINAL_DT, PPC, Particle, SimParams, ToolState},
+    sim::{Current, Material, PhaseGroup, NOMINAL_DT, PPC, Particle, SimParams, ToolState},
     world::{Source, World},
 };
 
 const GRID: [u32; 2] = [512, 288];
 
-struct Report {
-    failures: u32,
+pub(crate) struct Report {
+    pub(crate) failures: u32,
     /// Where to save a picture of each scenario (`--shots DIR`).
     shots: Option<(Offscreen, PathBuf)>,
 }
 
 impl Report {
-    fn shot(&mut self, w: &World, name: &str) {
+    pub(crate) fn shot(&mut self, w: &World, name: &str) {
         if let Some((off, dir)) = &mut self.shots {
             // Every scenario builds its own world, so drop what the last one left cached.
             off.renderer.invalidate();
-            off.save_png(&w.sim, View::fit(GRID, off.size), &dir.join(format!("{name}.png")));
+            off.save_png(&w.sim, View::fit(w.sim.grid, off.size), &dir.join(format!("{name}.png")));
         }
     }
 
-    fn check(&mut self, what: &str, measured: String, expected: &str, ok: bool) {
+    /// Where `--shots` saves pictures, if it was given.
+    pub(crate) fn shots_dir(&self) -> Option<PathBuf> {
+        self.shots.as_ref().map(|(_, d)| d.clone())
+    }
+
+    pub(crate) fn check(&mut self, what: &str, measured: String, expected: &str, ok: bool) {
         if !ok {
             self.failures += 1;
         }
@@ -38,7 +43,16 @@ impl Report {
     }
 }
 
-fn world(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), fills: &[([f32; 4], Material)]) -> World {
+fn is_oil(p: &Particle) -> bool {
+    p.is(Material::Oil)
+}
+
+/// Syrup share of a particle (0 for water and oil).
+fn syrup_in(p: &Particle) -> f32 {
+    if p.is(Material::Syrup) { p.s } else { 0.0 }
+}
+
+pub(crate) fn world(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), fills: &[([f32; 4], Material)]) -> World {
     let scene = Scene::new(GRID);
     let mut ps = Vec::new();
     for &(rect, m) in fills {
@@ -50,22 +64,22 @@ fn world(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), fills: &[([f32; 4], Mat
     w
 }
 
-fn run(w: &mut World, seconds: f32) {
+pub(crate) fn run(w: &mut World, seconds: f32) {
     if seconds > 0.0 {
         w.sim.advance_blocking(seconds as f64, ToolState::default());
     }
 }
 
 fn rho(p: &Particle, sp: &SimParams) -> f32 {
-    if p.kind == KIND_OIL { sp.rho[2] } else { sp.rho[0] + (sp.rho[1] - sp.rho[0]) * p.s }
+    p.density(sp)
 }
 
-fn rms_speed(ps: &[Particle]) -> f32 {
+pub(crate) fn rms_speed(ps: &[Particle]) -> f32 {
     (ps.iter().map(|p| p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sum::<f32>() / ps.len().max(1) as f32).sqrt()
 }
 
 /// Mean kinetic and gravitational potential energy per particle.
-fn energy(ps: &[Particle], sp: &SimParams) -> (f64, f64) {
+pub(crate) fn energy(ps: &[Particle], sp: &SimParams) -> (f64, f64) {
     let (mut ke, mut pe) = (0.0f64, 0.0f64);
     for p in ps {
         let rho = rho(p, sp) as f64;
@@ -75,7 +89,7 @@ fn energy(ps: &[Particle], sp: &SimParams) -> (f64, f64) {
     (ke / ps.len().max(1) as f64, pe / ps.len().max(1) as f64)
 }
 
-fn mean_height(ps: &[Particle], pick: impl Fn(&Particle) -> f32) -> f32 {
+pub(crate) fn mean_height(ps: &[Particle], pick: impl Fn(&Particle) -> f32) -> f32 {
     let (mut sum, mut weight) = (0.0f64, 0.0f64);
     for p in ps {
         let w = pick(p) as f64;
@@ -86,7 +100,7 @@ fn mean_height(ps: &[Particle], pick: impl Fn(&Particle) -> f32) -> f32 {
 }
 
 /// Area (cells^2) of the region holding liquid, from a 1-cell occupancy histogram.
-fn occupied_area(ps: &[Particle]) -> f32 {
+pub(crate) fn occupied_area(ps: &[Particle]) -> f32 {
     let (w, h) = (GRID[0] as usize, GRID[1] as usize);
     let mut count = vec![0u16; w * h];
     for p in ps {
@@ -98,7 +112,7 @@ fn occupied_area(ps: &[Particle]) -> f32 {
     count.iter().filter(|&&c| c > 0).count() as f32
 }
 
-fn percentile(mut v: Vec<f32>, q: f32) -> f32 {
+pub(crate) fn percentile(mut v: Vec<f32>, q: f32) -> f32 {
     if v.is_empty() {
         return 0.0;
     }
@@ -122,6 +136,40 @@ fn hydrostatic(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.check("particles conserved", format!("{} -> {}", n0, ps.len()), "equal", n0 == ps.len());
     r.check("surface level", format!("{:.2} cells ({:+.2} %)", top, (top / 100.0 - 1.0) * 100.0), "100 +/- 2 %", (top / 100.0 - 1.0).abs() < 0.02);
     r.check("residual motion (rms speed / sqrt(g h))", format!("{:.5}", rms / v_ref), "< 0.01", rms / v_ref < 0.01);
+}
+
+/// Liquid with no free surface: a box closed on every side and full of water, and a tank
+/// filled to the lid. Nothing fixes the level of the pressure there (the system is singular);
+/// the region's vent has to (`sealed_vent`), or the solve diverges and throws the liquid out.
+fn sealed(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
+    println!("\nSealed liquid (a closed box full of water, 3 s; a tank filled to the lid, 2 s)");
+    let wall = |x0: f32, y0: f32, x1: f32, y1: f32| Shape::Box { c: [(x0 + x1) * 0.5, (y0 + y1) * 0.5], half: [(x1 - x0) * 0.5, (y1 - y0) * 0.5], angle: 0.0 };
+    let mut scene = Scene::new(GRID);
+    scene.shapes.extend([wall(194.0, 0.0, 200.0, 86.0), wall(300.0, 0.0, 306.0, 86.0), wall(194.0, 80.0, 306.0, 86.0)]);
+    let (inside, lid) = ([200.0, 0.0, 300.0, 80.0], 80.0);
+    for (name, scene, fill, seconds) in [("box", scene, inside, 3.0), ("tank", Scene::new(GRID), [0.0, 0.0, 512.0, 288.0], 2.0)] {
+        let mut ps = Vec::new();
+        fill_rect(&scene, fill, Material::Water, &mut ps);
+        let n0 = ps.len();
+        let mut w = World::custom(gpu.clone(), scene, ps);
+        apply(&mut w.sim.params);
+        w.sim.step_blocking(0, ToolState::default());
+        w.sim.solver.reset_extremes();
+        run(&mut w, seconds);
+        r.shot(&w, &format!("sealed_{name}"));
+        let ps = w.sim.download_particles();
+        let st = w.sim.solver;
+        let escaped = ps.iter().filter(|p| name == "box" && (p.pos[1] > lid + 1.0 || p.pos[0] < 199.0 || p.pos[0] > 301.0)).count();
+        r.check(&format!("{name}: liquid stays where it is"), format!("{} of {} particles left, {} outside", ps.len(), n0, escaped), "all, none", ps.len() == n0 && escaped == 0);
+        let v_ref = (w.sim.params.g_cells() * 80.0).sqrt();
+        r.check(&format!("{name}: at rest (rms speed / sqrt(g h))"), format!("{:.5}", rms_speed(&ps) / v_ref), "< 0.01", rms_speed(&ps) / v_ref < 0.01);
+        r.check(
+            &format!("{name}: pressure solves converged"),
+            format!("{} unconverged of {} substeps, most iterations {}", st.pressure_unconverged, st.substeps, st.pressure_iters_max),
+            "0",
+            st.pressure_unconverged == 0,
+        );
+    }
 }
 
 /// Collapse of a water column. The surge front is compared with the classic experiment
@@ -202,7 +250,7 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
         ],
     );
     let before = w.sim.download_particles();
-    let syrup0: f64 = before.iter().filter(|p| p.kind == KIND_AQUEOUS).map(|p| p.s as f64).sum();
+    let syrup0: f64 = before.iter().map(|p| syrup_in(p) as f64).sum();
     let area0 = occupied_area(&before);
     let sp = w.sim.params;
     // Nothing here may add mechanical energy: overturning turns potential energy into
@@ -219,10 +267,10 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
         let strip = |p: &Particle| ((p.pos[0] / GRID[0] as f32 * 16.0) as usize).min(15);
         let mut above = 0usize;
         for k in 0..16 {
-            let floor = percentile(ps.iter().filter(|p| p.kind == KIND_OIL && strip(p) == k).map(|p| p.pos[1]).collect(), 0.05);
-            above += ps.iter().filter(|p| p.kind != KIND_OIL && strip(p) == k && p.pos[1] > floor).count();
+            let floor = percentile(ps.iter().filter(|p| is_oil(p) && strip(p) == k).map(|p| p.pos[1]).collect(), 0.05);
+            above += ps.iter().filter(|p| !is_oil(p) && strip(p) == k && p.pos[1] > floor).count();
         }
-        above as f32 / ps.iter().filter(|p| p.kind != KIND_OIL).count().max(1) as f32
+        above as f32 / ps.iter().filter(|p| !is_oil(p)).count().max(1) as f32
     };
     let mut trend = Vec::new();
     for k in 0..20 {
@@ -239,9 +287,9 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
     r.shot(&w, "layers");
     let (ke1, pe1) = energy(&ps);
     let released = pe0 - pe1;
-    let oil_y = mean_height(&ps, |p| (p.kind == KIND_OIL) as u32 as f32);
-    let water_y = mean_height(&ps, |p| if p.kind == KIND_AQUEOUS { 1.0 - p.s } else { 0.0 });
-    let syrup_y = mean_height(&ps, |p| if p.kind == KIND_AQUEOUS { p.s } else { 0.0 });
+    let oil_y = mean_height(&ps, |p| (is_oil(p)) as u32 as f32);
+    let water_y = mean_height(&ps, |p| if is_oil(p) { 0.0 } else { 1.0 - syrup_in(p) });
+    let syrup_y = mean_height(&ps, syrup_in);
     r.check(
         "mean heights oil / water / syrup",
         format!("{:.0} / {:.0} / {:.0} cells", oil_y, water_y, syrup_y),
@@ -255,7 +303,7 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
         trend.iter().map(|t| format!("{:.2} %", t * 100.0)).collect::<Vec<_>>().join(", ")
     );
     r.check("water/syrup left above the oil layer's floor", format!("{:.2} %", below * 100.0), "< 3 %", below < 0.03);
-    let syrup1: f64 = ps.iter().filter(|p| p.kind == KIND_AQUEOUS).map(|p| p.s as f64).sum();
+    let syrup1: f64 = ps.iter().map(|p| syrup_in(p) as f64).sum();
     r.check(
         "dissolved syrup volume conserved",
         format!("{:+.4} %", (syrup1 / syrup0 - 1.0) * 100.0),
@@ -263,11 +311,11 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
         (syrup1 / syrup0 - 1.0).abs() < 1e-3,
     );
     // Miscibility: water and syrup should have blended; oil particles never change kind.
-    let aq: Vec<f32> = ps.iter().filter(|p| p.kind == KIND_AQUEOUS).map(|p| p.s).collect();
+    let aq: Vec<f32> = ps.iter().filter(|p| !is_oil(p)).map(syrup_in).collect();
     let mixed = aq.iter().filter(|&&s| s > 0.1 && s < 0.9).count() as f32 / aq.len() as f32;
     r.check("aqueous particles that are a water-syrup blend", format!("{:.0} %", mixed * 100.0), "> 50 %", mixed > 0.5);
-    let n_oil0 = before.iter().filter(|p| p.kind == KIND_OIL).count();
-    let n_oil1 = ps.iter().filter(|p| p.kind == KIND_OIL).count();
+    let n_oil0 = before.iter().filter(|p| is_oil(p)).count();
+    let n_oil1 = ps.iter().filter(|p| is_oil(p)).count();
     r.check("oil phase conserved", format!("{} -> {}", n_oil0, n_oil1), "equal", n_oil0 == n_oil1);
     let area1 = occupied_area(&ps);
     r.check("total volume", format!("{:+.2} %", (area1 / area0 - 1.0) * 100.0), "|drift| < 3 %", (area1 / area0 - 1.0).abs() < 0.03);
@@ -293,7 +341,7 @@ fn viscous_current(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Repor
     let (bw, bh) = (50.0, 60.0);
     let mut w = world(gpu, apply, &[([0.0, 0.0, WALL + bw, WALL + bh], Material::Syrup)]);
     let q = w.sim.download_particles().len() as f32 / PPC as f32;
-    let (g, nu) = (w.sim.params.g_cells(), w.sim.params.nu_cells(1));
+    let (g, nu) = (w.sim.params.g_cells(), w.sim.params.nu_cells(Material::Syrup));
     let k = 1.411 * (g * q.powi(3) / (3.0 * nu)).powf(0.2);
     let mut t = 0.0;
     let mut pts = Vec::new();
@@ -352,8 +400,8 @@ fn buoyancy(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.shot(&w, "buoyancy");
     let ps = w.sim.download_particles();
     let surface = percentile(ps.iter().map(|p| p.pos[1]).collect(), 0.995);
-    let oil_y = mean_height(&ps, |p| (p.kind == KIND_OIL) as u32 as f32);
-    let syr_y = mean_height(&ps, |p| if p.kind == KIND_AQUEOUS { p.s } else { 0.0 });
+    let oil_y = mean_height(&ps, |p| (is_oil(p)) as u32 as f32);
+    let syr_y = mean_height(&ps, syrup_in);
     r.check("oil blob", format!("{:.0} -> {:.0} cells (surface {:.0})", oil_c[1], oil_y, surface), "within 12 cells of the surface", surface - oil_y < 12.0);
     r.check("syrup blob", format!("{:.0} -> {:.0} cells", syr_c[1], syr_y), "sank below 60 cells", syr_y < 60.0);
 }
@@ -671,24 +719,45 @@ fn tools(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.check("grab: fluid under the brush follows it", format!("{:.0} cells/s", carried), &format!("> {:.0} (brush moves at {:.0})", 0.5 * speed, speed), carried > 0.5 * speed);
     // Water has no viscosity here, so the swirl and the waves are long-lived. What they
     // must not do is grow: kinetic plus potential energy can only fall.
+    // The total measured from the particles wobbles by about 1 % within each slosh (it reads
+    // higher while the pool moves fast than while it is piled up), and the slosh lasts about
+    // 2 s: single samples 2 s apart landed on random phases of it and, once the decay had
+    // slowed, rose by up to 16 in about 1100 in either build. Each 2 s is therefore averaged
+    // over eight samples. By then the pool sits where the density correction's lift balances
+    // the slow compression of particle advection (without the correction its energy keeps
+    // falling below rest), and that lift is potential energy the flow never had: a rise
+    // between the means is allowed up to lifting the pool by CORRECTION_LIFT, what the
+    // correction does to a resting pool (README, stabilisation table). The flow itself must
+    // still lose energy: the last mean below the first.
     let sp = w.sim.params;
     let rest = sp.g_cells() as f64 * (WALL as f64 + 30.0);
     let total = |ps: &[Particle]| {
         let (ke, pe) = energy(ps, &sp);
         ke + pe - rest
     };
-    let mut energies = vec![total(&ps)];
+    let e0 = total(&ps);
+    let mut means = Vec::new();
     for _ in 0..5 {
-        run(&mut w, 2.0);
-        energies.push(total(&w.sim.download_particles()));
+        let mut sum = 0.0;
+        for _ in 0..8 {
+            run(&mut w, 0.25);
+            sum += total(&w.sim.download_particles());
+        }
+        means.push(sum / 8.0);
     }
     r.shot(&w, "tools_grab_1");
     let ps = w.sim.download_particles();
+    const CORRECTION_LIFT: f64 = 0.016;  // cells
+    let lift = sp.g_cells() as f64 * CORRECTION_LIFT;
+    let worst = means.windows(2).map(|p| p[1] - p[0]).fold(f64::MIN, f64::max);
     r.check(
         "grab: the released pool only loses energy",
-        energies.iter().map(|e| format!("{e:.0}")).collect::<Vec<_>>().join(" > "),
-        "falling (energy above rest, every 2 s)",
-        energies.windows(2).all(|p| p[1] < p[0]) && ps.len() == n0,
+        format!(
+            "{e0:.0}, then 2 s means {}; worst change {worst:+.1}",
+            means.iter().map(|e| format!("{e:.0}")).collect::<Vec<_>>().join(" "),
+        ),
+        &format!("falling; a rise < {lift:.1} (the density correction's lift of a resting pool)"),
+        means[means.len() - 1] < means[0] && means[0] < e0 && worst < lift && ps.len() == n0,
     );
 
     // ---- solids ------------------------------------------------------------------------
@@ -743,12 +812,69 @@ fn tools(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         removed == 3 && w.scene.shapes.is_empty() && refill > 0.95 && (mean(&ps) - mean0).abs() < 0.5,
     );
     r.check("solids: the refilled pool does not clump", format!("fullest cell holds {}", crowded(&ps)), "< 12", crowded(&ps) < 12);
+
+    // ---- push into the floor, and a clump in ice -------------------------------------------
+    // A held push sets velocities after the pressure solve at 2 m/s; driven on into the floor
+    // it packed tens of thousands of particles into one cell, where the fixed-point sums
+    // wrapped and the cell drew in everything around it (params.rs: tool_crowd_max).
+    let scene = Scene::new(GRID);
+    let mut ps = Vec::new();
+    fill_rect(&scene, [0.0, 0.0, 512.0, WALL + 50.0], Material::Water, &mut ps);
+    let mut w = World::custom(gpu.clone(), scene, ps);
+    apply(&mut w.sim.params);
+    w.sim.step_blocking(0, ToolState::default());
+    let mut worst = 0;
+    for k in 0..120 {
+        let a = k as f32 * 0.2;
+        let mut push = ToolState::push([256.0 + 6.0 * a.cos(), WALL + 12.0 + 4.0 * a.sin()], 13.0);
+        push.strength *= 2.5;
+        frame(&mut w, push);
+        if k % 20 == 19 {
+            worst = worst.max(crowded(&w.sim.download_particles()));
+        }
+    }
+    r.shot(&w, "tools_push_floor");
+    r.check("push: a brush held against the floor does not pack liquid", format!("fullest cell holds up to {worst}"), &format!("< 64 (rest {PPC})"), worst < 64);
+    run(&mut w, 2.0);
+    let n = crowded(&w.sim.download_particles());
+    r.check("push: released, the liquid spreads out again", format!("fullest cell holds {n}"), "< 16", n < 16);
+
+    // A block of ice with 400 particles stacked on one spot inside it (what a brush driven
+    // into ice used to leave): bodies take no density correction at rest occupancy, and a
+    // clump in one never spread out; it rode with the body, grew, and its wrapped sums froze
+    // the tank.
+    let scene = Scene::new(GRID);
+    let mut ps = Vec::new();
+    fill_rect(&scene, [200.0, 0.0, 312.0, WALL + 40.0], Material::Water, &mut ps);
+    for k in 0..400 {
+        ps.push(Particle::new(Material::Water, [256.0 + 0.001 * (k % 20) as f32, WALL + 20.0 + 0.001 * (k / 20) as f32], [0.0, 0.0]));
+    }
+    let mut sp = SimParams::default();
+    apply(&mut sp);
+    let ice = sp.enthalpy_temp(Material::Water, 1.0, -30.0);
+    for p in &mut ps {
+        p.t = ice;
+    }
+    let mut w = World::custom(gpu.clone(), scene, ps);
+    apply(&mut w.sim.params);
+    w.sim.step_blocking(0, ToolState::default());
+    let n0 = crowded(&w.sim.download_particles());
+    run(&mut w, 3.0);
+    let ps = w.sim.download_particles();
+    let frozen = ps.iter().filter(|p| w.sim.params.temperature(p).1 > 0.5).count();
+    r.shot(&w, "tools_ice_clump");
+    r.check(
+        "ice: a clump inside a frozen body spreads out",
+        format!("fullest cell {n0} -> {} after 3 s, {:.0} % frozen", crowded(&ps), 100.0 * frozen as f32 / ps.len() as f32),
+        "< 32, > 95 % frozen",
+        crowded(&ps) < 32 && frozen * 100 > 95 * ps.len(),
+    );
 }
 
 // ---- independent checks of viscosity, surface tension and settling ------------------
 
 /// A world on an arbitrary grid from explicit particles.
-fn world_from(gpu: &Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), ps: Vec<Particle>) -> World {
+pub(crate) fn world_from(gpu: &Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), ps: Vec<Particle>) -> World {
     let mut w = World::custom(gpu.clone(), Scene::new(grid), ps);
     apply(&mut w.sim.params);
     w.sim.step_blocking(0, ToolState::default());
@@ -757,7 +883,7 @@ fn world_from(gpu: &Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), ps
 
 /// Rest-lattice particles inside `inside`, within the bounding box, with velocity field `vel`
 /// and its gradient `grad` (du/dx, du/dy, dv/dx, dv/dy) as the APIC matrix.
-fn particles_where(
+pub(crate) fn particles_where(
     grid: [u32; 2],
     bbox: [f32; 4],
     m: Material,
@@ -778,7 +904,7 @@ fn particles_where(
 
 /// Least-squares amplitude of `component` of the particle velocity along `shape(pos)`,
 /// over particles that `pick` selects.
-fn mode_amplitude(ps: &[Particle], pick: &dyn Fn(&Particle) -> bool, shape: &dyn Fn([f32; 2]) -> f32, component: usize) -> f32 {
+pub(crate) fn mode_amplitude(ps: &[Particle], pick: &dyn Fn(&Particle) -> bool, shape: &dyn Fn([f32; 2]) -> f32, component: usize) -> f32 {
     let (mut num, mut den) = (0.0f64, 0.0f64);
     for p in ps.iter().filter(|p| pick(p)) {
         let f = shape(p.pos) as f64;
@@ -801,13 +927,16 @@ fn viscosity(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     let setup = |p: &mut SimParams| {
         apply(p);
         p.gravity = 0.0;
-        p.nu = [nu_si; 3];
-        p.sigma = [0.0; 3];
-        p.sigma_oil = 0.0;
+        for m in &mut p.mat[..3] {
+            m.viscosity = nu_si;
+            m.tension = 0.0;
+        }
+        p.pair_tension[0][1] = 0.0;
+        p.pair_tension[1][0] = 0.0;
     };
     let mut params = SimParams::default();
     setup(&mut params);
-    let nu = params.nu_cells(0);
+    let nu = params.nu_cells(Material::Water);
     let (h, a) = (40.0f32, 20.0f32);
     let pi = std::f32::consts::PI;
 
@@ -906,7 +1035,7 @@ fn viscosity(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
 }
 
 /// Second moments of a particle cloud about its centroid: (Ixx - Iyy) / (Ixx + Iyy).
-fn ellipticity(ps: &[Particle], pick: &dyn Fn(&Particle) -> bool) -> f32 {
+pub(crate) fn ellipticity(ps: &[Particle], pick: &dyn Fn(&Particle) -> bool) -> f32 {
     let sel: Vec<&Particle> = ps.iter().filter(|p| pick(p)).collect();
     let n = sel.len().max(1) as f64;
     let cx = sel.iter().map(|p| p.pos[0] as f64).sum::<f64>() / n;
@@ -920,7 +1049,7 @@ fn ellipticity(ps: &[Particle], pick: &dyn Fn(&Particle) -> bool) -> f32 {
 }
 
 /// Period of the oscillation of `e(t)` from the times of its zero crossings.
-fn period(samples: &[(f32, f32)]) -> Option<f32> {
+pub(crate) fn period(samples: &[(f32, f32)]) -> Option<f32> {
     let mut crossings = Vec::new();
     for w in samples.windows(2) {
         let ((t0, e0), (t1, e1)) = (w[0], w[1]);
@@ -950,7 +1079,8 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     };
     let mut params = SimParams::default();
     setup(&mut params);
-    let u = params.gpu_units();
+    let sigma_water = params.sigma_cells(Material::Water);
+    let sigma_oil = params.pair_sigma_cells(PhaseGroup::Aqueous, PhaseGroup::Oily);
     let pi = std::f32::consts::PI;
     let c = [256.0f32, 144.0f32];
     let disc = |rad: f32| move |x: [f32; 2]| (x[0] - c[0]).hypot(x[1] - c[1]) < rad;
@@ -974,7 +1104,7 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         }
     }
     let p_in = (sum / n.max(1) as f64) as f32 / dt;
-    let p_theory = u.sigma[0] / rad;
+    let p_theory = sigma_water / rad;
     r.check(
         "drop: pressure inside / (sigma / R)",
         format!("{:.3}", p_in / p_theory),
@@ -982,7 +1112,7 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         (p_in / p_theory - 1.0).abs() < 0.10,
     );
     let ps = w.sim.download_particles();
-    let v_cap = (u.sigma[0] / rad).sqrt();
+    let v_cap = (sigma_water / rad).sqrt();
     let rms = rms_speed(&ps);
     r.check(
         "drop: spurious currents (rms speed / sqrt(sigma/rho R))",
@@ -1019,7 +1149,7 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         (sum / n.max(1) as f64) as f32 / dt
     };
     let jump = ring(0.0, 0.5 * rad) - ring(rad + 8.0, rad + 16.0);
-    let theory = u.sigma_oil / rad;
+    let theory = sigma_oil / rad;
     r.check(
         "oil disc in water: pressure jump / (sigma_oa / R)",
         format!("{:.3}", jump / theory),
@@ -1036,7 +1166,7 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     if on("waterdrop") {
     let ps = particles_where(GRID, [c[0] - ax, c[1] - ay, c[0] + ax, c[1] + ay], Material::Water, &ellipse, &zero, &zero4);
     let mut w = world_from(gpu, GRID, &setup, ps);
-    let omega = (6.0 * u.sigma[0] / rad.powi(3)).sqrt();
+    let omega = (6.0 * sigma_water / rad.powi(3)).sqrt();
     let t_theory = 2.0 * pi / omega;
     let mut samples = Vec::new();
     let step = t_theory / 40.0;
@@ -1058,8 +1188,8 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     }
 
     // ---- oil drop in water: interfacial tension, omega^2 = 6 sigma / ((rho_i + rho_o) R^3) --
-    let rho_sum = params.rho[0] + params.rho[2];
-    let t_oil = 2.0 * pi / (6.0 * u.sigma_oil / (rho_sum * rad.powi(3))).sqrt();
+    let rho_sum = params.rho(Material::Water) + params.rho(Material::Oil);
+    let t_oil = 2.0 * pi / (6.0 * sigma_oil / (rho_sum * rad.powi(3))).sqrt();
     if on("oildrop") {
     // (A free surface at the top: a tank filled to the lid has no pressure reference.)
     let mut ps = particles_where(GRID, [0.0, 0.0, 512.0, 260.0], Material::Water, &|_| true, &zero, &zero4);
@@ -1072,12 +1202,12 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     let t_theory = t_oil;
     let mut samples = Vec::new();
     let step = t_theory / 40.0;
-    let oil = |p: &Particle| p.kind == KIND_OIL;
+    let oil = |p: &Particle| is_oil(p);
     for k in 0..=90 {
         samples.push((k as f32 * step, ellipticity(&w.sim.download_particles(), &oil)));
         if trace {
             let ps = w.sim.download_particles();
-            let o: Vec<Particle> = ps.iter().copied().filter(|p| p.kind == KIND_OIL).collect();
+            let o: Vec<Particle> = ps.iter().copied().filter(is_oil).collect();
             let st = w.sim.solver;
             let top = percentile(ps.iter().map(|p| p.pos[1]).collect(), 0.999);
             println!(
@@ -1100,9 +1230,8 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     // cells, and loses 45 % of its amplitude per period.
     let defaults = SimParams::default();
     let standard = rad == 20.0
-        && params.nu == defaults.nu
-        && params.rho == defaults.rho
-        && params.sigma_oil == defaults.sigma_oil
+        && params.mat[..3] == defaults.mat[..3]
+        && params.pair_tension == defaults.pair_tension
         && params.cell_size == 0.001;
     if standard {
         let t_viscous = 2.0874;
@@ -1132,11 +1261,11 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     }
     let mut w = world_from(gpu, GRID, &|p: &mut SimParams| {
         setup(p);
-        p.diffuse = 0.0;
+        p.mat[Material::Syrup.index()].mix_rate = 0.0;
     }, ps);
-    let e0 = ellipticity(&w.sim.download_particles(), &|p: &Particle| p.kind == KIND_AQUEOUS && p.s > 0.5);
+    let e0 = ellipticity(&w.sim.download_particles(), &|p: &Particle| syrup_in(p) > 0.5);
     run(&mut w, t_theory / 2.0);
-    let e1 = ellipticity(&w.sim.download_particles(), &|p: &Particle| p.kind == KIND_AQUEOUS && p.s > 0.5);
+    let e1 = ellipticity(&w.sim.download_particles(), &|p: &Particle| syrup_in(p) > 0.5);
     r.check(
         "syrup blob in water keeps its shape (miscible)",
         format!("ellipticity {:.3} -> {:.3}", e0, e1),
@@ -1158,7 +1287,9 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         let ps = particles_where(GRID, [base[0] - rad, WALL, base[0] + rad, WALL + rad], Material::Water, &half, &zero, &zero4);
         let mut w = world_from(gpu, GRID, &|p: &mut SimParams| {
             setup(p);
-            p.contact_angle = [angle; 3];
+            for m in &mut p.mat[..3] {
+                m.contact_angle = angle;
+            }
         }, ps);
         run(&mut w, 4.0);
         // Measured on the occupancy raster (cells holding at least half the rest count), so
@@ -1243,17 +1374,18 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         }
         let mut w = world_from(gpu, GRID, &|p: &mut SimParams| {
             setup(p);
-            p.sigma_oil = sigma_oil;
+            p.pair_tension[0][1] = sigma_oil;
+            p.pair_tension[1][0] = sigma_oil;
         }, ps);
         run(&mut w, 0.5);
-        let ps: Vec<Particle> = w.sim.download_particles().into_iter().filter(|p| p.kind == KIND_OIL).collect();
+        let ps: Vec<Particle> = w.sim.download_particles().into_iter().filter(is_oil).collect();
         let n = ps.len() as f32;
         let cx = ps.iter().map(|p| p.pos[0]).sum::<f32>() / n;
         let cy = ps.iter().map(|p| p.pos[1]).sum::<f32>() / n;
         let rmax = percentile(ps.iter().map(|p| (p.pos[0] - cx).hypot(p.pos[1] - cy)).collect(), 0.995);
         (rmax / (n / PPC as f32 / pi).sqrt(), w)
     };
-    let (with, w) = rounded(params.sigma_oil);
+    let (with, w) = rounded(params.pair_tension[0][1]);
     r.shot(&w, "oil_bead");
     let (without, _) = rounded(0.0);
     r.check(
@@ -1318,17 +1450,32 @@ fn settle(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     );
 
     println!("\nSloshing vs jitter after a stir (512 x 288, 60-cell pool)");
-    let (rows, jitter) = stir_and_settle(gpu, apply);
-    println!("  t (s)   energy above rest / particle   particle-scale jitter rms (cells/s)");
-    for (t, ke, j) in &rows {
-        println!("  {t:5.1}   {ke:28.2}   {j:8.3}");
+    let (rows, series, jitter) = stir_and_settle(gpu, apply);
+    // Means over each 2 s (eight samples 0.25 s apart), judged as "Grab: the released pool
+    // only loses energy" is (see there). Measured from the particles, the energy of a
+    // sloshing pool wobbles by about 1 % within each slosh, which lasts about 2 s: single
+    // samples 2 s apart landed on random phases of it, and a rise between two of them
+    // flipped with 0.1 % changes of water's viscosity in either build. Late in the run the
+    // pool sits where the density correction's lift balances the slow compression of
+    // advection, and its 2 s means level off in either build (3 of 8 such runs each rose);
+    // a rise is allowed up to the energy of that lift. The flow must still lose energy:
+    // the last mean below the first.
+    let means: Vec<f64> = (0..5).map(|k| series[8 * k + 1..=8 * k + 8].iter().sum::<f64>() / 8.0).collect();
+    println!("  t (s)   energy above rest / particle   particle-scale jitter rms (cells/s)   mean over the 2 s before");
+    for (i, (t, ke, j)) in rows.iter().enumerate() {
+        let m = if i > 0 { format!("{:10.2}", means[i - 1]) } else { String::new() };
+        println!("  {t:5.1}   {ke:28.2}   {j:8.3}   {m}");
     }
     let (ke_first, ke_last) = (rows[0].1, rows[rows.len() - 1].1);
+    const CORRECTION_LIFT: f64 = 0.016;  // cells (README, stabilisation table)
+    let lift = w_g_cells(apply) * CORRECTION_LIFT;
+    let worst = means.windows(2).map(|p| p[1] - p[0]).fold(f64::MIN, f64::max);
+    let falling = means[0] < ke_first && means[4] < means[0] && worst < lift;
     r.check(
         "after the stir: energy above rest falls, sloshing persists",
-        format!("{:.0} -> {:.0}", ke_first, ke_last),
-        "falling at every sample, not zero",
-        rows.windows(2).all(|w| w[1].1 < w[0].1) && ke_last > 0.0,
+        format!("{:.0} -> {:.0}, 2 s means {:.0} .. {:.0}, worst change {:+.1}", ke_first, ke_last, means[0], means[4], worst),
+        &format!("falling; a rise < {lift:.1} (the correction's lift); not zero"),
+        falling && ke_last > 0.0,
     );
     // The same stir on the previous solver: energy above rest 2072 -> 1087, jitter
     // 9.15 -> 3.09 cells/s. Small eddies left by the stir are real; what must not happen is
@@ -1349,7 +1496,16 @@ fn settle(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
 /// of its 4 x 4 cell block: sloshing waves are smooth at that scale, numerical noise is not.
 /// Uses only `World::custom`, `step_blocking` and `download_particles`, so the same function
 /// runs against older solvers.
-fn stir_and_settle(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams)) -> (Vec<(f32, f64, f32)>, f32) {
+/// Gravity in cells/s² with the parameters `apply` sets.
+fn w_g_cells(apply: &dyn Fn(&mut SimParams)) -> f64 {
+    let mut p = SimParams::default();
+    apply(&mut p);
+    p.g_cells() as f64
+}
+
+/// Returns a row every 2 s (time, energy above rest per particle, jitter), the energy every
+/// 0.25 s, and the last jitter.
+fn stir_and_settle(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams)) -> (Vec<(f32, f64, f32)>, Vec<f64>, f32) {
     let mut w = world(gpu, apply, &[([0.0, 0.0, 512.0, WALL + 60.0], Material::Water)]);
     let (speed, radius) = (200.0, 12.0);
     let mut pos = [150.0, WALL + 30.0];
@@ -1378,16 +1534,20 @@ fn stir_and_settle(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams)) -> (Vec<(f32,
     // Mechanical energy above the level pool at rest (same volume, flat surface).
     let rest = sp.g_cells() as f64 * (WALL as f64 + 30.0);
     let mut rows = Vec::new();
-    for k in 0..=5 {
+    let mut series = Vec::new();
+    for k in 0..=40 {
         let ps = w.sim.download_particles();
         let (ke, pe) = energy(&ps, &sp);
-        rows.push((k as f32 * 2.0, ke + pe - rest, jitter(&ps)));
-        if k < 5 {
-            w.sim.step_blocking(480, ToolState::default());
+        series.push(ke + pe - rest);
+        if k % 8 == 0 {
+            rows.push((k as f32 * 0.25, ke + pe - rest, jitter(&ps)));
+        }
+        if k < 40 {
+            w.sim.step_blocking(60, ToolState::default());
         }
     }
     let j = rows[rows.len() - 1].2;
-    (rows, j)
+    (rows, series, j)
 }
 
 /// Dam break at three resolutions: the front must converge as the grid is refined.
@@ -1449,8 +1609,9 @@ pub fn run_all(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), only: Option<&str>
         (Offscreen::new(gpu.clone(), [960, 540]), PathBuf::from(dir))
     });
     let mut r = Report { failures: 0, shots };
-    let tests: [(&str, Test); 13] = [
+    let tests: [(&str, Test); 25] = [
         ("hydrostatic", hydrostatic),
+        ("sealed", sealed),
         ("dam", dam_break),
         ("ritter", ritter),
         ("layers", stratification),
@@ -1463,6 +1624,17 @@ pub fn run_all(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), only: Option<&str>
         ("pour", pour),
         ("current", current),
         ("tools", tools),
+        ("thermal", crate::checks::thermal),
+        ("rheology", crate::checks::rheology),
+        ("suspension", crate::checks::suspension),
+        ("elastic", crate::checks::elastic),
+        ("metals", crate::checks::metals),
+        ("mixing", crate::checks::mixing),
+        ("maps", crate::stress::maps),
+        ("liquids", crate::stress::liquids),
+        ("abuse", crate::stress::abuse),
+        ("extremes", crate::stress::extremes),
+        ("render", crate::stress::render),
     ];
     for (name, test) in tests {
         if only.is_none_or(|o| o == name) {

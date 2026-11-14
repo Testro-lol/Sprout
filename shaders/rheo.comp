@@ -1,0 +1,55 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Non-Newtonian viscosity (README, "Rheology"). Runs after grid_prep.comp, before the
+// viscosity solve, in tanks holding a liquid whose viscosity depends on the shear rate or
+// that has a surface skin (CAP_RHEO).
+//
+// The shear rate g = sqrt(2 D:D) is taken from the velocity before viscosity (u*, gravity
+// included): the viscosity is lagged by one solve, the usual Picard linearisation. The
+// cell's non-Newtonian material (rh.xyz: share f, row, concentration s) scales the
+// cell's viscosity mu, which already holds that material's zero-shear (or consistency)
+// value at the cell's temperature and concentration, by
+//   Carreau (1):            F = r + (1 - r) (1 + (lambda g)^2)^((n - 1) / 2)
+//   Herschel-Bulkley (2):   F = g^(n - 1) + tau_y / (mu g)       (Bingham for n = 1)
+//   shear thickening (3):   F = min((1 + (lambda g)^2)^((n - 1) / 2), ratio)
+// as mu_eff = mu (1 + f (F - 1)). The yield stress of a concentrate scales with its
+// concentration (tau_y s). A skin (gallium's oxide) adds the yield stress skin / dx in
+// cells at the free surface.
+//
+// The solve stops at `rigid_viscosity`. Whether a cell then flows is decided after the
+// solve, from the stress it actually carries (rigid.comp): an unyielded plug or jammed
+// shear-thickening liquid moves with its rigid body, so the yield stress is honoured
+// without an unbounded viscosity. A plug under more than its yield stress creeps at the
+// capped viscosity, carries that stress, yields, and its viscosity falls on the next
+// substeps (a Picard iteration across substeps).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid - 1)) || any(lessThan(c, ivec2(1)))) return;
+    int i = cidx(c);
+    vec4 me = cell[i];
+    vec4 q = rh[i];
+    if (me.w <= 0.0 || q.x <= 0.0) return;
+    float g = shear_rate(i, true);
+    float F, tau;
+    nn_eval(i, q, g, F, tau);
+    float eff = me.z * F + tau / max(g, 1e-6);
+    float cap = me.y * exp(P.heat2.x);
+    // A skin (oxide) cell holds until straining breaks it: the inertial stress of the motion
+    // across the cell, rho (g dx)^2, against the skin's yield stress skin / dx. Tension acts
+    // in the pressure step, after the viscosity, so a one-cell skin cannot be judged by the
+    // stress the solve gives it; what reaches it through the liquid's motion (an impact, a
+    // stir, the brush) can be, and breaks it (README, "Oxide skin").
+    int W = P.grid.x;
+    float skin = q.x * mats[int(q.y)].temp.w;
+    if (skin > 0.0 && me.y * g * g < skin && (cell[i - 1].w <= 0.0 || cell[i + 1].w <= 0.0 || cell[i - W].w <= 0.0 || cell[i + W].w <= 0.0)) {
+        q.w = 1.0;
+        rh[i] = q;
+    }
+    me.z = min(eff, cap);
+    cell[i] = me;
+}

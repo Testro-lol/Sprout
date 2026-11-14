@@ -1,0 +1,38 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// The force of the viscoelastic stress on the liquid (README, "Viscoelasticity"): the
+// particles' stress, scattered to cell centres by grid_prep.comp (volume-weighted, so it
+// falls to zero across a free surface: traction-free), and its divergence added to the face
+// velocities before viscosity and pressure, explicitly:
+//   u += dt / rho_f (d tau_xx / dx + d tau_xy / dy),  v += dt / rho_f (d tau_xy / dx + d tau_yy / dy)
+// with tau_xy averaged to cell corners. The time step keeps elastic waves within half a cell
+// per substep (SimParams::dt_elastic).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+float txy_node(int i) {
+    int W = P.grid.x;
+    return 0.25 * (estr[i].z + estr[i - 1].z + estr[i - W].z + estr[i - W - 1].z);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid - 1)) || any(lessThan(c, ivec2(2)))) return;
+    int i = cidx(c);
+    int W = P.grid.x;
+    vec4 q = vel[i];
+    vec4 a = cell[i], l = cell[i - 1], b = cell[i - W];
+    if (face_live(q.z)) {
+        float rho = (a.x * a.y + l.x * l.y) / max(a.x + l.x, 1e-6);
+        float f = (estr[i].x - estr[i - 1].x) + (txy_node(i + W) - txy_node(i));
+        q.x += S.dt * f / max(rho, 0.05);
+    }
+    if (face_live(q.w)) {
+        float rho = (a.x * a.y + b.x * b.y) / max(a.x + b.x, 1e-6);
+        float f = (estr[i].y - estr[i - W].y) + (txy_node(i + 1) - txy_node(i));
+        q.y += S.dt * f / max(rho, 0.05);
+    }
+    vel[i] = q;
+}

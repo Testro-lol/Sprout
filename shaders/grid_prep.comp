@@ -12,17 +12,17 @@ const float BRIDGE_LEVEL = 0.05;
 // Whether cell `i` holds enough particles to count as liquid on its own.
 bool packed(int i) {
     vec4 sol = solid[i];
-    float phi_f = float(acc[i * ACC_STRIDE + 4]) / MASS_SCALE * P.inv_ppc;
-    return sol.w > 0.02 && phi_f > 0.04 && phi_f + sol.z > P.fluid_thr;
+    float phi_f = float(acc[i * P.acc_stride + 4]) / MASS_SCALE * P.inv_ppc;
+    return sol.w > 0.02 && phi_f > 0.04 && phi_f + sol.z > LIQUID_THR;
 }
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(c, P.grid))) return;
     int i = cidx(c);
-    int k = i * ACC_STRIDE;
+    int k = i * P.acc_stride;
     int um = acc[k], umom = acc[k + 1], vm = acc[k + 2], vmom = acc[k + 3];
-    int cw = acc[k + 4], coil = acc[k + 5], csyr = acc[k + 6];
+    int cw = acc[k + 4];
     vec4 sol = solid[i];
 
     vec4 o = vec4(0.0, 0.0, FACE_EMPTY, FACE_EMPTY);
@@ -42,20 +42,157 @@ void main() {
     vel0[i] = o.xy;
 
     float phi_f = float(cw) / MASS_SCALE * P.inv_ppc;
-    float oil = 0.0, syr = 0.0, rho = 0.0, mu = 0.0;
+    // Composition: the share and mean concentration of every material in the tank, and from
+    // them (and the material table) everything the solver needs to know about the cell.
+    // Within a phase group density blends linearly by volume and viscosity
+    // logarithmically; across groups (a cell the interface passes through, or an
+    // unresolved dispersion) the dynamic viscosities are averaged by volume.
+    float f[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);    // share of each phase group
+    float rg[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);   // share * density
+    float lg[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);   // share * ln nu
+    float sigma = 0.0;
+    vec2 contact = vec2(0.0);
+    float fam0 = -1.0;
+    float rho = 0.0, mu = 0.0, rho_c = 0.0, nu_c = 0.0;
+    bool thermal = has_cap(CAP_THERMAL);
+    float T = P.heat.x, kappa = 0.0, emis = 0.0, frozen = 0.0, Craw = 0.0;
+    vec4 nn = vec4(0.0, -1.0, 1.0, 0.0);  // rh: the cell's non-Newtonian material (see common.glsl)
+    float chi = 0.0;
+    int major = 0;
+    int top_row = -1;  // the material with the largest share (the wet map's colour)
+    float top_share = 0.0;
+    int nmix = P.n_fam - 1;
+    for (int q = 0; q < nmix; q++) mixb[i * nmix + q] = -1.0;
+    bool settle = has_cap(CAP_SETTLE);
+    if (settle) for (int q = 0; q < P.n_fam; q++) famocc[i * P.n_fam + q] = 0.0;
     if (cw > 0) {
-        oil = clamp(float(coil) / float(cw), 0.0, 1.0);
-        int aq = cw - coil;
-        syr = aq > 0 ? clamp(float(csyr) / float(aq), 0.0, 1.0) : 0.0;
-        rho = mix(aqueous_density(syr), P.rho.z, oil);
-        mu = mix(aqueous_viscosity(syr), P.rho.z * P.nu.z, oil);
+        // The first row's weight is what the explicit channels leave of the cell weight. If
+        // the tank has a primary family (P.primary: the first concentrate of the first row,
+        // syrup in water), the two share that remainder and are one liquid here, at the
+        // concentration of the pair: the diluent takes part in the exchange directly.
+        int others = 0;
+        for (int j = 0; j < P.n_present; j++) {
+            int ch = mats[present_row(j)].ia.z;
+            if (ch >= 0) others += acc[k + ch];
+        }
+        // Pass 1: shares and concentrations; with heat, the cell's heat capacity,
+        // conductivity and from them its temperature.
+        float sh[MAX_PRESENT], sc[MAX_PRESENT];
+        float Csh = 0.0;
+        float Cg[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);  // heat capacity per phase group
+        for (int j = 0; j < P.n_present; j++) {
+            sh[j] = 0.0;
+            sc[j] = 1.0;
+            int r = present_row(j);
+            ivec4 ia = mats[r].ia;
+            if (ia.z < 0 && P.primary >= 0 && r != P.primary) continue;
+            int w = ia.z >= 0 ? acc[k + ia.z] : max(cw - others, 0);
+            if (w <= 0) continue;
+            // A cell of one material has share 1 exactly (the driver may turn the division
+            // into a multiplication by a rounded reciprocal; a density one bit off from cell
+            // to cell is enough to disturb a sealed, completely full tank).
+            sh[j] = w >= cw ? 1.0 : clamp(float(w) / float(cw), 0.0, 1.0);
+            if (ia.y >= 0 && ia.w >= 0) sc[j] = clamp(float(acc[k + ia.w]) / float(w), 0.0, 1.0);
+            if (thermal) {
+                float cr = sh[j] * thermal_of(uint(r), sc[j]).w;
+                Csh += cr;
+                Cg[ia.x] += cr;
+                float kp = mats[r].th.y;
+                kappa += sh[j] * (ia.y >= 0 ? mix(mats[ia.y].th.y, kp, sc[j]) : kp);
+                float em = mats[r].th2.y;
+                emis += sh[j] * (ia.y >= 0 ? mix(mats[ia.y].th2.y, em, sc[j]) : em);
+            }
+        }
+        // The temperature of each phase group present, from its own particles: liquids of
+        // different groups meet at a sharp interface and keep their own temperatures (they
+        // exchange heat through it, heat.comp), so a cell where lava meets water must not
+        // evaluate the lava at the mean of the two. Within a group the cell's liquids mix.
+        float Tg[GROUPS] = float[GROUPS](T, T, T, T);
+        if (thermal && Csh > 0.0) {
+            int Htot = acc[k + int(P.heat2.z)];
+            T = float(Htot) * T_SCALE / (Csh * float(cw)) - 273.15;
+            int rest = Htot;
+            int first = -1;
+            for (int g = 0; g < GROUPS; g++) {
+                int ch = group_heat_chan(g);
+                if (ch >= 0) {
+                    int h = acc[k + ch];
+                    rest -= h;
+                    if (Cg[g] > 0.0) Tg[g] = float(h) * T_SCALE / (Cg[g] * float(cw)) - 273.15;
+                } else if (first < 0 && (P.group_mask & (1u << uint(g))) != 0u) {
+                    first = g;
+                }
+            }
+            if (first >= 0 && Cg[first] > 0.0) Tg[first] = float(rest) * T_SCALE / (Cg[first] * float(cw)) - 273.15;
+        }
+        // Pass 2: properties of each material at its concentration and its group's temperature.
+        for (int j = 0; j < P.n_present; j++) {
+            float share = sh[j];
+            if (share <= 0.0) continue;
+            int r = present_row(j);
+            ivec4 ia = mats[r].ia;
+            float s = sc[j];
+            vec4 ma = mats[r].a;
+            float rho_m = ma.x, lnu = ma.y, sig = ma.z;
+            float Tm = Tg[ia.x];
+            if (thermal) lnu += temp_law(r, Tm);
+            float xp = thermal ? expansion(uint(r), s, Tm) : 1.0;
+            vec2 cs = mats[r].b.xy;
+            if (ia.y >= 0) {
+                vec4 da = mats[ia.y].a;
+                rho_m = mix(da.x, rho_m, s);
+                lnu = mix(thermal ? da.y + temp_law(ia.y, Tm) : da.y, lnu, blend_share(s, mats[r].misc.z));
+                sig = mix(da.z, sig, s);
+                cs = mix(mats[ia.y].b.xy, cs, s);
+                int fam = mats[r].ib.x;
+                if (fam == 0) fam0 = s;
+                else if (fam > 0) mixb[i * nmix + fam - 1] = s;
+                if (settle && fam >= 0) famocc[i * P.n_fam + fam] = share * phi_f;
+            }
+            rho_m *= xp;
+            if (thermal) {
+                // Frozen liquid stays liquid to the solver, at the viscosity of
+                // `frozen_viscosity` (README, "Solidification"), and takes the solid's density.
+                vec4 th = thermal_of(uint(r), s);
+                float fs = th.y > -1e8 ? clamp((th.y - Tm) / max(th.y - th.x, 1e-3), 0.0, 1.0) : 0.0;
+                if (fs > 0.0) {
+                    lnu = mix(lnu, max(lnu, P.heat2.x), fs);
+                    float rs = mats[r].b.w;
+                    rho_m = mix(rho_m, ia.y >= 0 ? mix(mats[ia.y].b.w, rs, s) : rs, fs);
+                    frozen += share * fs;
+                }
+            }
+            if ((mats[r].ib.y != 0 || mats[r].temp.w > 0.0) && share > nn.x) nn = vec4(share, float(r), s, 0.0);
+            if (share > top_share) {
+                top_share = share;
+                top_row = r;
+            }
+            chi += share * mats[r].el.z;
+            int g = ia.x;
+            f[g] += share;
+            rg[g] += share * rho_m;
+            lg[g] += share * lnu;
+            sigma += share * sig;
+            contact += share * cs;
+        }
+        for (int g = 0; g < GROUPS; g++) {
+            if (f[g] <= 0.0) continue;
+            rho += rg[g];
+            mu += rg[g] * exp(lg[g] / f[g]);
+            if (f[g] > f[major]) major = g;
+        }
+        if (f[major] > 0.0) {
+            rho_c = rg[major] / f[major];
+            nu_c = exp(lg[major] / f[major]);
+        }
+        Craw = Csh * float(cw) / MASS_SCALE;
     }
     float phi_t = phi_f + sol.z;
 
     // Level > 0 marks a liquid cell. Sparse spray stays "air": it gets no pressure and
     // flies ballistically until it packs densely enough to count as liquid again.
     bool has = phi_f > 0.04 && sol.w > 0.02;
-    float level = has ? phi_t - P.fluid_thr : -P.fluid_thr;
+    float level = has ? phi_t - LIQUID_THR : -LIQUID_THR;
     // A thin cell squeezed between two liquid ones stays liquid. Liquid that is being
     // stretched (a falling stream) is under tension, and without this a one-cell crack
     // would count as a free surface, lose that tension and tear the stream into slugs.
@@ -64,7 +201,40 @@ void main() {
         if ((packed(i - 1) && packed(i + 1)) || (packed(i - W) && packed(i + W))) level = BRIDGE_LEVEL;
     }
 
+    // An open cell without liquid: its region has a free surface (see rhs.comp).
+    if (sol.w > 0.0 && level <= 0.0) {
+        uint bit = 1u << (region[i] & REGION_MASK);
+        if ((region_air & bit) == 0u) atomicOr(region_air, bit);
+    }
+
+    // The viscosity solve stops at `rigid_viscosity`; a cell that would need more is
+    // stiff, and moves rigidly (rigid.comp).
+    if (has_cap(CAP_RIGID | CAP_RHEO)) {
+        float cap = rho * exp(P.heat2.x);
+        if (mu >= cap && level > 0.0) nn.w = 1.0;
+        mu = min(mu, cap);
+        rh[i] = nn;
+    }
+    if (has_cap(CAP_MAGNET)) magc[i].x = chi * min(phi_f, 1.0);
+    if (has_cap(CAP_ELASTIC)) {
+        int ce = int(P.elastic.x);
+        estr[i] = vec4(acc[k + ce], acc[k + ce + 1], acc[k + ce + 2], 0.0) * (P.elastic.y * P.inv_ppc / STRESS_FIX);
+    }
     cell[i] = vec4(phi_f, rho, mu, level);
-    comp[i] = vec4(rho, oil, syr, phi_t);
+    comp[i] = vec4(rho, f[1], fam0, phi_t);
+    // Only read where phase groups meet (the drift in particles.comp, pair jumps).
+    if ((P.group_mask & (P.group_mask - 1u)) != 0u) {
+        aux[i] = vec4(nu_c, rho_c, f[2], f[3]);
+        grho[i] = vec4(rg[0], rg[1], rg[2], rg[3]);
+    }
+    // w: the majority phase group, plus (row + 1) / 128 of the material with the largest
+    // share for the renderer's wet map (surf_apply.comp truncates to the group).
+    sprop[i] = vec4(sigma, contact, float(major) + float(top_row + 1) / 128.0);
+    if (thermal) {
+        therm[i] = vec4(T, Craw, kappa, frozen);
+        // heat.comp reads the emissivity here, then stores its result; without conduction
+        // there is no heat pass and the particles must find nothing to take.
+        dheat[i] = vec4(P.heat.y > 0.0 ? emis : 0.0, 0.0, 0.0, 0.0);
+    }
     if (level <= 0.0) pres[i] = vec2(0.0);
 }

@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 
-// Curvature kappa = div(n) of both smoothed indicators, n the outward unit normal
+// Curvature kappa = div(n) of every smoothed indicator (liquid, and each phase group present), n the outward unit normal
 // (-grad f / |grad f|), taken at the four corners of each cell and differenced across it.
 // Positive kappa is a convex liquid (or oil) surface, whose inside pressure is higher.
 //
@@ -21,11 +21,18 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const float G_MIN = 0.05;   // smallest |grad f| (per cell) counted as an interface
+const float WALL_BAND = 0.5;
 
+// Field 0 is the liquid fraction, field g > 0 the share of phase group g.
 float field(ivec2 c, int k) {
     c = clamp(c, ivec2(0), P.grid - 1);
-    vec4 s = surf[cidx(c)];
-    return k == 0 ? s.x : s.y;
+    int i = cidx(c);
+    if (k < 2) {
+        vec4 s = surf[i];
+        return k == 0 ? s.x : s.y;
+    }
+    vec4 s2 = surf2[i];
+    return k == 2 ? s2.x : s2.y;
 }
 
 vec2 grad_node(ivec2 n, int k) {
@@ -40,10 +47,14 @@ float node_sdf(ivec2 n) {
 
 // Contact angle of the liquid in the cells around node n: cos, sin.
 vec2 contact(ivec2 n) {
-    vec4 m = comp[cidx(clamp(n, ivec2(0), P.grid - 1))];
-    vec2 aq = mix(P.contact_aq.xy, P.contact_aq.zw, m.z);
-    vec2 cs = mix(aq, P.contact_oil.xy, m.y);
-    return normalize(cs);
+    // Share-weighted over the cells around the node, so a node just ahead of the contact
+    // line (its own cells still empty) takes the angle of the liquid about to reach it.
+    vec2 cs = sprop[cidx(clamp(n, ivec2(0), P.grid - 1))].yz;
+    if (dot(cs, cs) > 1e-12) return normalize(cs);
+    for (int b = -3; b <= 2; b++)
+        for (int a = -3; a <= 2; a++)
+            cs += sprop[cidx(clamp(n + ivec2(a, b), ivec2(0), P.grid - 1))].yz * cell[cidx(clamp(n + ivec2(a, b), ivec2(0), P.grid - 1))].x;
+    return dot(cs, cs) > 1e-12 ? normalize(cs) : vec2(0.0, 1.0);
 }
 
 vec2 normal_node(ivec2 n, int k, out float mag) {
@@ -53,15 +64,25 @@ vec2 normal_node(ivec2 n, int k, out float mag) {
     vec2 nn = -g / mag;
     if (k == 0) {
         float d = node_sdf(n);
-        if (d < 1.5) {
+        if (d < WALL_BAND) {
             vec2 gw = vec2(node_sdf(n + ivec2(1, 0)) - node_sdf(n - ivec2(1, 0)), node_sdf(n + ivec2(0, 1)) - node_sdf(n - ivec2(0, 1)));
             if (length(gw) > 1e-4) {
                 vec2 nw = normalize(gw);
-                vec2 t = nn - dot(nn, nw) * nw;
-                if (length(t) > 1e-4) {
-                    t = normalize(t);
+                // The contact angle applies where the interface meets the wall: where the
+                // liquid fraction changes along it. A surface parallel to the wall (the top of
+                // a layer a few cells thick, whose gradient the smoothing carries down to the
+                // floor) has no contact line, and the in-wall direction of its normal is
+                // noise: bending it there gave neighbouring nodes opposite normals, a random
+                // curvature that pumped energy into thin layers until a resting non-wetting
+                // puddle broke up into a film over the whole floor.
+                vec2 gt = g - dot(g, nw) * nw;
+                float along = length(gt);
+                if (along > 0.5 * G_MIN) {
+                    vec2 t = -gt / along;  // along the wall, away from the liquid
                     vec2 cs = contact(n);
-                    nn = cs.x * nw + cs.y * t;
+                    vec2 nc = cs.x * nw + cs.y * t;
+                    vec2 m = mix(nn, nc, smoothstep(0.5 * G_MIN, G_MIN, along));
+                    nn = length(m) > 1e-4 ? normalize(m) : nc;
                 }
             }
         }
@@ -69,23 +90,32 @@ vec2 normal_node(ivec2 n, int k, out float mag) {
     return nn;
 }
 
+float curvature(ivec2 c, int k, float kmax) {
+    float m00, m10, m01, m11;
+    vec2 n00 = normal_node(c, k, m00);
+    vec2 n10 = normal_node(c + ivec2(1, 0), k, m10);
+    vec2 n01 = normal_node(c + ivec2(0, 1), k, m01);
+    vec2 n11 = normal_node(c + ivec2(1, 1), k, m11);
+    if (0.25 * (m00 + m10 + m01 + m11) < G_MIN) return 0.0;
+    float kap = 0.5 * (n10.x + n11.x - n00.x - n01.x) + 0.5 * (n01.y + n11.y - n00.y - n10.y);
+    return kmax > 0.0 ? clamp(kap, -kmax, kmax) : kap;  // params.rs: curvature_max
+}
+
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(c, P.grid))) return;
-    float kmax = P.contact_oil.z;
-    vec2 kappa = vec2(0.0);
-    for (int k = 0; k < 2; k++) {
-        float m00, m10, m01, m11;
-        vec2 n00 = normal_node(c, k, m00);
-        vec2 n10 = normal_node(c + ivec2(1, 0), k, m10);
-        vec2 n01 = normal_node(c + ivec2(0, 1), k, m01);
-        vec2 n11 = normal_node(c + ivec2(1, 1), k, m11);
-        if (0.25 * (m00 + m10 + m01 + m11) < G_MIN) continue;
-        float kap = 0.5 * (n10.x + n11.x - n00.x - n01.x) + 0.5 * (n01.y + n11.y - n00.y - n10.y);
-        kappa[k] = clamp(kap, -kmax, kmax);
-    }
+    float kmax = P.misc.x;
     int i = cidx(c);
+    // The liquid and group 1 (oil-like) share a buffer and are always done; groups 2 and 3
+    // (liquid metal, silicate melt) only while the tank holds them.
+    vec2 kappa = vec2(0.0);
+    for (int k = 0; k < 2; k++) kappa[k] = curvature(c, k, kmax);
     vec4 o = surf[i];
     o.zw = kappa;
     surf[i] = o;
+    if ((P.group_mask & 12u) != 0u) {
+        vec4 o2 = surf2[i];
+        o2.zw = vec2((P.group_mask & 4u) != 0u ? curvature(c, 2, kmax) : 0.0, (P.group_mask & 8u) != 0u ? curvature(c, 3, kmax) : 0.0);
+        surf2[i] = o2;
+    }
 }

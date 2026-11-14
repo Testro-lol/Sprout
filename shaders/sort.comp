@@ -30,23 +30,23 @@ void main() {
     int W = P.grid.x;
     if (pc.stage == 0u) {
         if (id >= P.n_slots || particles[id].kind == KIND_DEAD) return;
-        atomicAdd(acc[cell_of(particles[id].pos) * ACC_STRIDE + 7], 1);
+        atomicAdd(acc[cell_of(particles[id].pos) * P.acc_stride + 7], 1);
     } else if (pc.stage == 1u) {
         if (id >= uint(P.grid.y)) return;
         int first = int(id) * W;
         int run = 0;
         for (int x = 0; x < W; x++) {
-            int k = (first + x) * ACC_STRIDE + 7;
+            int k = (first + x) * P.acc_stride + 7;
             int n = acc[k];
             acc[k] = run;
             run += n;
         }
-        acc[first * ACC_STRIDE + 6] = run;
+        acc[first * P.acc_stride + 6] = run;
     } else if (pc.stage == 2u) {
         if (id != 0u) return;
         int run = 0;
         for (int y = 0; y < P.grid.y; y++) {
-            int k = y * W * ACC_STRIDE + 6;
+            int k = y * W * P.acc_stride + 6;
             int n = acc[k];
             acc[k] = run;
             run += n;
@@ -57,7 +57,8 @@ void main() {
         if (p.kind == KIND_DEAD) return;
         int c = cell_of(p.pos);
         int first = (c / W) * W;
-        int dst = acc[first * ACC_STRIDE + 6] + atomicAdd(acc[c * ACC_STRIDE + 7], 1);
+        int dst = acc[first * P.acc_stride + 6] + atomicAdd(acc[c * P.acc_stride + 7], 1);
         sorted[dst] = p;
+        if (has_cap(CAP_ELASTIC)) pstress2[dst] = pstress[id];
     }
 }

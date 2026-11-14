@@ -70,6 +70,13 @@ impl Offscreen {
         submit_and_wait(&self.gpu, b);
     }
 
+    /// Notes which solids are wet at this moment (see `Renderer::track`).
+    pub fn track(&mut self, sim: &FluidSim) {
+        let mut b = self.gpu.builder();
+        self.renderer.track(&mut b, sim);
+        submit_and_wait(&self.gpu, b);
+    }
+
     /// Renders the simulation and returns RGBA8 pixels.
     pub fn capture(&mut self, sim: &FluidSim, view: View) -> Vec<u8> {
         self.capture_with(sim, view, |_| {}, |_| {})
@@ -127,9 +134,15 @@ pub fn shot(gpu: Arc<Gpu>, o: ShotOptions, apply: &dyn Fn(&mut crate::sim::SimPa
     let start = Instant::now();
     world.sim.step_blocking(0, ToolState::default());
     for (k, &t) in o.times.iter().enumerate() {
-        let left = t as f64 - world.sim.sim_time();
-        if left > 0.0 {
-            world.sim.advance_blocking(left, ToolState::default());
+        // In pieces of about 1/30 s, noting what is wet after each, as the app does every
+        // frame. (A fixed number of pieces: `advance_blocking` stops within a sliver of its
+        // goal, so "until the time is reached" would never end.)
+        let from = world.sim.sim_time();
+        let pieces = ((t as f64 - from) * 30.0).ceil().max(0.0) as u32;
+        for k in 1..=pieces {
+            let goal = from + (t as f64 - from) * k as f64 / pieces as f64;
+            world.sim.advance_blocking((goal - world.sim.sim_time()).max(0.0), ToolState::default());
+            off.track(&world.sim);
         }
         let path = if o.times.len() == 1 { o.out.clone() } else { o.out.replace(".png", &format!("_{k}.png")) };
         if o.with_ui {
@@ -166,14 +179,21 @@ fn ui_frame(gpu: &Arc<Gpu>, off: &mut Offscreen, world: &mut World, view: View, 
     let cursor = [world.sim.grid[0] as f32 * 0.62, world.sim.grid[1] as f32 * 0.7];
     let mut deltas = Vec::new();
     let mut shapes = Vec::new();
+    let mut swatches = crate::editor::Swatches::new(gpu.clone());
+    // `SPROUT_UI_LIQUIDS=1`: the picker and the editor open too (for the README pictures).
+    if std::env::var_os("SPROUT_UI_LIQUIDS").is_some() {
+        state.editor.picker_open = true;
+        state.editor.duplicate(world, Material::Chocolate.index());
+        state.editor.draft.viscosity *= 3.0;
+    }
     for frame in 0..30 {
         let input = egui::RawInput { time: Some(frame as f64 / 30.0), ..input.clone() };
         let out = ctx.run(input, |ctx| {
-            ui::build(ctx, &mut state, world);
+            ui::build(ctx, &mut state, world, &mut swatches);
             if frame == 0 {
                 overlay.toast_map(ctx, world.map);
             }
-            overlay.draw(ctx, &state, view, size, Some(cursor), false, false, None, world.currents(), None);
+            overlay.draw(ctx, &state, view, size, Some(cursor), false, false, None, world.currents(), world.sim.magnets());
         });
         deltas.push(out.textures_delta);
         shapes = out.shapes;
@@ -199,7 +219,7 @@ fn ui_frame(gpu: &Arc<Gpu>, off: &mut Offscreen, world: &mut World, view: View, 
 use crate::{
     maps::fill_rect,
     scene::Scene,
-    sim::{KIND_OIL, Material, Particle, SimParams},
+    sim::{Material, Particle, SimParams},
 };
 
 /// Bulk measurements of a particle snapshot.
@@ -224,7 +244,7 @@ pub fn diagnose(ps: &[Particle], params: &SimParams) -> Diag {
     let mut ys: Vec<f32> = Vec::with_capacity(ps.len());
     let mut pe = 0.0f64;
     for p in ps {
-        let rho = if p.kind == KIND_OIL { params.rho[2] } else { params.rho[0] + (params.rho[1] - params.rho[0]) * p.s };
+        let rho = p.density(params);
         let v2 = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1];
         d.ke += 0.5 * rho * v2;
         pe += (params.g_cells() * rho * p.pos[1]) as f64;
@@ -262,6 +282,7 @@ pub fn probe(gpu: Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), map:
         "t", "ke", "pe", "ke+pe", "max_speed", "mean_y", "top_y", "dt ms", "p it", "v it", "u grid", "u part"
     );
     let mut worst = (0.0f32, 0.0f32);
+    let e0 = crate::sim::heat_content(&world.sim.download_particles(), &world.sim.params);
     for s in 0..=samples {
         let d = diagnose(&world.sim.download_particles(), &world.sim.params);
         let _ = world.sim.download_pressure();
@@ -276,6 +297,16 @@ pub fn probe(gpu: Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), map:
         if s < samples {
             world.sim.advance_blocking(seconds as f64 / samples as f64, ToolState::default());
         }
+    }
+    if world.sim.thermal() {
+        let ps = world.sim.download_particles();
+        let l = world.sim.download_ledger();
+        let e1 = crate::sim::heat_content(&ps, &world.sim.params);
+        let lost: u32 = l.boiled_count.iter().sum();
+        println!(
+            "heat (J/m): content {:.4e} -> {:.4e}, change {:+.4e}; in from air {:.3e} solids {:.3e} brush {:.3e}; out to air {:.3e} solids {:.3e} brush {:.3e} boiled {:.3e} ({} particles lost); unaccounted {:+.3e}",
+            e0, e1, e1 - e0, l.from_air, l.from_solids, l.heated, l.to_air, l.to_solids, l.cooled, l.boiled, lost, (e1 - e0) - l.net_in()
+        );
     }
     let st = world.sim.solver;
     println!(
@@ -421,4 +452,363 @@ pub fn profile(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], ma
         crate::maps::MAPS[map].name, grid[0], grid[1], world.sim.slots(), substeps / n as f64,
         rec * 1e3 / n as f64, exec * 1e3 / n as f64, rec * 1e3 / substeps, exec * 1e3 / substeps
     );
+}
+
+// ---- gallery -------------------------------------------------------------------------
+
+/// Renders a fixed set of pictures that covers every liquid, every way two of them meet and
+/// every tool, at several zoom levels and resolutions (`sprout gallery DIR`). The scenes are
+/// deterministic, so two builds can be compared picture by picture.
+pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut SimParams)) {
+    use crate::{scene::WALL, sim::Current, world::Source};
+    const SIZE: [u32; 2] = [1280, 720];
+    const G: [u32; 2] = [512, 288];
+    std::fs::create_dir_all(dir).expect("cannot create the gallery directory");
+    let off = RefCell::new(Offscreen::new(gpu.clone(), SIZE));
+    let start = Instant::now();
+    let wants = |name: &str| only.is_none_or(|o| name.starts_with(o));
+    let save = |world: &World, name: &str, view: View| {
+        off.borrow_mut().save_png(&world.sim, view, &Path::new(dir).join(format!("{name}.png")));
+        println!("{name:<22} t = {:5.2} s   ({:.1} s wall)", world.sim.sim_time(), start.elapsed().as_secs_f32());
+    };
+    let map = |name: &str, grid: [u32; 2], t: f64| {
+        let index = crate::maps::MAPS.iter().position(|m| m.name == name).expect("built-in map");
+        let mut world = World::new(gpu.clone(), grid, index);
+        apply(&mut world.sim.params);
+        // Every scene builds its own world, so drop what the last one left cached.
+        off.borrow_mut().renderer.invalidate();
+        world.sim.step_blocking(0, ToolState::default());
+        world.sim.advance_blocking(t, ToolState::default());
+        world
+    };
+    let pool = |fills: &[([f32; 4], Material)], shapes: &[crate::scene::Shape]| {
+        let mut scene = Scene::new(G);
+        scene.shapes.extend_from_slice(shapes);
+        let mut ps = Vec::new();
+        for &(r, m) in fills {
+            fill_rect(&scene, r, m, &mut ps);
+        }
+        let mut world = World::custom(gpu.clone(), scene, ps);
+        apply(&mut world.sim.params);
+        off.borrow_mut().renderer.invalidate();
+        world.sim.step_blocking(0, ToolState::default());
+        world
+    };
+    // A brush held still for `seconds`, in 1/60 s frames as the app drives it.
+    let hold = |w: &mut World, source: Source, material: Material, at: [f32; 2], radius: f32, rate: f32, seconds: f32| {
+        for _ in 0..(seconds * 60.0).round() as usize {
+            w.emit(source, material, at, radius, rate, 1.0 / 60.0);
+            w.sim.advance_blocking(1.0 / 60.0, source.nozzle(at, radius, rate));
+            off.borrow_mut().track(&w.sim);
+        }
+        w.end_stroke();
+    };
+    // Nothing held, for `seconds`, in the same frames.
+    let wait = |w: &mut World, seconds: f32| {
+        for _ in 0..(seconds * 60.0).round() as usize {
+            w.sim.advance_blocking(1.0 / 60.0, ToolState::default());
+            off.borrow_mut().track(&w.sim);
+        }
+    };
+    let fit = View::fit(G, SIZE);
+    let zoom = |center: [f32; 2], factor: f32| View { center, zoom: fit.zoom * factor };
+
+    // Each liquid on its own, moving.
+    if wants("water") {
+        let w = map("Dam Break", G, 1.15);
+        save(&w, "water_dam", fit);
+        save(&w, "water_dam_zoom", zoom([300.0, 60.0], 3.0));
+    }
+    if wants("syrup") {
+        let mut w = pool(&[([150.0, 0.0, 250.0, 150.0], Material::Syrup)], &[crate::scene::Shape::Circle { c: [330.0, 30.0], r: 22.0 }]);
+        w.sim.advance_blocking(2.5, ToolState::default());
+        save(&w, "syrup_slump", fit);
+        save(&w, "syrup_slump_zoom", zoom([300.0, 45.0], 3.0));
+    }
+    if wants("oil") {
+        let mut w = pool(&[([150.0, 0.0, 250.0, 150.0], Material::Oil)], &[crate::scene::Shape::Circle { c: [330.0, 30.0], r: 22.0 }]);
+        w.sim.advance_blocking(0.9, ToolState::default());
+        save(&w, "oil_collapse", fit);
+        save(&w, "oil_collapse_zoom", zoom([300.0, 45.0], 3.0));
+    }
+    // Liquids meeting.
+    if wants("playground") {
+        let w = map("Playground", G, 1.3);
+        save(&w, "playground_impact", fit);
+        save(&w, "playground_impact_zoom", zoom([130.0, 45.0], 3.0));
+        save(&w, "playground_syrup_zoom", zoom([330.0, 60.0], 3.0));
+    }
+    if wants("overturn") {
+        let mut w = map("Upside Down", G, 5.0);
+        save(&w, "overturn_5s", fit);
+        save(&w, "overturn_5s_zoom", zoom([256.0, 90.0], 3.0));
+        w.sim.advance_blocking(20.0, ToolState::default());
+        save(&w, "overturn_25s", fit);
+        save(&w, "overturn_25s_zoom", zoom([256.0, 110.0], 4.0));
+    }
+    if wants("columns") {
+        let w = map("Three Columns", G, 2.0);
+        save(&w, "columns_2s", fit);
+    }
+    if wants("mix") {
+        let mut w = pool(&[([0.0, 0.0, 512.0, 110.0], Material::Water)], &[]);
+        hold(&mut w, Source::Pour, Material::Syrup, [256.0, 200.0], 9.0, 12000.0, 2.0);
+        save(&w, "mix_syrup_pour", fit);
+        save(&w, "mix_syrup_pour_zoom", zoom([256.0, 75.0], 3.0));
+    }
+    // Blood stirred into water: a dispersing, half-mixed plume (per-cell concentration).
+    if wants("mix") {
+        let mut w = pool(&[([0.0, 0.0, 512.0, 110.0], Material::Water)], &[]);
+        hold(&mut w, Source::Pour, Material::Blood, [256.0, 200.0], 9.0, 12000.0, 1.5);
+        wait(&mut w, 3.0);
+        save(&w, "mix_blood", fit);
+        save(&w, "mix_blood_zoom", zoom([256.0, 60.0], 3.0));
+    }
+    // Small droplets inside another liquid: clusters of 1, 2, 4, 9 and 16 particles of lava and
+    // of oil in water, and of water in lava and in oil, shortly after they were placed (and six
+    // consecutive frames of the first, for the flicker count).
+    if wants("droplets") {
+        let seed = |host: Material, guests: [Material; 2]| {
+            let scene = Scene::new(G);
+            let mut ps = Vec::new();
+            fill_rect(&scene, [0.0, 0.0, 512.0, 120.0], host, &mut ps);
+            for (row, &m) in guests.iter().enumerate() {
+                for (k, n) in [1usize, 2, 4, 9, 16].into_iter().enumerate() {
+                    let c = [176.0 + 40.0 * k as f32, 50.0 + 40.0 * row as f32];
+                    let mut idx: Vec<usize> = (0..ps.len()).collect();
+                    let d2 = |p: &Particle| (p.pos[0] - c[0]).powi(2) + (p.pos[1] - c[1]).powi(2);
+                    idx.sort_by(|&a, &b| d2(&ps[a]).total_cmp(&d2(&ps[b])));
+                    for &i in &idx[..n] {
+                        ps[i] = Particle::new(m, ps[i].pos, [0.0, 0.0]);
+                    }
+                }
+            }
+            let mut w = World::custom(gpu.clone(), scene, ps);
+            apply(&mut w.sim.params);
+            off.borrow_mut().renderer.invalidate();
+            w.sim.step_blocking(0, ToolState::default());
+            w
+        };
+        for (name, host, guests) in [
+            ("droplets_in_water", Material::Water, [Material::Lava, Material::Oil]),
+            ("droplets_in_lava", Material::Lava, [Material::Water, Material::Oil]),
+            ("droplets_in_oil", Material::Oil, [Material::Water, Material::Lava]),
+        ] {
+            let mut w = seed(host, guests);
+            wait(&mut w, 0.15);
+            save(&w, name, zoom([256.0, 70.0], 2.4));
+            if host == Material::Water {
+                for k in 0..6 {
+                    save(&w, &format!("motion_droplets_{k}"), zoom([256.0, 70.0], 2.4));
+                    wait(&mut w, 1.0 / 60.0);
+                }
+            }
+        }
+    }
+    // The effects (README, "Look"): glow and crust of lava, stains, glints, thin films,
+    // a metal mirroring a melt.
+    if wants("fx") {
+        let wall = |x: f32| crate::scene::Shape::Box { c: [x, 50.0], half: [4.0, 48.0], angle: 0.0 };
+        // A cup of lava, freshly poured, then cooling.
+        let mut w = pool(&[([200.0, WALL, 312.0, 60.0], Material::Lava)], &[wall(196.0), wall(316.0)]);
+        wait(&mut w, 1.0);
+        save(&w, "fx_lava", zoom([256.0, 60.0], 3.0));
+        wait(&mut w, 14.0);
+        save(&w, "fx_lava_cooling", zoom([256.0, 60.0], 3.0));
+        // Blood sprayed at a wall and left to drain.
+        let mut w = pool(&[], &[wall(330.0)]);
+        hold(&mut w, Source::Spray, Material::Blood, [270.0, 60.0], 8.0, 20000.0, 1.0);
+        save(&w, "fx_blood_spray", zoom([300.0, 50.0], 3.0));
+        wait(&mut w, 4.0);
+        save(&w, "fx_blood_stains", zoom([300.0, 50.0], 3.0));
+        save(&w, "fx_blood_stains_zoom8", zoom([325.0, 40.0], 8.0));
+        // Honey over a ball, close.
+        let mut w = pool(&[], &[crate::scene::Shape::Circle { c: [256.0, 80.0], r: 30.0 }]);
+        hold(&mut w, Source::Pour, Material::Syrup, [250.0, 200.0], 7.0, 8000.0, 2.5);
+        save(&w, "fx_honey", zoom([256.0, 100.0], 4.0));
+        save(&w, "fx_honey_zoom8", zoom([240.0, 112.0], 8.0));
+        // A thin layer of oil on water.
+        let mut w = pool(&[([0.0, 0.0, 512.0, 60.0], Material::Water), ([0.0, 60.0, 512.0, 64.0], Material::Oil)], &[]);
+        hold(&mut w, Source::Pour, Material::Oil, [256.0, 160.0], 5.0, 4000.0, 1.0);
+        wait(&mut w, 1.5);
+        save(&w, "fx_oil_film", zoom([256.0, 62.0], 5.0));
+        // Mercury beside a lava pool: it mirrors the glow.
+        let mut w = pool(&[([150.0, WALL, 250.0, 40.0], Material::Mercury), ([262.0, WALL, 362.0, 40.0], Material::Lava)], &[wall(256.0)]);
+        wait(&mut w, 1.0);
+        save(&w, "fx_mercury_lava", zoom([256.0, 35.0], 3.5));
+        // Six frames, to look for flicker in the glow and crust.
+        let mut w = pool(&[([200.0, WALL, 312.0, 60.0], Material::Lava)], &[wall(196.0), wall(316.0)]);
+        wait(&mut w, 6.0);
+        for k in 0..6 {
+            save(&w, &format!("motion_fx_lava_{k}"), zoom([256.0, 70.0], 3.0));
+            wait(&mut w, 1.0 / 60.0);
+        }
+    }
+    // Tools.
+    if wants("spray") {
+        let mut w = pool(&[([0.0, 0.0, 512.0, 50.0], Material::Water)], &[]);
+        hold(&mut w, Source::Spray, Material::Water, [180.0, 170.0], 12.0, 30000.0, 0.7);
+        hold(&mut w, Source::Spray, Material::Oil, [330.0, 150.0], 12.0, 30000.0, 0.5);
+        save(&w, "spray", fit);
+        save(&w, "spray_zoom", zoom([300.0, 110.0], 2.5));
+    }
+    if wants("jet") {
+        let mut w = pool(&[([0.0, 0.0, 512.0, 90.0], Material::Water), ([0.0, 90.0, 512.0, 115.0], Material::Oil)], &[]);
+        w.sim.advance_blocking(0.5, ToolState::default());
+        hold(&mut w, Source::Jet { angle: -70.0 }, Material::Water, [120.0, 60.0], 9.0, 20000.0, 1.2);
+        save(&w, "jet_in_pool", fit);
+        save(&w, "jet_in_pool_zoom", zoom([230.0, 80.0], 2.5));
+        let mut w = pool(&[([0.0, 0.0, 512.0, 60.0], Material::Water)], &[]);
+        hold(&mut w, Source::Jet { angle: 60.0 }, Material::Water, [380.0, 200.0], 9.0, 20000.0, 0.9);
+        save(&w, "jet_impact", fit);
+        save(&w, "jet_impact_zoom", zoom([200.0, 60.0], 2.5));
+    }
+    if wants("current") {
+        let mut w = pool(&[([0.0, 0.0, 512.0, 80.0], Material::Water), ([0.0, 80.0, 512.0, 105.0], Material::Oil), ([0.0, 0.0, 512.0, WALL + 18.0], Material::Syrup)], &[]);
+        w.add_current(Current::new([256.0, 55.0], 16.0, 90.0, 1.0));
+        w.sim.advance_blocking(3.0, ToolState::default());
+        save(&w, "current_in_pool", fit);
+        save(&w, "current_in_pool_zoom", zoom([300.0, 65.0], 2.5));
+    }
+    if wants("pour") {
+        let mut w = pool(&[], &[crate::scene::Shape::Circle { c: [256.0, 80.0], r: 30.0 }]);
+        hold(&mut w, Source::Pour, Material::Syrup, [250.0, 200.0], 7.0, 8000.0, 2.5);
+        save(&w, "pour_syrup_on_ball", fit);
+        save(&w, "pour_syrup_on_ball_zoom", zoom([256.0, 90.0], 3.0));
+        let mut w = pool(&[], &[crate::scene::Shape::Circle { c: [256.0, 80.0], r: 30.0 }]);
+        hold(&mut w, Source::Pour, Material::Water, [250.0, 200.0], 7.0, 8000.0, 1.2);
+        save(&w, "pour_water_on_ball", fit);
+        save(&w, "pour_water_on_ball_zoom", zoom([256.0, 90.0], 3.0));
+    }
+    // Cooling a stirred pool: ice and the half-mixed liquid around it (per-cell fields; they
+    // looked pixelated before the optics blur, README "Look").
+    if wants("freeze") {
+        let mut w = map("Playground", G, 3.0);
+        for k in 0..240 {
+            let ph = k as f32 / 240.0 * std::f32::consts::TAU;
+            let at = [200.0 + 40.0 * ph.sin(), 40.0 + 12.0 * (2.0 * ph).sin()];
+            w.sim.advance_blocking(1.0 / 60.0, ToolState::heat(at, 13.0, true));
+            off.borrow_mut().track(&w.sim);
+        }
+        wait(&mut w, 1.0);
+        save(&w, "freeze_pool", fit);
+        save(&w, "freeze_pool_zoom", zoom([200.0, 40.0], 3.0));
+        save(&w, "freeze_pool_zoom8", zoom([200.0, 40.0], 8.0));
+    }
+    // Liquid on solids.
+    if wants("wet") {
+        // Each liquid poured over a ball and left to run off: what it leaves behind.
+        let ball = |x: f32| crate::scene::Shape::Circle { c: [x, 90.0], r: 24.0 };
+        let mut w = pool(&[], &[ball(110.0), ball(256.0), ball(402.0)]);
+        hold(&mut w, Source::Pour, Material::Syrup, [398.0, 190.0], 6.0, 6000.0, 1.0);
+        hold(&mut w, Source::Pour, Material::Oil, [252.0, 190.0], 6.0, 6000.0, 1.0);
+        hold(&mut w, Source::Pour, Material::Water, [106.0, 190.0], 6.0, 6000.0, 1.0);
+        wait(&mut w, 0.25);
+        save(&w, "wet_running_off", fit);
+        wait(&mut w, 1.25);
+        save(&w, "wet_after", fit);
+        save(&w, "wet_after_zoom", zoom([256.0, 95.0], 2.4));
+    }
+    if wants("plank") {
+        // Blood poured over the end of the Playground plank: the wet edge of a slanted solid,
+        // close up.
+        let mut w = map("Playground", G, 0.0);
+        hold(&mut w, Source::Pour, Material::Blood, [60.0, 230.0], 8.0, 4000.0, 1.5);
+        wait(&mut w, 1.0);
+        save(&w, "plank_wet", zoom([80.0, 180.0], 3.0));
+        save(&w, "plank_wet_zoom8", zoom([70.0, 182.0], 8.0));
+        save(&w, "plank_wet_zoom20", zoom([60.0, 186.0], 20.0));
+        // The same plank deep under blood, water and oil.
+        let plank = crate::scene::Shape::Box { c: [134.4, 166.4], half: [93.8, 3.2], angle: (-51.2f32).atan2(179.2) };
+        let mut w = pool(
+            &[([0.0, 0.0, 512.0, 150.0], Material::Blood), ([0.0, 150.0, 300.0, 270.0], Material::Water), ([300.0, 150.0, 512.0, 270.0], Material::Oil)],
+            &[plank],
+        );
+        wait(&mut w, 2.0);
+        save(&w, "plank_deep", zoom([80.0, 180.0], 3.0));
+        save(&w, "plank_deep_zoom8", zoom([70.0, 182.0], 8.0));
+        save(&w, "plank_deep_zoom20", zoom([60.0, 186.0], 20.0));
+    }
+    if wants("cascade") {
+        let w = map("Cascade", G, 2.2);
+        save(&w, "cascade", fit);
+        save(&w, "cascade_zoom", zoom([120.0, 200.0], 3.0));
+    }
+    if wants("drops") {
+        let w = map("Oil Drops", G, 0.5);
+        save(&w, "drops", fit);
+        save(&w, "drops_zoom", zoom([400.0, 165.0], 4.0));
+    }
+    if wants("pinball") {
+        let w = map("Pinball Garden", G, 1.4);
+        save(&w, "pinball", fit);
+    }
+    // Consecutive frames, to look for flicker (see README, "Look").
+    if wants("motion") {
+        for (name, t, view) in [
+            ("Playground", 1.3, zoom([130.0, 45.0], 3.0)),
+            ("Upside Down", 5.0, zoom([256.0, 90.0], 3.0)),
+            ("Dam Break", 1.15, fit),
+            ("Lava Meets Water", 6.0, zoom([230.0, 60.0], 2.5)),
+            ("Ferrofluid", 3.0, zoom([256.0, 30.0], 3.0)),
+            ("Kitchen", 4.0, zoom([380.0, 70.0], 2.0)),
+        ] {
+            let mut w = map(name, G, t);
+            for k in 0..6 {
+                save(&w, &format!("motion_{}_{k}", name.to_lowercase().replace(' ', "_")), view);
+                wait(&mut w, 1.0 / 60.0);
+            }
+        }
+    }
+    // Every liquid on its own: a block dropped into a cup with a peg, 1.6 s later.
+    for (row, b) in crate::sim::BUILTINS.iter().enumerate() {
+        let name = format!("liquid_{}", b.key);
+        if !crate::sim::pickable(row) || !wants(&name) {
+            continue;
+        }
+        let m = Material(row as u8);
+        // A cup with a peg in it.
+        let wall = |x: f32| crate::scene::Shape::Box { c: [x, 40.0], half: [4.0, 38.0], angle: 0.0 };
+        let peg = crate::scene::Shape::Circle { c: [236.0, 20.0], r: 8.0 };
+        let mut w = pool(&[([226.0, 40.0, 296.0, 90.0], m)], &[wall(176.0), wall(336.0), peg]);
+        wait(&mut w, 1.6);
+        save(&w, &name, zoom([256.0, 55.0], 2.2));
+    }
+    // The new maps, and the interactions they are about.
+    for (name, file, t, view) in [
+        ("Lava Meets Water", "lava_water", 8.0, zoom([200.0, 60.0], 2.0)),
+        ("Density Tower", "density_tower", 12.0, zoom([256.0, 60.0], 2.2)),
+        ("Glass and Slime", "glass_slime", 4.0, fit),
+        ("Mud Flats", "mud_flats", 6.0, fit),
+        ("Ferrofluid", "ferrofluid_spikes", 4.0, zoom([256.0, 30.0], 3.0)),
+        ("Kitchen", "kitchen", 8.0, fit),
+        ("Cold Snap", "cold_snap", 30.0, fit),
+        ("Gallium", "gallium", 3.0, fit),
+    ] {
+        if !wants(file) {
+            continue;
+        }
+        let mut w = map(name, G, 0.0);
+        // In frames, so that the wet map and the drying films follow.
+        wait(&mut w, t as f32);
+        save(&w, file, fit);
+        save(&w, &format!("{file}_zoom"), view);
+    }
+
+    // Zoom and resolution: far out, very close, and the coarsest and finest presets.
+    if wants("zoom") {
+        let w = map("Playground", G, 3.0);
+        save(&w, "zoom_out", zoom([256.0, 144.0], 0.6));
+        save(&w, "zoom_in_8x", zoom([330.0, 68.0], 8.0));
+        save(&w, "zoom_in_20x", zoom([330.0, 70.0], 20.0));
+    }
+    if wants("quality") {
+        for (label, grid) in [("low", [384, 216]), ("ultra", [1024, 576])] {
+            let w = map("Playground", grid, 1.3);
+            let fit = View::fit(grid, SIZE);
+            save(&w, &format!("quality_{label}"), fit);
+            let s = grid[0] as f32 / 512.0;
+            save(&w, &format!("quality_{label}_zoom"), View { center: [130.0 * s, 45.0 * s], zoom: fit.zoom * 3.0 });
+        }
+    }
 }

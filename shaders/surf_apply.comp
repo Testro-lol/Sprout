@@ -7,12 +7,12 @@
 //
 // Liquid-air: the air side of a face takes the Dirichlet value P = sigma * kappa at the
 // interface (sub-cell position from the liquid level, as for the free surface itself).
-// sigma is that of the liquid on the face: water, syrup or oil against air, blended by
-// composition. pjump holds that air-side value.
+// sigma is that of the liquid on the face: its materials' tensions against air, blended by
+// composition (grid_prep.comp). pjump holds that air-side value.
 //
-// Oil-aqueous: both sides are liquid. Where the oil fraction crosses 1/2 between two cells,
-// the pressure must jump by sigma_oa * kappa across the face (higher on the oil side of a
-// convex oil surface). pjump holds that jump as P(this cell) - P(the neighbour behind),
+// Between phase groups: both sides are liquid. Where the majority group changes between two
+// cells, the pressure must jump by sigma_ab * kappa across the face (P.pair holds the
+// tension of every pair of groups; see pair_jump). pjump holds that jump as P(this cell) - P(the neighbour behind),
 // and rhs.comp / project.comp subtract it from the pressure difference. The jump and the
 // pressure gradient use the same face coefficient, so a jump of the right size is balanced
 // exactly and drives no flow ("balanced force").
@@ -22,10 +22,6 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-float sigma_air(vec4 m) {
-    return mix(mix(P.sigma.x, P.sigma.y, m.z), P.sigma.z, m.y);
-}
-
 // Ghost pressure (* dt) on the face between cells a and b, one liquid, one air.
 float air_jump(int a, int b) {
     bool la = cell[a].w > 0.0;
@@ -34,25 +30,41 @@ float air_jump(int a, int b) {
     float theta = clamp(lf / (lf - lg), THETA_MIN, 1.0);
     float kl = surf[liq].z, kg = surf[air].z;
     float kap = kg != 0.0 ? mix(kl, kg, theta) : kl;
-    return S.dt * sigma_air(comp[liq]) * kap;
+    return S.dt * sprop[liq].x * kap;
 }
 
-// Jump P(c) - P(n) (* dt) across the liquid-liquid face between n (behind) and c.
-float oil_jump(int c, int n) {
-    float oc = comp[c].y, on = comp[n].y;
-    if ((oc - 0.5) * (on - 0.5) >= 0.0) return 0.0;
-    float theta = (0.5 - on) / (oc - on);  // interface position from n towards c
-    float kc = surf[c].w, kn = surf[n].w;
+// Share of phase group g in cell i, and the curvature of its smoothed indicator.
+float share_of(int i, int g) {
+    if (g == 1) return comp[i].y;
+    if (g == 2) return aux[i].z;
+    if (g == 3) return aux[i].w;
+    return 1.0 - comp[i].y - aux[i].z - aux[i].w;
+}
+float curv_of(int i, int g) { return g == 1 ? surf[i].w : g == 2 ? surf2[i].z : surf2[i].w; }
+
+// Jump P(c) - P(n) (* dt) across the liquid-liquid face between n (behind) and c: non-zero
+// where the two cells belong to different phase groups. The interface is that of the
+// higher-numbered group of the pair (oil against water: the oil's), located where the two
+// groups' shares are equal; its curvature is taken from that group's indicator, and the
+// pressure is higher on its side where it is convex.
+float pair_jump(int c, int n) {
+    int gc = int(sprop[c].w), gn = int(sprop[n].w);
+    if (gc == gn) return 0.0;
+    int hi = max(gc, gn), lo = min(gc, gn);
+    float dc = share_of(c, hi) - share_of(c, lo), dn = share_of(n, hi) - share_of(n, lo);
+    if (dc * dn >= 0.0) return 0.0;
+    float theta = -dn / (dc - dn);  // interface position from n towards c
+    float kc = curv_of(c, hi), kn = curv_of(n, hi);
     float kap = kc == 0.0 ? kn : kn == 0.0 ? kc : mix(kn, kc, theta);
-    float j = S.dt * P.sigma.w * kap;
-    return oc > on ? j : -j;
+    float j = S.dt * P.pair[hi][lo] * kap;
+    return gc == hi ? j : -j;
 }
 
 float face_jump(int c, int n, float open) {
     if (open <= 0.0) return 0.0;
     bool lc = cell[c].w > 0.0, ln = cell[n].w > 0.0;
     if (lc != ln) return air_jump(c, n);
-    if (lc && ln) return oil_jump(c, n);
+    if (lc && ln) return pair_jump(c, n);
     return 0.0;
 }
 

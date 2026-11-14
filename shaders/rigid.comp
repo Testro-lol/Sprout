@@ -1,0 +1,196 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Frozen liquid moves as rigid bodies (README, "Solidification"): the rigid-fluid method of
+// Carlson et al. (2004). The whole tank, frozen parts included, is solved as liquid; then,
+// after the projection, the velocity inside each connected frozen body is replaced by the
+// rigid motion with the same linear and angular momentum. Pressure (buoyancy, contact with
+// the floor) acts on a body through the liquid solve; the projection only removes its
+// deformation, so a block of ice floats and keeps its shape, and melts back into liquid
+// particle by particle when it warms.
+//
+// Five passes (push constant `mode`), over the grid:
+//   0  label:    every rigid cell (frozen share > RIGID_SHARE) is its own body
+//   1  union:    join each rigid cell with its rigid neighbours (8-connected; union-find
+//                with atomicMin, Playne & Hawick 2018); the root is the smallest index
+//   2  compress: point every cell at its root; each root claims a slot in the body table
+//   3  sum:      mass, centre of mass, momentum, angular momentum and inertia per body,
+//                and its contacts with solids (common.glsl: body_contact), as exact 64-bit
+//                fixed-point sums (deterministic, whatever the order)
+//   4  apply:    faces with rigid cells of one body on both sides take its rigid velocity
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform RPC {
+    uint mode;
+} R;
+
+const float RIGID_SHARE = 0.5;
+
+// Rigid: liquid that is mostly frozen, too viscous to flow (grid_prep.comp), or, after the
+// solve, a non-Newtonian cell that does not flow: its stress mu g stays below its yield
+// stress (an unyielded plug), or its viscosity at the shear rate it now has reaches the cap
+// (jammed shear-thickening liquid).
+bool rigid(ivec2 c, int i) {
+    vec4 me = cell[i];
+    if (me.w <= 0.0) return false;
+    if (has_cap(CAP_THERMAL) && therm[i].w > RIGID_SHARE) return true;
+    vec4 q = rh[i];
+    if (q.w > 0.5) return true;
+    if (!has_cap(CAP_RHEO) || q.x <= 0.0 || any(lessThan(c, ivec2(1))) || any(greaterThanEqual(c, P.grid - 1))) return false;
+    float g = shear_rate(i, false);
+    float F, tau;
+    nn_eval(i, q, g, F, tau);
+    if (tau > 0.0 && me.z * g < tau) return true;
+    return mats[int(q.y)].ib.y == 3 && me.z * F >= me.y * exp(P.heat2.x);
+}
+
+// Signed distance to the solids (cells, positive in the open) and its gradient, bilinear
+// over the node-centred field (as particles.comp: sample_sdf).
+float sdf_at(vec2 x, out vec2 grad) {
+    vec2 g = clamp(x, vec2(0.0), vec2(P.grid) - 0.001);
+    ivec2 i = ivec2(g);
+    vec2 f = g - vec2(i);
+    int w1 = P.grid.x + 1;
+    int k = i.y * w1 + i.x;
+    float d00 = sdf[k], d10 = sdf[k + 1], d01 = sdf[k + w1], d11 = sdf[k + w1 + 1];
+    grad = vec2(mix(d10 - d00, d11 - d01, f.y), mix(d01 - d00, d11 - d10, f.x));
+    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
+}
+
+int find_root(int i) {
+    int l = rl[i].x;
+    for (int guard = 0; guard < 1 << 20 && l != i; guard++) {
+        i = l;
+        l = rl[i].x;
+    }
+    return i;
+}
+
+void unite(int a, int b) {
+    bool done = false;
+    for (int guard = 0; guard < 4096 && !done; guard++) {
+        a = find_root(a);
+        b = find_root(b);
+        if (a < b) {
+            int old = atomicMin(rl[b].x, a);
+            done = old == b;
+            b = old;
+        } else if (b < a) {
+            int old = atomicMin(rl[a].x, b);
+            done = old == a;
+            a = old;
+        } else {
+            done = true;
+        }
+    }
+}
+
+// Adds round(x) to the 64-bit two's-complement sum in words w (low), w + 1 (high). Integer
+// addition is associative, so the total does not depend on the order of the additions.
+void add64(uint w, float x) {
+    x = floor(x + 0.5);
+    float hi = floor(x * (1.0 / 4294967296.0));
+    uint lo = uint(x - hi * 4294967296.0);
+    uint old = atomicAdd(rbody[w], lo);
+    uint h = uint(int(hi)) + (old + lo < old ? 1u : 0u);
+    if (h != 0u) atomicAdd(rbody[w + 1u], h);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    int W = P.grid.x;
+
+    if (R.mode == 0u) {
+        rl[i] = ivec2(rigid(c, i) ? i : -1, -1);
+        if (i == 0) rbody[0] = 0u;
+        return;
+    }
+    int l = rl[i].x;
+    if (R.mode == 1u) {
+        if (l < 0) return;
+        // Eight neighbours (four of them, each pair once): a skin around a curved outline is
+        // a staircase whose cells touch only at corners.
+        if (c.x > 0 && rl[i - 1].x >= 0) unite(i, i - 1);
+        if (c.y > 0 && rl[i - W].x >= 0) unite(i, i - W);
+        if (c.y > 0 && c.x > 0 && rl[i - W - 1].x >= 0) unite(i, i - W - 1);
+        if (c.y > 0 && c.x < P.grid.x - 1 && rl[i - W + 1].x >= 0) unite(i, i - W + 1);
+        return;
+    }
+    if (R.mode == 2u) {
+        if (l < 0) return;
+        int r = find_root(i);
+        rl[i].x = r;
+        if (r == i) {
+            uint b = atomicAdd(rbody[0], 1u);
+            if (b < uint(MAX_BODIES)) {
+                for (uint k = 0u; k < BODY_WORDS; k++) rbody[16u + BODY_WORDS * b + k] = 0u;
+                rl[i].y = int(b);
+            }
+        }
+        return;
+    }
+    if (R.mode == 3u) {
+        if (l < 0) return;
+        int b = rl[l].y;
+        if (b < 0) return;
+        float m = cell[i].y * min(cell[i].x, 1.0) * FIX;
+        vec2 d = vec2(c - ivec2(l % W, l / W));
+        vec4 q = vel[i];
+        vec2 u = 0.5 * vec2(q.x + vel[i + 1].x, q.y + vel[i + W].y);
+        uint o = 16u + BODY_WORDS * uint(b);
+        add64(o, m);
+        add64(o + 2u, m * d.x);
+        add64(o + 4u, m * d.y);
+        add64(o + 6u, m * u.x);
+        add64(o + 8u, m * u.y);
+        add64(o + 10u, m * (d.x * u.y - d.y * u.x));
+        add64(o + 12u, m * (dot(d, d) + 1.0 / 6.0));
+        // A contact: the cell's centre within a cell of a solid surface.
+        if (P.misc.w >= 0.0) {
+            vec2 g;
+            float dist = sdf_at(vec2(c) + 0.5, g);
+            if (dist < 1.0 && dot(g, g) > 1e-8) {
+                vec2 nrm = normalize(g);
+                add64(o + 14u, FIX);
+                add64(o + 16u, FIX * nrm.x);
+                add64(o + 18u, FIX * nrm.y);
+                add64(o + 20u, FIX * d.x);
+                add64(o + 22u, FIX * d.y);
+                add64(o + 24u, FIX * d.x * d.x);
+                add64(o + 26u, FIX * d.y * d.y);
+                add64(o + 28u, FIX * d.x * d.y);
+            }
+        }
+        return;
+    }
+    // mode 4: faces between two cells of one body move with it, and take no density
+    // correction (at rest occupancy its particle noise would make the body creep), except
+    // next to a clump: a cell over rest occupancy by more than `correction_deadband`, the
+    // threshold buried liquid uses. Without it nothing ever spread a clump of frozen
+    // particles out again (a brush drives particles into a body or onto the floor at 2 m/s):
+    // it rode with the body, swallowed more, and at a few thousand particles in one cell the
+    // fixed-point sums wrapped around, the cell's temperature with them, and the cold that
+    // released froze the whole tank.
+    vec4 q = vel[i];
+    bool changed = false;
+    vec3 u;
+    float clump = REST_PHI + max(P.corr.y, 0.05);
+    bool cl = cell[i].x > clump;
+    if (l >= 0 && c.x > 0 && rl[i - 1].x == l && face_live(q.z) && rl[l].y >= 0
+        && body_motion(uint(rl[l].y), l, vec2(c) + vec2(0.0, 0.5), u)) {
+        q.x = u.x;
+        if (!cl && cell[i - 1].x <= clump) q.z = 0.0;
+        changed = true;
+    }
+    if (l >= 0 && c.y > 0 && rl[i - W].x == l && face_live(q.w) && rl[l].y >= 0
+        && body_motion(uint(rl[l].y), l, vec2(c) + vec2(0.5, 0.0), u)) {
+        q.y = u.y;
+        if (!cl && cell[i - W].x <= clump) q.w = 0.0;
+        changed = true;
+    }
+    if (changed) vel[i] = q;
+}

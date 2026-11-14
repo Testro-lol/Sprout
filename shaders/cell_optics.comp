@@ -1,0 +1,139 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "optics.glsl"
+
+// What the liquid in each cell looks like, for the renderer (README, "Look"). Run once per
+// rendered frame, after the last substep, from what that substep scattered to the grid:
+// the share and concentration of every material in the cell (as grid_prep.comp reads
+// them), the cell's temperature and velocity, and the optics table. The particles' own
+// splat (render.rs) gives the sharp shapes; these soft fields give their colour and
+// manner, at the cell's resolution, which is finer than any blend the eye can follow.
+//
+// Per cell, five vec4 (one texel in each layer of an RGBA16F array image, so that the
+// composite gets them bilinearly filtered by the sampler), each premultiplied by the liquid's occupancy (so that the composite
+// can interpolate between cells, empty ones included):
+//   0  body colour of the aqueous liquids (OKLab L, a, b, chroma) x their share
+//   1  the same for the other groups: immiscible liquids never blend colours
+//   2  opacity, scattering, metal, gloss
+//   3  emission (linear RGB, from the temperature), speed / fast speed
+//   4  body, foam, aqueous share, total
+//   5  frozen colour of the aqueous liquids (OKLab, chroma) x their frozen share
+//   6  the same for the other groups
+//   7  frozen share of the aqueous liquids, of the others; velocity (cells / s)
+//   8  stain, glint, iridescence, crackle (the effects of composite.frag)
+// A concentrate blends with its diluent as the particles do (optics.glsl: blend_colour).
+// A frozen share loses gloss here; its colour is kept apart (layers 5 - 7) so that the
+// composite can draw ice with a crisp outline instead of fading it into the liquid.
+// optics_blur.comp then smooths all of them over 3 x 3 cells.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform OPC {
+    float inv_speed;   // 1 / the speed that counts as fast (cells / s)
+} OP;
+
+layout(std430, set = 0, binding = 57) readonly buffer OptBuf { Optics optics[]; };
+layout(set = 0, binding = 58, rgba16f) uniform writeonly image2DArray cellopt;
+
+// render.rs had it per particle: the visible glow of a grey body at T (deg C).
+vec3 glow(float T) {
+    float K = T + 273.15;
+    if (K < 800.0) return vec3(0.0);
+    float level = clamp(2.0 - 1600.0 / K, 0.0, 1.0);
+    vec3 c = vec3(1.0, 1.677 * exp(-2575.0 / K), 3.89 * exp(-7353.0 / K));
+    return c / max(c.r, max(c.g, c.b)) * level * level * 1.6;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    int k = i * P.acc_stride;
+    int cw = acc[k + 4];
+    vec4 o0 = vec4(0.0), o1 = vec4(0.0), o2 = vec4(0.0), o3 = vec4(0.0), o4 = vec4(0.0);
+    vec4 o5 = vec4(0.0), o6 = vec4(0.0), o7 = vec4(0.0), o8 = vec4(0.0);
+    if (cw > 0) {
+        float occ = min(float(cw) / MASS_SCALE * P.inv_ppc, 1.0);
+        bool thermal = has_cap(CAP_THERMAL);
+        float T = thermal ? therm[i].x : P.heat.x;
+        int others = 0;
+        for (int j = 0; j < P.n_present; j++) {
+            int ch = mats[present_row(j)].ia.z;
+            if (ch >= 0) others += acc[k + ch];
+        }
+        vec4 aq = vec4(0.0), ot = vec4(0.0), opt = vec4(0.0), sty = vec4(0.0);
+        vec4 iaq = vec4(0.0), iot = vec4(0.0), fx = vec4(0.0);
+        vec2 fz = vec2(0.0);
+        vec3 em = vec3(0.0);
+        float waq = 0.0, wot = 0.0;
+        for (int j = 0; j < P.n_present; j++) {
+            int r = present_row(j);
+            ivec4 ia = mats[r].ia;
+            if (ia.z < 0 && P.primary >= 0 && r != P.primary) continue;
+            int w = ia.z >= 0 ? acc[k + ia.z] : max(cw - others, 0);
+            if (w <= 0) continue;
+            float sh = clamp(float(w) / float(cw), 0.0, 1.0);
+            float s = (ia.y >= 0 && ia.w >= 0) ? clamp(float(acc[k + ia.w]) / float(w), 0.0, 1.0) : 1.0;
+            Optics o = optics[r];
+            vec4 lab = o.lab, labs = o.lab_solid, op = o.opt, st = o.sty, ef = o.fx;
+            if (ia.y >= 0) {
+                Optics d = optics[ia.y];
+                lab = blend_colour(d, o, d.lab, lab, s);
+                labs = blend_colour(d, o, d.lab_solid, labs, s);
+                op = mix(d.opt, op, s);
+                st = mix(d.sty, st, s);
+                ef = mix(d.fx, ef, s);
+            }
+            // Frozen share at the cell's temperature (as grid_prep.comp has it).
+            float fs = 0.0;
+            if (thermal) {
+                vec4 th = thermal_of(uint(r), s);
+                fs = th.y > -1e8 ? clamp((th.y - T) / max(th.y - th.x, 1e-3), 0.0, 1.0) : 0.0;
+                op.w *= 1.0 - 0.6 * fs;
+                op.x = mix(op.x, max(op.x, 0.6), fs);
+            }
+            if (o.idx.y == 0) {
+                aq += sh * lab;
+                waq += sh;
+                iaq += sh * fs * labs;
+                fz.x += sh * fs;
+            } else {
+                ot += sh * lab;
+                wot += sh;
+                iot += sh * fs * labs;
+                fz.y += sh * fs;
+            }
+            opt += sh * op;
+            fx += sh * ef;
+            sty += sh * st;
+            em += sh * glow(T) * st.w;
+        }
+        // Speed: the face velocities around the cell.
+        vec4 v = vel[i];
+        vec2 u = vec2(face_live(v.z) ? v.x : 0.0, face_live(v.w) ? v.y : 0.0);
+        float speed = min(length(u) * OP.inv_speed, 1.5);
+        o0 = aq * occ;
+        o1 = ot * occ;
+        o2 = opt * occ;
+        o3 = vec4(em, speed) * occ;
+        o4 = vec4(sty.x, sty.y, waq, waq + wot) * occ;
+        o5 = iaq * occ;
+        o6 = iot * occ;
+        // The cell's velocity at its centre (the mean of the faces around it), for effects
+        // that move with the liquid.
+        vec4 vr = vel[min(i + 1, P.grid.x * P.grid.y - 1)], vt = vel[min(i + P.grid.x, P.grid.x * P.grid.y - 1)];
+        vec2 uc = 0.5 * (u + vec2(face_live(vr.z) ? vr.x : 0.0, face_live(vt.w) ? vt.y : 0.0));
+        o7 = vec4(fz, uc) * occ;
+        o8 = fx * occ;
+    }
+    imageStore(cellopt, ivec3(c, 0), o0);
+    imageStore(cellopt, ivec3(c, 1), o1);
+    imageStore(cellopt, ivec3(c, 2), o2);
+    imageStore(cellopt, ivec3(c, 3), o3);
+    imageStore(cellopt, ivec3(c, 4), o4);
+    imageStore(cellopt, ivec3(c, 5), o5);
+    imageStore(cellopt, ivec3(c, 6), o6);
+    imageStore(cellopt, ivec3(c, 7), o7);
+    imageStore(cellopt, ivec3(c, 8), o8);
+}

@@ -5,7 +5,7 @@
 
 // Weights of the strain samples: cell (i, j) and node (i, j). Also marks the tiles that need
 // the implicit solve: those within one cell of a cell whose diffusion number reaches
-// IMPLICIT_MIN (the tile buffer is cleared before this pass).
+// P.corr.w (params.rs: implicit_viscosity_min; the tile buffer is cleared before this pass).
 
 bool ok_u(int i) { return live_u(i) || closed_u(i); }
 bool ok_v(int i) { return live_v(i) || closed_v(i); }
@@ -42,7 +42,7 @@ void main() {
     o.xy = vec2(wc, wn);
     vw[i] = o;
     vec4 me = cell[i];
-    if (me.w > 0.0 && S.dt * me.z / max(me.y, 0.05) >= IMPLICIT_MIN) {
+    if (me.w > 0.0 && S.dt * me.z / max(me.y, 0.05) >= P.corr.w) {
         for (int b = -1; b <= 1; b++) {
             for (int a = -1; a <= 1; a++) {
                 ivec2 n = clamp(c + ivec2(a, b), ivec2(0), P.grid - 1);

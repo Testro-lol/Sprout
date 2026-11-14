@@ -6,6 +6,11 @@
 //! brush and fades toasts and ripples in and out.
 
 use std::collections::VecDeque;
+use std::ops::RangeInclusive;
+
+/// Default and range of `UiState::min_fps`.
+pub const MIN_FPS_DEFAULT: f32 = 60.0;
+pub const MIN_FPS_RANGE: RangeInclusive<f32> = 20.0..=240.0;
 
 use egui::{Color32, CornerRadius, Pos2, RichText, Shadow, Stroke, Vec2, emath::easing};
 
@@ -13,7 +18,7 @@ use crate::{
     maps::MAPS,
     render::View,
     scene::Shape,
-    sim::{CURRENT_SPEED, Current, Material, SimParams, SolverStats},
+    sim::{CURRENT_SPEED, CURRENT_STRENGTH, CURRENT_STRENGTH_DEFAULT, Current, Group, Material, PPC, Param, SimParams, SolverStats},
     world::World,
 };
 
@@ -27,6 +32,9 @@ pub enum Tool {
     Push,
     Current,
     Erase,
+    Heat,
+    Cool,
+    Magnet,
     Circle,
     Box,
     Ramp,
@@ -36,6 +44,7 @@ pub enum Tool {
 impl Tool {
     pub const LIQUID: [Tool; 8] = [Tool::Pour, Tool::Spray, Tool::Jet, Tool::Drop, Tool::Grab, Tool::Push, Tool::Current, Tool::Erase];
     pub const SOLID: [Tool; 4] = [Tool::Circle, Tool::Box, Tool::Ramp, Tool::Remove];
+    pub const FIELD: [Tool; 3] = [Tool::Heat, Tool::Cool, Tool::Magnet];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -47,6 +56,9 @@ impl Tool {
             Tool::Push => "Push",
             Tool::Current => "Current",
             Tool::Erase => "Erase",
+            Tool::Heat => "Heat",
+            Tool::Cool => "Cool",
+            Tool::Magnet => "Magnet",
             Tool::Circle => "Circle",
             Tool::Box => "Box",
             Tool::Ramp => "Ramp",
@@ -65,6 +77,9 @@ impl Tool {
             Tool::Push => "V",
             Tool::Current => "Z",
             Tool::Erase => "E",
+            Tool::Heat => "Y",
+            Tool::Cool => "U",
+            Tool::Magnet => "M",
             Tool::Circle => "A",
             Tool::Box => "S",
             Tool::Ramp => "D",
@@ -80,10 +95,13 @@ impl Tool {
             Tool::Drop => "Click to drop a round blob. Works while paused.",
             Tool::Grab => "Drag to carry and stir liquid. The right button grabs with any tool.",
             Tool::Push => "Hold to drive liquid outwards from the cursor.",
-            Tool::Current => "Click to place a current that drives the liquid passing through it. T / G or the wheel aim it.",
+            Tool::Current => "Hold to drive the liquid under the cursor along the arrow. T / G or the wheel aim it.",
             Tool::Erase => "Hold to remove liquid under the brush.",
+            Tool::Heat => "Hold to heat the liquid under the brush (melts, boils away).",
+            Tool::Cool => "Hold to cool the liquid under the brush (freezes, sets).",
+            Tool::Magnet => "Click to place a magnet (north up); Remove takes it away. Only magnetic liquids feel it.",
             Tool::Circle | Tool::Box | Tool::Ramp => "Click to place. T / G rotate, F flips a ramp.",
-            Tool::Remove => "Click a highlighted solid or current to remove it.",
+            Tool::Remove => "Click a highlighted solid to remove it.",
         }
     }
 
@@ -108,6 +126,9 @@ impl Tool {
             Tool::Push => Color32::from_rgb(196, 160, 255),
             Tool::Current => CURRENT,
             Tool::Erase | Tool::Remove => DANGER,
+            Tool::Heat => Color32::from_rgb(255, 140, 70),
+            Tool::Cool => Color32::from_rgb(140, 200, 255),
+            Tool::Magnet => Color32::from_rgb(230, 90, 110),
             Tool::Circle | Tool::Box | Tool::Ramp => Color32::from_gray(225),
             _ => swatch(material),
         }
@@ -159,8 +180,16 @@ pub struct UiState {
     pub brush: f32,
     /// Flow of the liquid tools, particles per second.
     pub pour_rate: f32,
-    /// Strength of grab, push and newly placed currents relative to their default.
+    /// Strength of grab and push relative to their default.
     pub force_strength: f32,
+    /// Speed of the next current, as a multiple of `CURRENT_SPEED`.
+    pub current_strength: f32,
+    /// The liquid picker and editor.
+    pub editor: crate::editor::LiquidEditor,
+    /// Liquids on the number keys 1 - 4 (table rows).
+    pub favourites: [usize; 4],
+    /// Field at the rim of the next magnet, T.
+    pub magnet_strength: f32,
     /// Jet heading in degrees clockwise from straight down.
     pub jet_angle: f32,
     /// Heading of the next current, degrees clockwise from straight down.
@@ -172,7 +201,12 @@ pub struct UiState {
     pub shape_flip: bool,
     pub paused: bool,
     pub time_scale: f32,
+    /// Lowest frame rate the simulation may push the app down to before it slows simulated
+    /// time instead of the frame rate, fps.
+    pub min_fps: f32,
     pub vsync: bool,
+    /// How the liquid and solids are drawn.
+    pub look: crate::render::Look,
     pub show_panel: bool,
     pub grid: [u32; 2],
     /// Substeps taken in the last frame.
@@ -190,6 +224,10 @@ impl Default for UiState {
             brush: 9.0,
             pour_rate: 12000.0,
             force_strength: 1.0,
+            current_strength: CURRENT_STRENGTH_DEFAULT,
+            editor: Default::default(),
+            favourites: [Material::Water.index(), Material::Oil.index(), Material::Syrup.index(), Material::Lava.index()],
+            magnet_strength: crate::sim::MAGNET_STRENGTH_DEFAULT,
             jet_angle: 0.0,
             current_angle: 90.0,
             shape_angle: 0.0,
@@ -197,7 +235,9 @@ impl Default for UiState {
             shape_flip: false,
             paused: false,
             time_scale: 1.0,
+            min_fps: MIN_FPS_DEFAULT,
             vsync: true,
+            look: Default::default(),
             show_panel: true,
             grid: [512, 288],
             substeps: 0,
@@ -212,9 +252,12 @@ impl UiState {
         self.brush = (self.brush * factor).clamp(2.0, 60.0);
     }
 
-    /// `-` and `=`: the flow of liquid tools, or the strength of force tools.
+    /// `-` and `=`: the flow of liquid tools, the strength of grab and push, or the speed of
+    /// the current.
     pub fn scale_rate(&mut self, factor: f32) {
-        if self.tool.is_force() {
+        if self.tool == Tool::Current {
+            self.current_strength = (self.current_strength * factor).clamp(CURRENT_STRENGTH[0], CURRENT_STRENGTH[1]);
+        } else if self.tool.is_force() {
             self.force_strength = (self.force_strength * factor).clamp(0.1, 4.0);
         } else {
             self.pour_rate = (self.pour_rate * factor).clamp(1000.0, 200_000.0);
@@ -261,6 +304,7 @@ pub struct UiActions {
     pub grid: Option<[u32; 2]>,
     pub reset_view: bool,
     pub vsync_changed: bool,
+    pub clean_stains: bool,
     pub quit: bool,
 }
 
@@ -309,16 +353,18 @@ pub fn style(ctx: &egui::Context) {
     });
 }
 
+/// A liquid's body colour from the live table (custom liquids included).
+fn swatch_of(p: &SimParams, row: usize) -> Color32 {
+    let c = p.mat[row.min(crate::sim::MAX_MATERIALS - 1)].color;
+    Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+}
+
 fn swatch(m: Material) -> Color32 {
     let c = m.color();
     Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
 }
 
 /// A material colour lifted enough to read as text on the dark panel.
-fn swatch_text(m: Material) -> Color32 {
-    swatch(m).lerp_to_gamma(Color32::WHITE, 0.25)
-}
-
 /// A small filled circle in line with text.
 fn dot(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -351,75 +397,132 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).small().strong().color(Color32::from_gray(150)));
 }
 
-fn physics(ui: &mut egui::Ui, p: &mut SimParams, solver: &SolverStats) {
-    let d = SimParams::default();
-    // Material properties are edited in physical units; the solver converts them.
-    egui::Grid::new("physics").num_columns(2).show(ui, |ui| {
-        ui.label("Gravity");
-        ui.add(egui::Slider::new(&mut p.gravity, 0.0..=25.0).suffix(" m/s²"));
-        ui.end_row();
-        ui.label("Cell size");
-        ui.add(egui::Slider::new(&mut p.cell_size, 0.0005..=0.05).logarithmic(true).suffix(" m"))
-            .on_hover_text("Physical size of one grid cell. Smaller cells make surface tension matter more.");
-        ui.end_row();
-        for (i, name) in ["Water", "Syrup", "Oil"].iter().enumerate() {
-            ui.label(format!("{name} viscosity"));
-            ui.add(egui::Slider::new(&mut p.nu[i], 1e-7..=0.5).logarithmic(true).suffix(" m²/s"));
-            ui.end_row();
-        }
-        for (i, name) in ["Water", "Syrup", "Oil"].iter().enumerate() {
-            ui.label(format!("{name}-air tension"));
-            ui.add(egui::Slider::new(&mut p.sigma[i], 0.0..=0.2).suffix(" N/m"));
-            ui.end_row();
-        }
-        ui.label("Oil-water tension");
-        ui.add(egui::Slider::new(&mut p.sigma_oil, 0.0..=0.1).suffix(" N/m"));
-        ui.end_row();
-        for (i, name) in ["Water", "Syrup", "Oil"].iter().enumerate() {
-            ui.label(format!("{name} contact angle"));
-            ui.add(egui::Slider::new(&mut p.contact_angle[i], 0.0..=180.0).suffix("°"));
-            ui.end_row();
-        }
-        ui.label("Syrup density");
-        ui.add(egui::Slider::new(&mut p.rho[1], 1.0..=2.5).suffix(" × water"));
-        ui.end_row();
-        ui.label("Oil density");
-        ui.add(egui::Slider::new(&mut p.rho[2], 0.4..=1.0).suffix(" × water"));
-        ui.end_row();
-        ui.label("Oil droplet size");
-        ui.add(egui::Slider::new(&mut p.droplet, 0.1..=4.0).suffix(" cells"))
-            .on_hover_text("Size of oil droplets too small for the grid; they rise out of water at their terminal velocity.");
-        ui.end_row();
-        ui.label("Syrup mixing");
-        ui.add(egui::Slider::new(&mut p.diffuse, 0.0..=20.0).suffix(" /s"))
-            .on_hover_text("How fast touching water and syrup blend.");
+/// A length in metres, in the unit that suits it.
+fn length_unit(metres: f32) -> (f32, &'static str) {
+    if metres < 0.01 { (1e-3, "mm") } else if metres < 1.0 { (1e-2, "cm") } else { (1.0, "m") }
+}
+
+/// A grid row for parameter `key` of `PARAMS`: a slider over its safe range, shown as
+/// `scale` times the parameter's own unit (in `unit`), plus an on/off box for a
+/// stabilisation device that can be switched off. Writes only when the slider moves, so a
+/// value is never rewritten by the round trip through the display unit.
+fn param_row(ui: &mut egui::Ui, p: &mut SimParams, key: &str, label: &str, scale: f32, unit: &str) -> egui::Response {
+    let def = Param::find(key).expect("parameter listed in PARAMS");
+    ui.label(label);
+    let value = def.read(p);
+    let mut on = def.off != Some(value);
+    let response = ui
+        .horizontal(|ui| {
+            if let Some(off) = def.off
+                && ui.checkbox(&mut on, "").on_hover_text("On / off").changed()
+            {
+                let d = def.read(&SimParams::default());
+                def.write(p, if !on { off } else if def.off == Some(d) { def.min } else { d });
+            }
+            let mut shown = if on { value * scale } else { def.read(&SimParams::default()) * scale };
+            let mut slider = egui::Slider::new(&mut shown, def.min * scale..=def.max * scale).logarithmic(def.logarithmic());
+            if !unit.is_empty() {
+                slider = slider.suffix(format!(" {unit}"));
+            }
+            if def.integer {
+                slider = slider.integer();
+            } else if def.logarithmic() && def.min * scale < 1e-2 {
+                // Tolerances and viscosities span decades: show them in scientific notation.
+                slider = slider.custom_formatter(|v, _| if v != 0.0 && v.abs() < 1e-2 { format!("{v:.1e}") } else { format!("{v:.3}") });
+            }
+            let r = ui.add_enabled(on, slider);
+            if r.changed() {
+                def.write(p, def.clamp(shown / scale));
+            }
+            r
+        })
+        .inner;
+    ui.end_row();
+    response.on_hover_text(def.help)
+}
+
+/// Player-facing physics: the world and the liquids, in physical units.
+fn physics(ui: &mut egui::Ui, _state: &mut UiState, world: &mut World) {
+    ui.spacing_mut().slider_width = 92.0;
+    let grid = world.sim.grid;
+    let p = &mut world.sim.params;
+    section(ui, "WORLD");
+    egui::Grid::new("world").num_columns(2).show(ui, |ui| {
+        param_row(ui, p, "gravity", "Gravity", 1.0, "m/s²");
+        let (w, h) = (p.cell_size * grid[0] as f32, p.cell_size * grid[1] as f32);
+        let (k, unit) = length_unit(w);
+        param_row(ui, p, "cell_size", "Cell size", 1e3, "mm").on_hover_text(format!(
+            "Physical size of one grid cell: the tank is {:.2} × {:.2} {unit}. Small cells make surface tension matter more.\n\
+             Each map sets its own scale; reloading the map restores it.",
+            w / k,
+            h / k
+        ));
+        ui.label("");
+        ui.label(RichText::new(format!("tank {:.2} × {:.2} {unit}", w / k, h / k)).small().weak());
         ui.end_row();
     });
-    ui.separator();
+
+    section(ui, "HEAT");
+    egui::Grid::new("heat").num_columns(2).show(ui, |ui| {
+        param_row(ui, p, "ambient_temp", "Air", 1.0, "°C");
+        param_row(ui, p, "heat_rate", "Heat rate", 1.0, "×");
+        param_row(ui, p, "air_cooling", "Air cooling", 1.0, "W/m²K");
+        param_row(ui, p, "heat_power", "Heat brush", 1.0, "K/s");
+        param_row(ui, p, "rigid_viscosity", "Sets above", 1.0, "m²/s");
+    });
+    section(ui, "BETWEEN LIQUIDS");
+    egui::Grid::new("between").num_columns(2).show(ui, |ui| {
+        param_row(ui, p, "tension_oil_water", "Oil–water", 1.0, "N/m");
+        param_row(ui, p, "tension_metal_water", "Metal–water", 1.0, "N/m");
+        param_row(ui, p, "tension_metal_oil", "Metal–oil", 1.0, "N/m");
+        param_row(ui, p, "tension_melt_water", "Melt–water", 1.0, "N/m");
+        param_row(ui, p, "tension_melt_oil", "Melt–oil", 1.0, "N/m");
+        param_row(ui, p, "tension_melt_metal", "Melt–metal", 1.0, "N/m");
+        let mm = p.droplet_cells * p.cell_size * 1e3;
+        param_row(ui, p, "droplet_cells", "Droplet size", 1.0, "cells").on_hover_text(format!(
+            "Size of the droplets, too small for the grid, that separate out where two immiscible liquids share a cell: \
+             {mm:.2} mm at this cell size. Bigger droplets separate faster."
+        ));
+    });
+    ui.label(RichText::new("Each liquid's own properties: the liquid editor (Liquids…, Edit).").small().weak());
+    if ui.button("Restore defaults").on_hover_text("World and liquids; the map's own scale; solver settings are kept").clicked() {
+        let cell = p.cell_size;
+        // The material table belongs to the liquids (and the editor), not to this tab.
+        let mat = p.mat;
+        let count = p.mat_count;
+        p.reset_groups(&[Group::World, Group::Liquid]);
+        p.mat = mat;
+        p.mat_count = count;
+        p.cell_size = cell;
+        world.apply_map_scale();
+    }
+}
+
+/// Solver accuracy and cost, plus what the solver is doing. Everything else is `--set`.
+fn solver(ui: &mut egui::Ui, p: &mut SimParams, stats: &SolverStats) {
+    ui.spacing_mut().slider_width = 92.0;
+    ui.label(RichText::new("Accuracy and cost, not the liquids. Every setting: sprout params").small().weak());
     egui::Grid::new("solver").num_columns(2).show(ui, |ui| {
-        ui.label("CFL number");
-        ui.add(egui::Slider::new(&mut p.cfl, 0.5..=6.0)).on_hover_text("Most cells a particle may move per substep.");
-        ui.end_row();
-        ui.label("Pressure tolerance");
-        ui.add(egui::Slider::new(&mut p.pressure_tol, 1e-6..=1e-2).logarithmic(true));
-        ui.end_row();
-        ui.label("Viscosity tolerance");
-        ui.add(egui::Slider::new(&mut p.viscosity_tol, 1e-5..=1e-1).logarithmic(true));
-        ui.end_row();
+        param_row(ui, p, "cfl", "CFL number", 1.0, "cells");
+        param_row(ui, p, "speed_cap", "Speed cap", 1.0, "×")
+            .on_hover_text("Fastest a particle may move, as a multiple of free fall over the tank height, √(2gH). Off: no cap.");
+        param_row(ui, p, "pressure_tol", "Pressure tol.", 1.0, "");
+        param_row(ui, p, "viscosity_tol", "Viscosity tol.", 1.0, "");
         ui.label("Substep");
-        ui.label(format!("{:.2} ms (CFL {:.2} ms)", solver.dt * 1e3, solver.dt_cfl * 1e3));
+        ui.label(format!("{:.2} ms (CFL {:.2} ms)", stats.dt * 1e3, stats.dt_cfl * 1e3));
         ui.end_row();
         ui.label("Iterations");
-        ui.label(format!("pressure {}, viscosity {}", solver.pressure_iters_max, solver.viscosity_iters_max));
+        ui.label(format!("pressure {}, viscosity {}", stats.pressure_iters_max, stats.viscosity_iters_max));
         ui.end_row();
     });
-    if ui.button("Restore defaults").clicked() {
-        *p = d;
+    let groups = [Group::Accuracy, Group::Stabilisation];
+    if ui.add_enabled(!p.is_default(&groups), egui::Button::new("Restore solver defaults")).clicked() {
+        p.reset_groups(&groups);
     }
 }
 
 /// Builds the panel for this frame. It fades in and out with `show_panel`.
-pub fn build(ctx: &egui::Context, state: &mut UiState, world: &mut World) -> UiActions {
+pub fn build(ctx: &egui::Context, state: &mut UiState, world: &mut World, swatches: &mut crate::editor::Swatches) -> UiActions {
     let mut a = UiActions::default();
     // Fades and slides in and out with H.
     let shown = ctx.animate_bool_with_time_and_easing(egui::Id::new("panel_shown"), state.show_panel, 0.16, easing::cubic_out);
@@ -437,12 +540,16 @@ pub fn build(ctx: &egui::Context, state: &mut UiState, world: &mut World) -> UiA
             ui.multiply_opacity(shown);
             // Scrolls only when the window is too short for the panel.
             let max = (ctx.screen_rect().height() - 52.0).max(120.0);
-            egui::ScrollArea::vertical().max_height(max).auto_shrink([false, true]).show(ui, |ui| panel(ui, state, world, &mut a));
+            egui::ScrollArea::vertical().max_height(max).auto_shrink([false, true]).show(ui, |ui| panel(ui, state, world, &mut a, swatches));
         });
+    if let Some(row) = crate::editor::picker(ctx, &mut state.editor, swatches, world, state.material.index()) {
+        state.pick_material(Material(row as u8));
+    }
+    crate::editor::editor(ctx, &mut state.editor, swatches, world);
     a
 }
 
-fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiActions) {
+fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiActions, swatches: &mut crate::editor::Swatches) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Sprout").size(17.0).strong().color(Color32::from_gray(235)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -485,42 +592,103 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
 
     // ---- liquids and tools -------------------------------------------------
     section(ui, "LIQUID");
-    ui.columns(3, |cols| {
-        for (i, (ui, m)) in cols.iter_mut().zip(Material::ALL).enumerate() {
-            let selected = state.material == m;
-            let text = RichText::new(m.name()).color(swatch_text(m)).strong();
-            let mut button = egui::Button::new(text).selected(selected).min_size(egui::vec2(ui.available_width(), 26.0));
-            if selected {
-                button = button.fill(swatch(m).gamma_multiply(0.28)).stroke(Stroke::new(1.0_f32, swatch_text(m)));
-            }
-            if ui.add(button).on_hover_text(format!("Shortcut: {}", i + 1)).clicked() {
-                state.pick_material(m);
+    let ctx = ui.ctx().clone();
+    ui.columns(4, |cols| {
+        for (i, ui) in cols.iter_mut().enumerate() {
+            let row = state.favourites[i];
+            let selected = state.material.index() == row;
+            let tex = swatches.live(&ctx, &world.sim.params, row);
+            // Cropped to the drop, as the picker's tiles are (editor.rs, `tile`).
+            let uv = egui::Rect::from_min_max(egui::pos2(0.1, 0.36), egui::pos2(0.9, 0.95));
+            let img = egui::Image::new((tex, egui::vec2(52.0, 26.0))).uv(uv);
+            let r = ui.add(egui::ImageButton::new(img).selected(selected)).on_hover_text(format!("{}  (key {})", world.library.name(row), i + 1));
+            if r.clicked() {
+                state.pick_material(Material(row as u8));
             }
         }
     });
+    ui.horizontal(|ui| {
+        let m = state.material.index();
+        dot(ui, swatch_of(&world.sim.params, m));
+        ui.label(RichText::new(world.library.name(m)).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Edit").on_hover_text("Open the liquid editor (built-ins are duplicated first)").clicked() {
+                if m < crate::sim::BUILTINS.len() {
+                    state.editor.duplicate(world, m);
+                } else {
+                    state.editor.select(world, m);
+                }
+            }
+            if ui.button("Liquids…").on_hover_text("Choose from every liquid, by category, or search").clicked() {
+                state.editor.picker_open = !state.editor.picker_open;
+            }
+        });
+    });
     section(ui, "TOOLS");
     tool_grid(ui, state, &Tool::LIQUID);
+    tool_grid(ui, state, &Tool::FIELD);
     tool_grid(ui, state, &Tool::SOLID);
     ui.label(RichText::new(state.tool.hint()).small().weak());
 
+    // Tool sizes and rates are kept in grid units and shown in physical ones.
+    let dx = world.sim.params.cell_size;
     egui::Grid::new("brush").num_columns(2).show(ui, |ui| {
         ui.label("Brush");
-        ui.add(egui::Slider::new(&mut state.brush, 2.0..=60.0).logarithmic(true).suffix(" cells"))
-            .on_hover_text("[ and ], or Shift + wheel");
+        let (unit_m, unit) = length_unit(30.0 * dx);
+        let k = dx / unit_m;
+        let mut radius = state.brush * k;
+        if ui
+            .add(egui::Slider::new(&mut radius, 2.0 * k..=60.0 * k).logarithmic(true).suffix(format!(" {unit}")))
+            .on_hover_text(format!("Radius: {:.0} cells. [ and ], or Shift + wheel.", state.brush))
+            .changed()
+        {
+            state.brush = (radius / k).clamp(2.0, 60.0);
+        }
         ui.end_row();
-        if state.tool.is_force() {
+        if state.tool == Tool::Current {
+            ui.label("Speed");
+            let k = CURRENT_SPEED * dx;
+            let mut speed = state.current_strength * k;
+            if ui
+                .add(egui::Slider::new(&mut speed, CURRENT_STRENGTH[0] * k..=CURRENT_STRENGTH[1] * k).logarithmic(true).suffix(" m/s"))
+                .on_hover_text("Speed the current drives liquid towards. - and = adjust it.")
+                .changed()
+            {
+                state.current_strength = (speed / k).clamp(CURRENT_STRENGTH[0], CURRENT_STRENGTH[1]);
+            }
+            ui.end_row();
+        } else if state.tool == Tool::Magnet {
+            ui.label("Field");
+            ui.add(egui::Slider::new(&mut state.magnet_strength, crate::sim::MAGNET_STRENGTH[0]..=crate::sim::MAGNET_STRENGTH[1]).logarithmic(true).suffix(" T"))
+                .on_hover_text("Field at the magnet's rim (the brush radius). A strong neodymium magnet: 0.3 - 0.5 T.");
+            ui.end_row();
+        } else if state.tool.is_force() {
             ui.label("Strength");
             let mut percent = state.force_strength * 100.0;
-            ui.add(egui::Slider::new(&mut percent, 10.0..=400.0).logarithmic(true).suffix(" %"))
-                .on_hover_text("How hard Grab and Push move liquid, and how fast a new Current flows. - and = adjust it.");
-            state.force_strength = percent / 100.0;
+            if ui
+                .add(egui::Slider::new(&mut percent, 10.0..=400.0).logarithmic(true).suffix(" %"))
+                .on_hover_text("How hard Grab and Push (and right-mouse grabbing) move liquid. - and = adjust it.")
+                .changed()
+            {
+                state.force_strength = (percent / 100.0).clamp(0.1, 4.0);
+            }
             ui.end_row();
         } else if state.tool.uses_material() && state.tool != Tool::Drop {
             ui.label("Flow");
-            let mut k = state.pour_rate / 1000.0;
-            ui.add(egui::Slider::new(&mut k, 1.0..=200.0).logarithmic(true).suffix("k /s"))
-                .on_hover_text("Particles per second. - and = adjust it.\nA small brush caps how much it can deliver.");
-            state.pour_rate = k * 1000.0;
+            // Particles per second -> area of liquid per second (2D: per metre of depth).
+            let small = dx < 3e-3;
+            let (k, unit) = if small { (dx * dx / PPC as f32 * 1e4, "cm²/s") } else { (dx * dx / PPC as f32, "m²/s") };
+            let mut flow = state.pour_rate * k;
+            if ui
+                .add(egui::Slider::new(&mut flow, 1000.0 * k..=200_000.0 * k).logarithmic(true).suffix(format!(" {unit}")))
+                .on_hover_text(format!(
+                    "Area of liquid added per second ({:.0}k particles/s). - and = adjust it.\nA small brush caps how much it can deliver.",
+                    state.pour_rate / 1000.0
+                ))
+                .changed()
+            {
+                state.pour_rate = (flow / k).clamp(1000.0, 200_000.0);
+            }
             ui.end_row();
         }
         let aim = match state.tool {
@@ -540,7 +708,7 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
                 .on_hover_text("T and G rotate");
             ui.end_row();
             ui.label("Aspect");
-            ui.add(egui::Slider::new(&mut state.shape_aspect, 0.2..=12.0).logarithmic(true));
+            ui.add(egui::Slider::new(&mut state.shape_aspect, 0.2..=12.0).logarithmic(true)).on_hover_text("Width divided by height");
             ui.end_row();
         }
     });
@@ -570,17 +738,17 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
     }
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{} particles", stats.live)).monospace().small());
-        for (m, n) in [(Material::Water, stats.water().max(0.0)), (Material::Oil, stats.oil as f32), (Material::Syrup, stats.syrup)] {
-            dot(ui, swatch(m));
-            ui.label(RichText::new(format!("{n:.0}")).monospace().small().color(swatch_text(m)));
+        let mut rows: Vec<usize> = (0..world.sim.params.mat_count).filter(|&r| stats.count[r] > 0).collect();
+        rows.sort_by_key(|&r| std::cmp::Reverse(stats.count[r]));
+        for &r in rows.iter().take(5) {
+            let n = stats.volume(Material(r as u8), &world.sim.params);
+            dot(ui, swatch_of(&world.sim.params, r));
+            ui.label(RichText::new(format!("{n:.0}")).monospace().small());
         }
     });
 
     // ---- settings ----------------------------------------------------------
-    ui.collapsing("Physics", |ui| {
-        let solver = world.sim.solver;
-        physics(ui, &mut world.sim.params, &solver);
-    });
+    ui.collapsing("Physics", |ui| physics(ui, state, world));
     ui.collapsing("Display", |ui| {
         let mut selected = state.grid;
         let current = GRIDS
@@ -600,8 +768,43 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
             a.grid = Some(selected);
         }
         ui.horizontal(|ui| {
-            ui.label("Speed");
-            ui.add(egui::Slider::new(&mut state.time_scale, 0.1..=2.0).suffix("x"));
+            ui.label("Time scale");
+            ui.add(egui::Slider::new(&mut state.time_scale, 0.1..=2.0).suffix(" ×"))
+                .on_hover_text("Simulated seconds per real second, for slow motion. A scene too heavy for real time runs slower still.");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Real time down to");
+            ui.add(
+                egui::Slider::new(&mut state.min_fps, MIN_FPS_RANGE).step_by(5.0).suffix(" fps"),
+            )
+            .on_hover_text(
+                "How far a heavy scene may lower the frame rate before it goes into slow motion instead. \
+                 Lower keeps big scenes at real speed for longer but makes them choppier; set it to \
+                 the display's refresh rate to never give up frames.",
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Wet edge");
+            ui.add(egui::Slider::new(&mut state.look.wet_width, crate::render::Look::WET_WIDTH).step_by(0.1).suffix(" cells"))
+                .on_hover_text("How far a liquid's wet film reaches into a solid it touches or has run off.");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Wet tint");
+            ui.add(egui::Slider::new(&mut state.look.wet_tint, 0.0..=1.0))
+                .on_hover_text("How strongly wet solids take the liquid's colour. 0 draws solids dry.");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Glow");
+            ui.add(egui::Slider::new(&mut state.look.glow, 0.0..=2.0))
+                .on_hover_text("The glow of hot liquid: bloom, and the light it throws on walls and other liquids. 0 turns it off.");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Stains");
+            ui.add(egui::Slider::new(&mut state.look.stains, 0.0..=1.0))
+                .on_hover_text("How strongly the stains liquids leave on walls and the back of the tank show (blood, ink, mud, scorch marks of lava). Other liquids slowly wash them off.");
+            if ui.button("Clean").on_hover_text("Wipe every stain off").clicked() {
+                a.clean_stains = true;
+            }
         });
         if ui.checkbox(&mut state.vsync, "VSync").changed() {
             a.vsync_changed = true;
@@ -609,6 +812,10 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
         if ui.button("Reset view").on_hover_text("Home").clicked() {
             a.reset_view = true;
         }
+    });
+    ui.collapsing("Solver", |ui| {
+        let stats = world.sim.solver;
+        solver(ui, &mut world.sim.params, &stats);
     });
     ui.collapsing("Controls", |ui| {
         ui.label(
@@ -619,10 +826,11 @@ fn panel(ui: &mut egui::Ui, state: &mut UiState, world: &mut World, a: &mut UiAc
                  Wheel         zoom (aims jet, current)\n\
                  Alt+wheel     zoom while aiming\n\
                  Shift+wheel   brush size  ([ ])\n\
-                 - / =         flow / strength\n\
-                 1 2 3         water, oil, syrup\n\
+                 - / =         flow / strength / current speed\n\
+                 1 2 3 4       favourite liquids\n\
                  Q B J C       pour, spray, jet, drop\n\
                  W V Z E       grab, push, current, erase\n\
+                 Y U M         heat, cool, magnet\n\
                  A S D X       circle, box, ramp, remove\n\
                  T G F         aim / rotate, flip\n\
                  Space N R     pause, step, reset\n\
@@ -714,7 +922,7 @@ impl Overlay {
         grabbing: bool,
         shape: Option<(Shape, bool)>,
         currents: &[Current],
-        doomed: Option<usize>,
+        magnets: &[crate::sim::Magnet],
     ) {
         let now = ctx.input(|i| i.time);
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -731,9 +939,20 @@ impl Overlay {
         let turn = (state.jet_angle - self.shown_jet + 540.0).rem_euclid(360.0) - 180.0;
         self.shown_jet += turn * k;
 
-        for (i, current) in currents.iter().enumerate() {
-            let color = if doomed == Some(i) { DANGER } else { CURRENT };
-            draw_current(&painter, to_screen(ctx, view, size, current.pos), current.radius * zoom, current.vel, color, now);
+        for current in currents {
+            draw_current(&painter, to_screen(ctx, view, size, current.pos), current.radius * zoom, current.vel, CURRENT, now);
+        }
+        for m in magnets {
+            // A bar magnet: red north towards its pole direction, blue south.
+            let c = to_screen(ctx, view, size, m.pos);
+            let r = (m.radius * zoom).max(4.0);
+            let dir = egui::vec2(m.dir[0], -m.dir[1]);
+            let side = egui::vec2(-dir.y, dir.x) * r * 0.45;
+            let north = [c + side, c + side + dir * r, c - side + dir * r, c - side];
+            let south = [c + side, c + side - dir * r, c - side - dir * r, c - side];
+            painter.add(egui::Shape::convex_polygon(north.to_vec(), Color32::from_rgb(210, 70, 80).gamma_multiply(0.8), Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(south.to_vec(), Color32::from_rgb(80, 120, 220).gamma_multiply(0.8), Stroke::NONE));
+            painter.circle_stroke(c, r * 1.6, Stroke::new(1.0_f32, Color32::from_gray(200).gamma_multiply(0.25)));
         }
         if let Some((shape, remove)) = shape {
             outline(&painter, ctx, &shape, view, size, remove);
@@ -838,7 +1057,7 @@ impl Overlay {
     }
 }
 
-/// Draws a placed current: its zone, and chevrons drifting along it at a pace that follows
+/// Draws a current: its zone, and chevrons drifting along it at a pace that follows
 /// its speed. `vel` is in world axes (+y up), `c` and `r` in screen points.
 fn draw_current(painter: &egui::Painter, c: Pos2, r: f32, vel: [f32; 2], color: Color32, now: f64) {
     let speed = vel[0].hypot(vel[1]).max(1e-3);

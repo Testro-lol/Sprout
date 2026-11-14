@@ -158,16 +158,27 @@ pub fn jet_direction(degrees: f32) -> [f32; 2] {
 
 /// Launch velocity of a spray droplet at `p` on a stroke: outwards from the stroke at
 /// `SPRAY_SPEED`, and only from the outer rim. A dense centre would cancel opposite
-/// velocities on the grid and turn the spray back into a blob.
-pub fn spray_velocity(p: [f32; 2], from: [f32; 2], to: [f32; 2], radius: f32) -> Option<[f32; 2]> {
+/// velocities on the grid and turn the spray back into a blob. `jitter` (two numbers in
+/// 0..1) turns the direction by up to `SPRAY_SPREAD` either way and scales the speed by
+/// 1 -+ `SPRAY_SPEED_SPREAD`: the droplets start on a lattice, and launched exactly
+/// outwards at one speed every frame they flew out along the same rays, a regular sunburst.
+pub fn spray_velocity(p: [f32; 2], from: [f32; 2], to: [f32; 2], radius: f32, jitter: [f32; 2]) -> Option<[f32; 2]> {
     let length2 = (to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2);
     let offset = offset_from_stroke(p, from, to, length2);
     let distance = offset[0].hypot(offset[1]);
     if distance < radius * 0.7 || distance < 1e-4 {
         return None;
     }
-    Some([offset[0] / distance * SPRAY_SPEED, offset[1] / distance * SPRAY_SPEED])
+    let (s, c) = ((jitter[0] * 2.0 - 1.0) * SPRAY_SPREAD).sin_cos();
+    let speed = SPRAY_SPEED * (1.0 + (jitter[1] * 2.0 - 1.0) * SPRAY_SPEED_SPREAD);
+    let n = [offset[0] / distance, offset[1] / distance];
+    Some([(n[0] * c - n[1] * s) * speed, (n[0] * s + n[1] * c) * speed])
 }
+
+/// Most a spray droplet's direction turns from straight outwards, radians (about 14°).
+pub const SPRAY_SPREAD: f32 = 0.25;
+/// Its speed varies by this share either way.
+pub const SPRAY_SPEED_SPREAD: f32 = 0.25;
 
 /// Which cells of a window may still receive new liquid, so that a brush never packs a
 /// cell above rest density and adds nothing inside a pool.
@@ -339,15 +350,24 @@ mod tests {
     #[test]
     fn spray_has_no_dense_centre_and_keeps_its_launch_speed() {
         let c = [20.0, 20.0];
-        assert!(spray_velocity(c, c, c, 9.0).is_none());
-        assert!(spray_velocity([23.0, 20.0], c, c, 9.0).is_none());
+        let mid = [0.5, 0.5];
+        assert!(spray_velocity(c, c, c, 9.0, mid).is_none());
+        assert!(spray_velocity([23.0, 20.0], c, c, 9.0, mid).is_none());
         for offset in [[8.0, 0.0], [-8.0, 0.0], [0.0, 8.0], [5.0, -5.0]] {
-            let v = spray_velocity([c[0] + offset[0], c[1] + offset[1]], c, c, 9.0).unwrap();
+            let v = spray_velocity([c[0] + offset[0], c[1] + offset[1]], c, c, 9.0, mid).unwrap();
             assert!((v[0].hypot(v[1]) - SPRAY_SPEED).abs() < 0.001);
             assert!(v[0] * offset[0] + v[1] * offset[1] > 0.0);
+            // Jittered: within the spread of speed and direction, still outwards.
+            for j in [[0.0, 0.0], [1.0, 1.0], [0.2, 0.9]] {
+                let v = spray_velocity([c[0] + offset[0], c[1] + offset[1]], c, c, 9.0, j).unwrap();
+                let speed = v[0].hypot(v[1]);
+                assert!(speed >= SPRAY_SPEED * (1.0 - SPRAY_SPEED_SPREAD) - 1e-3 && speed <= SPRAY_SPEED * (1.0 + SPRAY_SPEED_SPREAD) + 1e-3);
+                let cos = (v[0] * offset[0] + v[1] * offset[1]) / (speed * offset[0].hypot(offset[1]));
+                assert!(cos >= SPRAY_SPREAD.cos() - 1e-4);
+            }
         }
         // Along a moving stroke the spray leaves sideways, not along the stroke.
-        let v = spray_velocity([30.0, 28.0], [20.0, 20.0], [40.0, 20.0], 9.0).unwrap();
+        let v = spray_velocity([30.0, 28.0], [20.0, 20.0], [40.0, 20.0], 9.0, mid).unwrap();
         assert!(v[0].abs() < 1e-3 && v[1] > 0.0);
     }
 }

@@ -8,6 +8,10 @@ use winit::{event::MouseButton, keyboard::KeyCode};
 
 use crate::scene::WALL;
 
+/// Length of the frames the script is written in, s. The app holds its frame rate to this
+/// while the script runs, whatever the display's refresh rate.
+pub const FRAME: f64 = 1.0 / 60.0;
+
 /// What the script can see of the app.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Snapshot {
@@ -30,6 +34,20 @@ pub struct Snapshot {
     pub jet_speed: f32,
     pub radial_speed: f32,
     pub panel: bool,
+    /// Custom liquids in the library (not deleted), and ids in the saved file.
+    pub custom: usize,
+    pub file_ids: usize,
+    /// The editor's liquid: its row, its particles in the tank, its live and draft viscosity,
+    /// whether the saved file holds exactly the live definition.
+    pub edit_row: usize,
+    pub edit_particles: usize,
+    pub live_visc: f32,
+    pub draft_visc: f32,
+    pub file_matches: bool,
+    /// Particles of water, magnets placed, mean temperature of the liquid (deg C).
+    pub water: usize,
+    pub magnets: usize,
+    pub mean_t: f32,
 }
 
 /// A check compares the state at the last `Mark` with the state now.
@@ -47,6 +65,23 @@ pub enum Act {
     Grid([u32; 2]),
     Mark,
     Check(&'static str, Check),
+    /// What the liquid picker and editor buttons do (editor.rs).
+    Liquid(LiquidAct),
+}
+
+#[derive(Clone, Copy)]
+pub enum LiquidAct {
+    /// Edit (a built-in is duplicated first), or Duplicate on a custom liquid.
+    Duplicate(usize),
+    /// Changes the draft, as the editor's controls do.
+    Edit(fn(&mut crate::sim::MatProps)),
+    Apply,
+    Save,
+    Delete,
+    /// Picks the editor's liquid to pour, as clicking it in the picker does.
+    Pick,
+    /// Opens the editor on a row without duplicating it (for a built-in: read-only).
+    Select(usize),
 }
 
 /// Builds the list of (frame, action) pairs.
@@ -158,18 +193,49 @@ pub fn script() -> Vec<(u64, Act)> {
     s.mark().drag(MouseButton::Left, [340.0, 180.0], [400.0, 180.0], 20);
     s.check("jet emits (J)", |m, s| s.particles > m.particles);
 
+    // Liquids: choose a preset, duplicate it, edit the draft, preview, apply, save, pour.
+    s.key(KeyR).wait(5).key(KeyQ).key(Digit1).drag(MouseButton::Left, [100.0, 150.0], [160.0, 150.0], 40).wait(30);
+    s.mark().push(Act::Liquid(LiquidAct::Duplicate(crate::sim::Material::Syrup.index()))).wait(3);
+    s.check("duplicate a preset: a new liquid, a draft not saved", |m, s| s.custom == m.custom + 1 && s.edit_row >= crate::sim::BUILTINS.len() && s.file_ids == m.file_ids);
+    s.mark().push(Act::Liquid(LiquidAct::Edit(|p| {
+        p.viscosity = 0.3;
+        p.color = [0.2, 0.8, 0.3];
+    })))
+    .wait(10);
+    s.check("editing changes the draft only", |m, s| s.draft_visc == 0.3 && s.live_visc == m.live_visc);
+    s.mark().push(Act::Liquid(LiquidAct::Apply)).wait(3).check("apply: the live table takes the draft", |_, s| s.live_visc == 0.3 && !s.file_matches);
+    s.mark().push(Act::Liquid(LiquidAct::Save)).wait(3).check("save: written to the file, read back the same", |m, s| s.file_ids == m.file_ids + 1 && s.file_matches);
+    s.mark().push(Act::Liquid(LiquidAct::Pick)).wait(2).drag(MouseButton::Left, [300.0, 150.0], [360.0, 150.0], 60).wait(10);
+    // (A syrup copy dissolves in water: water around it joins it as it mixes.)
+    s.check("pour the new liquid", |m, s| s.edit_particles > 500 && s.particles > m.particles + 500);
+    s.mark().push(Act::Liquid(LiquidAct::Edit(|p| p.viscosity = 0.01))).push(Act::Liquid(LiquidAct::Apply)).wait(5);
+    s.check("apply again: the liquid in the tank follows", |m, s| s.live_visc == 0.01 && s.edit_particles > 0 && s.particles == m.particles);
+    s.mark().push(Act::Liquid(LiquidAct::Duplicate(crate::sim::Material::Water.index()))).wait(3);
+    s.check("editing a built-in duplicates it; the water in the tank keeps its material", |m, s| s.edit_row != m.edit_row && s.edit_particles == 0 && s.water > 0 && s.particles == m.particles);
+    s.mark().push(Act::Liquid(LiquidAct::Select(crate::sim::Material::Water.index()))).push(Act::Liquid(LiquidAct::Edit(|p| p.viscosity = 0.2))).push(Act::Liquid(LiquidAct::Apply)).wait(3);
+    s.check("built-ins are read-only", |_, s| s.live_visc == 1.0e-6);
+    s.mark().push(Act::Liquid(LiquidAct::Duplicate(crate::sim::Material::Oil.index()))).push(Act::Liquid(LiquidAct::Delete)).wait(3);
+    s.check("delete a custom liquid (and only it leaves the file)", |m, s| s.custom == m.custom && s.file_ids == m.file_ids);
+    // Heat brush and magnets.
+    s.key(KeyR).wait(5).key(KeyQ).key(Digit1).drag(MouseButton::Left, [200.0, 100.0], [300.0, 100.0], 60).wait(150);
+    s.mark().key(KeyY).drag(MouseButton::Left, [230.0, 6.0], [280.0, 6.0], 90).wait(5);
+    s.check("heat brush warms the liquid (Y)", |m, s| s.mean_t > m.mean_t + 1.0);
+    s.mark().key(KeyM).click([256.0, 200.0]).check("place a magnet (M)", |m, s| s.magnets == m.magnets + 1);
+    s.mark().key(KeyX).click([256.0, 200.0]).check("remove it (X)", |m, s| s.magnets + 1 == m.magnets);
+
     // Reset, next map, and a change of resolution with fluid on screen.
     s.mark().key(KeyR).wait(5).check("reset the map (R)", |m, s| s.particles == 0 && s.shapes == 0 && s.map == m.map);
     // Isolate repulsion from gravity and other liquid: a fresh round blob.
     s.key(Space).key(KeyC).click([360.0, 180.0]).key(KeyV).mark();
     s.key(Space).push(Act::Press(MouseButton::Left)).wait(8).push(Act::Release(MouseButton::Left));
     s.check("push repels without adding liquid (V)", |m, s| s.particles == m.particles && s.radial_speed > m.radial_speed + 10.0);
-    // A blob dropped through a current that points right (Z, click) is carried right; X
-    // removes the current.
-    s.key(KeyR).wait(5).mark().key(KeyZ).click([256.0, 110.0]).key(KeyC).click([256.0, 150.0]).wait(30);
-    s.check("a current carries liquid along (Z)", |m, s| s.currents == 1 && s.particles > m.particles && s.drift > 5.0);
-    s.mark().key(KeyX).click([256.0, 110.0]).wait(3);
-    s.check("remove the current (X)", |m, s| s.currents == 0 && s.particles == m.particles);
+    // A blob dropped through the Current tool held pointing right (Z) is carried right;
+    // releasing the button ends the current.
+    s.key(KeyR).wait(5).mark().key(KeyC).click([256.0, 150.0]).key(KeyZ).push(Act::Move([256.0, 110.0]));
+    s.push(Act::Press(MouseButton::Left)).wait(30);
+    s.check("a held current carries liquid along (Z)", |m, s| s.currents == 1 && s.particles > m.particles && s.drift > 5.0);
+    s.mark().push(Act::Release(MouseButton::Left)).wait(3);
+    s.check("releasing it ends the current", |m, s| s.currents == 0 && s.particles == m.particles);
     s.key(KeyR).wait(5).key(KeyJ).push(Act::Move([256.0, 140.0])).wait(2).push(Act::Press(MouseButton::Left));
     s.wait(120).mark().wait(360);
     s.check("held jet keeps outlet power after 3s", |m, s| s.jet_speed > 100.0 && s.jet_speed > m.jet_speed * 0.7 && s.particles > m.particles);

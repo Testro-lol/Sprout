@@ -1,0 +1,53 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Smooths the per-cell optics (cell_optics.comp) before the composite reads them (README,
+// "Look"). Each cell's colour comes from the few particles in it and its frozen share from
+// that cell's mean temperature, so neighbouring cells jump: filtered bilinearly, ice was
+// drawn as staircases of whole cells and a half-mixed liquid as a grid of blocks and
+// diamonds. A 3 x 3 binomial kernel (sigma 0.7 cells) removes that cell-scale noise; 5 x 5
+// also blurred unmixed edges (a syrup stream in water) over two cells. Ice gets its crisp
+// outline back in the composite, from the smoothed frozen share.
+//
+// Every layer is premultiplied by the liquid's occupancy and share, and the composite divides
+// by the matching weight from the same image, so the blurred result is a weighted mean: no
+// colour bleeds into empty cells and the aqueous and other colours stay apart (immiscible
+// edges are drawn from the particle splat, which this does not touch). A neighbour on the
+// other side of a solid (the point halfway to it inside the solid) is left out, so colour
+// does not leak through thin walls.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 58, rgba16f) uniform readonly image2DArray raw;
+layout(set = 0, binding = 60, rgba16f) uniform writeonly image2DArray smooth_out;
+
+const int LAYERS = 9;  // sim/mod.rs: CELL_OPTICS_LAYERS
+
+// Signed distance to the solids at a node-centred position (nearest node; cells).
+float sdf_at(vec2 x) {
+    ivec2 n = clamp(ivec2(round(x)), ivec2(0), P.grid);
+    return sdf[n.y * (P.grid.x + 1) + n.x];
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    const float K[3] = float[3](1.0, 2.0, 1.0);
+    vec4 s[LAYERS] = vec4[LAYERS](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+    float wsum = 0.0;
+    vec2 here = vec2(c) + 0.5;
+    for (int b = -1; b <= 1; b++) {
+        for (int a = -1; a <= 1; a++) {
+            ivec2 q = c + ivec2(a, b);
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, P.grid))) continue;
+            if ((a != 0 || b != 0) && sdf_at(here + 0.5 * vec2(a, b)) < 0.0) continue;
+            float w = K[a + 1] * K[b + 1];
+            wsum += w;
+            for (int l = 0; l < LAYERS; l++) s[l] += w * imageLoad(raw, ivec3(q, l));
+        }
+    }
+    // Normalised by the kernel weight that was used, so a cell next to a wall or the edge
+    // keeps its level (the layers are already premultiplied by occupancy).
+    for (int l = 0; l < LAYERS; l++) imageStore(smooth_out, ivec3(c, l), s[l] / wsum);
+}

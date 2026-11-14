@@ -3,7 +3,7 @@
 #include "common.glsl"
 #include "visc.glsl"
 
-// Hands the inactive tiles (no cell reaches IMPLICIT_MIN) their explicit viscous step,
+// Hands the inactive tiles (no cell reaches implicit_viscosity_min) their explicit viscous step,
 // u = u* - M^-1 G^T W G u*, from the strain of u* computed just before over the whole grid,
 // then takes them out of the implicit system: zero weights, strain and Krylov vectors, so
 // their rows read M u = M u* and conjugate gradients never has to visit them. Faces that

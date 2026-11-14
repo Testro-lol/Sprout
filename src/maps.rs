@@ -6,7 +6,7 @@
 
 use crate::{
     scene::{Scene, Shape, WALL},
-    sim::{Material, PPC, Particle},
+    sim::{Magnet, Material, PPC, Particle},
 };
 
 /// Width of the map space; a 16:9 grid makes it 90 units tall.
@@ -32,10 +32,33 @@ impl MapDef {
 pub struct MapBuilder {
     scale: f32,
     shapes: Vec<Shape>,
-    fills: Vec<([f32; 4], Material)>,
+    temps: Vec<Option<f32>>,
+    /// Rectangle, material, temperature (°C; `None` = the material's spawn temperature).
+    fills: Vec<([f32; 4], Material, Option<f32>)>,
+    magnets: Vec<Magnet>,
+    ambient: Option<f32>,
 }
 
 impl MapBuilder {
+    /// Holds the shape added last at `t` °C (a hot plate, a cold block).
+    fn held_at(&mut self, t: f32) {
+        let n = self.shapes.len();
+        self.temps.resize(n, None);
+        self.temps[n - 1] = Some(t);
+    }
+
+    /// A magnet at (x, y), radius r (map units), north pole `degrees` clockwise from up,
+    /// field `tesla` at its rim.
+    fn magnet(&mut self, x: f32, y: f32, r: f32, degrees: f32, tesla: f32) {
+        let s = self.scale;
+        self.magnets.push(Magnet::new([x * s, y * s], r * s, degrees, tesla));
+    }
+
+    /// The air temperature of the map, °C.
+    fn air(&mut self, t: f32) {
+        self.ambient = Some(t);
+    }
+
     fn circle(&mut self, x: f32, y: f32, r: f32) {
         let s = self.scale;
         self.shapes.push(Shape::Circle { c: [x * s, y * s], r: r * s });
@@ -74,7 +97,7 @@ impl MapBuilder {
     }
 
     fn fill(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, material: Material) {
-        self.fills.push(([x0, y0, x1, y1], material));
+        self.fills.push(([x0, y0, x1, y1], material, None));
     }
 }
 
@@ -316,6 +339,108 @@ pub const MAPS: &[MapDef] = &[
             m.fill(140.0, 50.0, 146.0, 54.0, Material::Water);
         },
     },
+    MapDef {
+        name: "Lava Meets Water",
+        blurb: "Basaltic lava at 1200 °C runs down a slope into a pool: the water flashes off, the lava crusts and sets.",
+        width_m: 0.0,
+        build: |m| {
+            m.wedge(0.0, 0.0, 70.0, 36.0, false);
+            m.fill(4.0, 40.0, 30.0, 62.0, Material::Lava);
+            m.fill(78.0, 0.0, 160.0, 18.0, Material::Water);
+            m.rect(70.0, 0.0, 74.0, 10.0);
+        },
+    },
+    MapDef {
+        name: "Density Tower",
+        blurb: "Mercury, water, oil and molten wax poured in the wrong order sort themselves by density.",
+        width_m: 0.0,
+        build: |m| {
+            m.fill(40.0, 0.0, 120.0, 10.0, Material::Wax);
+            m.fill(40.0, 10.0, 120.0, 20.0, Material::Oil);
+            m.fill(40.0, 20.0, 120.0, 32.0, Material::Water);
+            m.fill(60.0, 40.0, 100.0, 46.0, Material::Mercury);
+            m.rect(34.0, 0.0, 38.0, 50.0);
+            m.rect(122.0, 0.0, 126.0, 50.0);
+        },
+    },
+    MapDef {
+        name: "Glass and Slime",
+        blurb: "Molten glass droops off a ledge in strands and sets as it cools; slime drops onto a peg, stretches and springs back.",
+        width_m: 0.0,
+        build: |m| {
+            m.rect(0.0, 48.0, 48.0, 52.0);
+            m.fill(6.0, 52.0, 40.0, 70.0, Material::Glass);
+            m.circle(118.0, 30.0, 4.0);
+            m.fill(108.0, 52.0, 128.0, 70.0, Material::Slime);
+            m.wedge(60.0, 0.0, 100.0, 14.0, true);
+        },
+    },
+    MapDef {
+        name: "Mud Flats",
+        blurb: "Mud slumps and settles out, a pile of sludge holds its shape, oobleck takes a falling ball of mercury.",
+        width_m: 0.0,
+        build: |m| {
+            m.fill(4.0, 0.0, 40.0, 30.0, Material::Mud);
+            m.fill(58.0, 0.0, 78.0, 28.0, Material::Sludge);
+            m.fill(100.0, 0.0, 156.0, 16.0, Material::Oobleck);
+            m.fill(124.0, 60.0, 130.0, 66.0, Material::Mercury);
+            m.fill(40.0, 0.0, 56.0, 6.0, Material::Water);
+        },
+    },
+    MapDef {
+        name: "Ferrofluid",
+        blurb: "A tabletop dish of ferrofluid over a strong magnet: it heaps up and breaks into spikes (1 mm cells; spacing ~1 cm).",
+        // 1 mm cells at the default resolution: the spikes' spacing, 2 pi sqrt(sigma / (rho g))
+        // ~ 1 cm, spans about ten cells. On 1 cm cells it is below one cell: not resolved.
+        width_m: 0.512,
+        build: |m| {
+            m.fill(20.0, 0.0, 140.0, 6.0, Material::Ferrofluid);
+            m.magnet(80.0, -6.0, 5.0, 0.0, 0.5);
+            m.fill(10.0, 60.0, 16.0, 66.0, Material::Ferrofluid);
+        },
+    },
+    MapDef {
+        name: "Kitchen",
+        blurb: "Chocolate poured onto a cold plate sets; milk, ink and blood sink and spread through water in plumes.",
+        width_m: 0.0,
+        build: |m| {
+            m.rect(4.0, 36.0, 60.0, 40.0);
+            m.held_at(4.0);
+            m.fill(14.0, 48.0, 40.0, 66.0, Material::Chocolate);
+            m.fill(72.0, 0.0, 158.0, 30.0, Material::Water);
+            m.rect(66.0, 0.0, 70.0, 34.0);
+            m.fill(84.0, 50.0, 92.0, 58.0, Material::Milk);
+            m.fill(110.0, 50.0, 118.0, 58.0, Material::Ink);
+            m.fill(136.0, 50.0, 144.0, 58.0, Material::Blood);
+        },
+    },
+    MapDef {
+        name: "Cold Snap",
+        blurb: "Air at -15 °C: the water freezes over and the brine does not; molten wax on a hot plate stays liquid, beside it it sets.",
+        width_m: 0.0,
+        build: |m| {
+            m.air(-15.0);
+            m.fill(0.0, 0.0, 48.0, 12.0, Material::Water);
+            m.rect(48.0, 0.0, 52.0, 20.0);
+            m.fill(52.0, 0.0, 100.0, 12.0, Material::Brine);
+            m.rect(100.0, 0.0, 104.0, 20.0);
+            m.rect(108.0, 0.0, 130.0, 3.0);
+            m.held_at(80.0);
+            m.fill(110.0, 3.0, 150.0, 14.0, Material::Wax);
+        },
+    },
+    MapDef {
+        name: "Gallium",
+        blurb: "Liquid gallium on a tabletop: its oxide skin holds lumpy shapes until a knock breaks it (1 mm cells).",
+        width_m: 0.512,
+        build: |m| {
+            m.air(35.0);
+            m.fill(30.0, 0.0, 50.0, 12.0, Material::Gallium);
+            m.fill(90.0, 30.0, 104.0, 44.0, Material::Gallium);
+            m.rect(70.0, 20.0, 120.0, 22.0);
+            m.fill(130.0, 0.0, 140.0, 30.0, Material::Gallium);
+        },
+    },
 ];
 
 /// Deterministic jitter so maps start identically on every run.
@@ -355,17 +480,36 @@ pub fn fill_rect(scene: &Scene, rect: [f32; 4], material: Material, out: &mut Ve
     }
 }
 
+/// What a map sets besides solids and liquid.
+#[derive(Clone, Debug, Default)]
+pub struct MapExtras {
+    pub magnets: Vec<Magnet>,
+    /// Air temperature, °C (`None`: the default).
+    pub ambient: Option<f32>,
+}
+
 /// Instantiates a map on a grid: the static scene plus its initial particles.
+#[cfg(test)]
 pub fn build(map: &MapDef, grid: [u32; 2]) -> (Scene, Vec<Particle>) {
-    let scale = grid[0] as f32 / MAP_W;
-    let mut b = MapBuilder { scale, shapes: Vec::new(), fills: Vec::new() };
-    (map.build)(&mut b);
-    let scene = Scene { grid, shapes: b.shapes };
-    let mut particles = Vec::new();
-    for (r, material) in b.fills {
-        fill_rect(&scene, [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale], material, &mut particles);
-    }
+    let (scene, particles, _) = build_full(map, grid);
     (scene, particles)
+}
+
+/// `build`, with the map's magnets and air temperature.
+pub fn build_full(map: &MapDef, grid: [u32; 2]) -> (Scene, Vec<Particle>, MapExtras) {
+    let scale = grid[0] as f32 / MAP_W;
+    let mut b = MapBuilder { scale, shapes: Vec::new(), temps: Vec::new(), fills: Vec::new(), magnets: Vec::new(), ambient: None };
+    (map.build)(&mut b);
+    let scene = Scene { grid, shapes: b.shapes, temps: b.temps };
+    let mut particles = Vec::new();
+    for (r, material, t) in b.fills {
+        let start = particles.len();
+        fill_rect(&scene, [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale], material, &mut particles);
+        if let Some(t) = t {
+            particles[start..].iter_mut().for_each(|p| *p = p.at_temp(t));
+        }
+    }
+    (scene, particles, MapExtras { magnets: b.magnets, ambient: b.ambient })
 }
 
 #[cfg(test)]
@@ -407,6 +551,6 @@ mod tests {
         fill_rect(&scene, [0.0, 0.0, 64.0, 23.0], Material::Syrup, &mut out);
         // The frame takes WALL cells off each side and the bottom.
         assert_eq!(out.len(), (58 * 20 * PPC) as usize);
-        assert!(out.iter().all(|p| p.s == 1.0 && p.pos[0] > WALL && p.pos[0] < 64.0 - WALL && p.pos[1] > WALL));
+        assert!(out.iter().all(|p| p.s == crate::sim::SPAWN_S && p.pos[0] > WALL && p.pos[0] < 64.0 - WALL && p.pos[1] > WALL));
     }
 }

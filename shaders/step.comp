@@ -47,4 +47,5 @@ void main() {
     S.substeps += 1u;
     S.umax_grid = 0u;
     S.umax_part = 0u;
+    region_air = 0u;  // grid_prep.comp marks the regions that hold air
 }

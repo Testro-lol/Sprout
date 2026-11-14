@@ -30,7 +30,7 @@ use crate::{
     render::Renderer,
     scene::Shape,
     selftest::{self, Act, Snapshot},
-    sim::{Current, KIND_OIL, Material, ToolState},
+    sim::{Current, Material, ToolState},
     ui::{self, Overlay, Tool, UiActions, UiState},
     world::{Source, World},
 };
@@ -40,6 +40,8 @@ pub struct AppOptions {
     pub grid: [u32; 2],
     pub size: [u32; 2],
     pub vsync: bool,
+    /// Lowest frame rate kept at real time (`UiState::min_fps`); `None` keeps the default.
+    pub min_fps: Option<f32>,
     pub overrides: Vec<(String, f32)>,
     /// Exit after this many frames and print frame timings (for benchmarking).
     pub frames: Option<u64>,
@@ -68,7 +70,8 @@ struct Win {
 struct Input {
     cursor_px: [f32; 2],
     cursor_world: [f32; 2],
-    prev_world: [f32; 2],
+    /// Where the cursor was on screen at the last frame, pixels.
+    prev_px: [f32; 2],
     /// Smoothed cursor velocity in cells/s.
     velocity: [f32; 2],
     left: bool,
@@ -96,6 +99,8 @@ struct App {
     /// Frame times of the whole run, kept only for `--frames`.
     bench: Vec<f32>,
     selftest: Option<SelfTest>,
+    /// Liquid swatches, drawn by the renderer (made with the window).
+    swatches: Option<crate::editor::Swatches>,
 }
 
 /// Progress through the `--selftest` script.
@@ -113,7 +118,10 @@ pub fn run(event_loop: EventLoop<()>, gpu: Arc<Gpu>, opts: AppOptions) -> bool {
         world.sim.params.set(k, *v);
         world.scale_locked |= k == "cell_size";
     }
-    let ui = UiState { vsync: opts.vsync, grid: opts.grid, ..Default::default() };
+    let mut ui = UiState { vsync: opts.vsync, grid: opts.grid, ..Default::default() };
+    if let Some(f) = opts.min_fps {
+        ui.min_fps = f;
+    }
     let mut app = App {
         camera: Camera::new(opts.grid, opts.size),
         overlay: Overlay::default(),
@@ -130,7 +138,22 @@ pub fn run(event_loop: EventLoop<()>, gpu: Arc<Gpu>, opts: AppOptions) -> bool {
         frame_index: 0,
         bench: Vec::new(),
         selftest: None,
+        swatches: None,
     };
+    // Custom liquids. The self-test uses a library of its own, never the user's.
+    let path = if app.opts.selftest {
+        std::env::temp_dir().join(format!("sprout-selftest-{}", std::process::id())).join("liquids.json")
+    } else {
+        crate::library::Library::default_path()
+    };
+    let library = crate::library::Library::load(path);
+    for w in &library.warnings {
+        eprintln!("liquids file: {w}");
+    }
+    if !library.warnings.is_empty() {
+        app.ui.editor.message = Some((format!("{} warning(s) loading the liquids file (see the terminal)", library.warnings.len()), false));
+    }
+    app.world.set_library(library);
     if app.opts.selftest {
         app.selftest = Some(SelfTest { script: selftest::script(), next: 0, mark: Snapshot::default(), failures: 0 });
     }
@@ -159,6 +182,9 @@ fn tool_for_key(code: KeyCode) -> Option<Tool> {
         KeyCode::KeyS => Tool::Box,
         KeyCode::KeyD => Tool::Ramp,
         KeyCode::KeyX => Tool::Remove,
+        KeyCode::KeyY => Tool::Heat,
+        KeyCode::KeyU => Tool::Cool,
+        KeyCode::KeyM => Tool::Magnet,
         _ => return None,
     })
 }
@@ -248,15 +274,11 @@ impl Win {
         }
     }
 
-    /// GPU time a frame may spend on the simulation, s: four fifths of the refresh interval
-    /// when presenting with vsync (the rest is for rendering), of 1/60 s otherwise.
-    fn sim_budget(&self, vsync: bool) -> f32 {
-        let refresh = self.window.current_monitor().and_then(|m| m.refresh_rate_millihertz());
-        let interval = match refresh {
-            Some(mhz) if vsync => 1000.0 / mhz.max(1) as f32,
-            _ => 1.0 / 60.0,
-        };
-        0.8 * interval
+    /// GPU time a frame may spend on the simulation, s: four fifths (the rest is for
+    /// rendering) of a frame at `min_fps`, the lowest frame rate the simulation may push the
+    /// app down to before simulated time slows down instead.
+    fn sim_budget(min_fps: f32) -> f32 {
+        0.8 / min_fps.max(1.0)
     }
 
     fn size(&self) -> [u32; 2] {
@@ -330,6 +352,9 @@ impl App {
         if actions.reset_view {
             self.reset_view(true);
         }
+        if actions.clean_stains {
+            self.world.sim.clean_stains();
+        }
         if actions.vsync_changed && let Some(win) = &mut self.win {
             win.recreate = true;
         }
@@ -348,9 +373,10 @@ impl App {
             KeyCode::Space => self.ui.paused = !self.ui.paused,
             KeyCode::KeyN | KeyCode::Period => a.step = true,
             KeyCode::KeyR => a.reset = true,
-            KeyCode::Digit1 => self.ui.pick_material(Material::Water),
-            KeyCode::Digit2 => self.ui.pick_material(Material::Oil),
-            KeyCode::Digit3 => self.ui.pick_material(Material::Syrup),
+            KeyCode::Digit1 => self.ui.pick_material(Material(self.ui.favourites[0] as u8)),
+            KeyCode::Digit2 => self.ui.pick_material(Material(self.ui.favourites[1] as u8)),
+            KeyCode::Digit3 => self.ui.pick_material(Material(self.ui.favourites[2] as u8)),
+            KeyCode::Digit4 => self.ui.pick_material(Material(self.ui.favourites[3] as u8)),
             KeyCode::BracketLeft => self.ui.scale_brush(1.0 / 1.15),
             KeyCode::BracketRight => self.ui.scale_brush(1.15),
             KeyCode::Minus => self.ui.scale_rate(1.0 / 1.25),
@@ -414,6 +440,8 @@ impl App {
             let _ = f.wait(None);
         }
         let ps = self.world.sim.download_particles();
+        let ed = &self.ui.editor;
+        let file = crate::library::Library::load(self.world.library.path.clone()).custom;
         let speed2: f32 = ps.iter().map(|p| p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sum();
         let direction = brush::jet_direction(self.ui.jet_angle);
         let mut axial = 0.0;
@@ -432,8 +460,8 @@ impl App {
             jet_speed: axial / outlet_count.max(1) as f32,
             radial_speed: radial / ps.len().max(1) as f32,
             particles: ps.len(),
-            oil: ps.iter().filter(|p| p.kind == KIND_OIL).count(),
-            syrup: ps.iter().filter(|p| p.kind != KIND_OIL).map(|p| p.s).sum(),
+            oil: ps.iter().filter(|p| p.is(Material::Oil)).count(),
+            syrup: ps.iter().map(|p| p.share(Material::Syrup, &self.world.sim.params)).sum(),
             rms_speed: (speed2 / ps.len().max(1) as f32).sqrt(),
             shapes: self.world.scene.shapes.len(),
             substeps: self.world.sim.substeps_done(),
@@ -446,6 +474,17 @@ impl App {
             drift: ps.iter().map(|p| p.vel[0]).sum::<f32>() / ps.len().max(1) as f32,
             jet_angle: self.ui.jet_angle,
             panel: self.ui.show_panel,
+            custom: self.world.library.custom.iter().filter(|c| !c.deleted).count(),
+            file_ids: file.len(),
+            edit_row: ed.row,
+            edit_particles: ps.iter().filter(|p| p.material().is_some_and(|m| m.index() == ed.row)).count(),
+            live_visc: self.world.sim.params.mat[ed.row].viscosity,
+            draft_visc: ed.draft.viscosity,
+            file_matches: ed.row >= crate::sim::BUILTINS.len()
+                && file.iter().zip(&self.world.library.custom).any(|(f, c)| f.id == c.id && f.props == self.world.sim.params.mat[ed.row] && crate::library::custom_row(self.world.library.custom.iter().position(|x| x.id == c.id).unwrap()) == ed.row),
+            water: ps.iter().filter(|p| p.is(Material::Water)).count(),
+            magnets: self.world.sim.magnets().len(),
+            mean_t: ps.iter().map(|p| self.world.sim.params.temperature(p).0).sum::<f32>() / ps.len().max(1) as f32,
         }
     }
 
@@ -468,6 +507,30 @@ impl App {
                 Act::Wheel(lines) => self.wheel(lines),
                 Act::Grid(grid) => self.apply(UiActions { grid: Some(grid), ..Default::default() }, Some(event_loop)),
                 Act::Mark => test.mark = self.snapshot(),
+                Act::Liquid(act) => {
+                    use selftest::LiquidAct;
+                    let ed = &mut self.ui.editor;
+                    match act {
+                        LiquidAct::Duplicate(row) => {
+                            ed.duplicate(&mut self.world, row);
+                        }
+                        LiquidAct::Edit(f) => f(&mut ed.draft),
+                        LiquidAct::Apply => {
+                            ed.apply(&mut self.world);
+                        }
+                        LiquidAct::Save => {
+                            ed.save(&mut self.world);
+                        }
+                        LiquidAct::Delete => {
+                            ed.delete(&mut self.world);
+                        }
+                        LiquidAct::Pick => {
+                            let row = ed.row;
+                            self.ui.pick_material(Material(row as u8));
+                        }
+                        LiquidAct::Select(row) => ed.select(&self.world, row),
+                    }
+                }
                 Act::Check(what, check) => {
                     let now = self.snapshot();
                     let ok = check(&test.mark, &now);
@@ -476,6 +539,9 @@ impl App {
                         "  [{}] {:<38} {} particles ({} oil, {:.0} syrup), {} solids, rms {:.0} cells/s",
                         if ok { "pass" } else { "FAIL" }, what, now.particles, now.oil, now.syrup.abs(), now.shapes, now.rms_speed.abs()
                     );
+                    if !ok {
+                        println!("         at the mark: {:?}\n         now:         {:?}", test.mark, now);
+                    }
                 }
             }
         }
@@ -492,9 +558,8 @@ impl App {
         let (tool, material, radius) = (self.ui.tool, self.ui.material, self.ui.brush);
         let done = match tool {
             Tool::Drop => self.world.stamp(material, at, radius) > 0,
-            Tool::Current => self.world.add_current(Current::new(at, radius, self.ui.current_angle, self.ui.force_strength)),
-            // Currents lie on top of the solids.
-            Tool::Remove => self.world.remove_current_at(at) || self.world.remove_shape_at(at),
+            Tool::Remove => self.world.remove_shape_at(at) || self.world.remove_magnet_at(at),
+            Tool::Magnet => self.world.add_magnet(crate::sim::Magnet::new(at, radius.max(2.0), 0.0, self.ui.magnet_strength)),
             _ => match pending_shape(&self.ui, at) {
                 Some(shape) => {
                     self.world.add_shape(shape);
@@ -590,6 +655,13 @@ impl App {
         win.recreate |= suboptimal;
 
         // ---- time ------------------------------------------------------------------
+        // The self-test script counts frames of 1/60 s. Vsync alone does not give it those:
+        // on a faster display (144 Hz, say) each scripted wait covered less than half the
+        // simulated time it was written for, and liquid had not got where a check expected it.
+        if self.selftest.is_some() {
+            let due = self.last_frame + std::time::Duration::from_secs_f64(selftest::FRAME);
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        }
         let now = Instant::now();
         let frame_dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -599,7 +671,7 @@ impl App {
         let mut plan = Plan { substeps: 0, target: 0.0, expected: 0.0 };
         if !self.ui.paused {
             let cost = self.world.sim.substep_cost();
-            plan = self.pacer.plan(frame_dt, dt, fixed, self.ui.time_scale, cost, win.sim_budget(self.ui.vsync));
+            plan = self.pacer.plan(frame_dt, dt, fixed, self.ui.time_scale, cost, Win::sim_budget(self.ui.min_fps));
         } else if self.step_once {
             plan = Plan { substeps: 1, target: dt, expected: dt };
         }
@@ -613,14 +685,18 @@ impl App {
         let view = self.camera.view;
         let input = &mut self.input;
         input.cursor_world = view.screen_to_world(input.cursor_px, size);
+        // The cursor's own motion, both ends seen through this frame's view: while the camera
+        // eases (a zoom, Home) the point under a still cursor moves through the world, and
+        // stirring then flung the liquid along with the view.
+        let before = view.screen_to_world(input.prev_px, size);
         let raw_vel = [
-            (input.cursor_world[0] - input.prev_world[0]) / frame_dt.max(1e-4),
-            (input.cursor_world[1] - input.prev_world[1]) / frame_dt.max(1e-4),
+            (input.cursor_world[0] - before[0]) / frame_dt.max(1e-4),
+            (input.cursor_world[1] - before[1]) / frame_dt.max(1e-4),
         ];
         let blend = (frame_dt * 30.0).min(1.0);
         input.velocity[0] += (raw_vel[0] - input.velocity[0]) * blend;
         input.velocity[1] += (raw_vel[1] - input.velocity[1]) * blend;
-        input.prev_world = input.cursor_world;
+        input.prev_px = input.cursor_px;
 
         let ppp = win.egui_ctx.pixels_per_point();
         let over_panel = win.egui_ctx.layer_id_at(egui::pos2(input.cursor_px[0] / ppp, input.cursor_px[1] / ppp))
@@ -643,6 +719,8 @@ impl App {
             tool.strength *= self.ui.force_strength;
         } else if held && self.ui.tool == Tool::Erase {
             tool = ToolState::erase(at, radius);
+        } else if held && matches!(self.ui.tool, Tool::Heat | Tool::Cool) {
+            tool = ToolState::heat(at, radius, self.ui.tool == Tool::Cool);
         } else if held && let Some(source) = source {
             // The stroke is laid out for the time the simulation is about to advance, so
             // nothing is emitted while paused (single steps still emit).
@@ -652,26 +730,30 @@ impl App {
         if !(held && source.is_some()) {
             self.world.end_stroke();
         }
+        // The Current tool drives the liquid under the cursor while the button is held.
+        let current = (held && self.ui.tool == Tool::Current)
+            .then(|| Current::new(at, radius, self.ui.current_angle, self.ui.current_strength));
+        self.world.hold_current(current);
 
         // ---- UI --------------------------------------------------------------------
         let raw_input = win.egui_state.take_egui_input(&win.window);
-        let doomed = if self.ui.tool == Tool::Remove { self.world.pick_current(at) } else { None };
         let shape = if self.ui.tool == Tool::Remove {
-            self.world.scene.pick(at).filter(|_| doomed.is_none()).map(|i| (self.world.scene.shapes[i], true))
+            self.world.scene.pick(at).map(|i| (self.world.scene.shapes[i], true))
         } else {
             pending_shape(&self.ui, at).map(|s| (s, false))
         };
         let mut actions = UiActions::default();
         let (pressed, grabbing) = (on_canvas && (self.input.left || self.input.right), on_canvas && self.input.right);
         let full = win.egui_ctx.run(raw_input, |ctx| {
-            actions = ui::build(ctx, &mut self.ui, &mut self.world);
+            let swatches = self.swatches.get_or_insert_with(|| crate::editor::Swatches::new(self.gpu.clone()));
+            actions = ui::build(ctx, &mut self.ui, &mut self.world, swatches);
             let now = (self.ui.tool, self.ui.material);
             if now.0 != self.shown.0 || (now.1 != self.shown.1 && self.ui.tool.uses_material()) {
                 self.overlay.toast_tool(ctx, &self.ui);
             }
             self.shown = now;
             let hover = self.input.inside && !ctx.is_pointer_over_area();
-            self.overlay.draw(ctx, &self.ui, view, size, hover.then_some(at), pressed, grabbing, shape.filter(|_| hover), self.world.currents(), doomed.filter(|_| hover));
+            self.overlay.draw(ctx, &self.ui, view, size, hover.then_some(at), pressed, grabbing, shape.filter(|_| hover), self.world.currents(), self.world.sim.magnets());
         });
         win.egui_state.handle_platform_output(&win.window, full.platform_output);
         let primitives = win.egui_ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -685,6 +767,7 @@ impl App {
         }
         win.painter.update_textures(&mut b, &full.textures_delta);
         let painter = &mut win.painter;
+        win.renderer.look = self.ui.look;
         win.renderer.render(&mut b, win.views[image_index as usize].clone(), &self.world.sim, view, |b| {
             painter.paint(b, &primitives, full.pixels_per_point, size)
         });

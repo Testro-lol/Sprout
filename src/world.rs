@@ -66,6 +66,10 @@ pub struct World {
     sdf: Vec<f32>,
     /// `--set cell_size=...` was given: maps do not change the physical scale.
     pub scale_locked: bool,
+    /// Custom liquids (their rows of the material table follow the built-ins).
+    pub library: crate::library::Library,
+    /// Ids of the custom liquids as last written to (or read from) the library file.
+    pub saved_ids: Vec<String>,
 }
 
 impl World {
@@ -92,7 +96,17 @@ impl World {
     }
 
     fn assemble(scene: Scene, sim: FluidSim) -> World {
-        World { scene, sim, map: 0, rng: 0x1234_5678, emitter: Emitter::default(), sdf: Vec::new(), scale_locked: false }
+        World {
+            scene,
+            sim,
+            map: 0,
+            rng: 0x1234_5678,
+            emitter: Emitter::default(),
+            sdf: Vec::new(),
+            scale_locked: false,
+            library: Default::default(),
+            saved_ids: Vec::new(),
+        }
     }
 
     /// Rasterises the scene's solids for the solver (and for the brushes).
@@ -119,7 +133,9 @@ impl World {
     pub fn load_map(&mut self, map: usize) {
         self.map = map.min(MAPS.len() - 1);
         self.apply_map_scale();
-        let (scene, particles) = maps::build(&MAPS[self.map], self.sim.grid);
+        let (scene, particles, extras) = maps::build_full(&MAPS[self.map], self.sim.grid);
+        self.sim.params.ambient_temp = extras.ambient.unwrap_or(crate::sim::T_REF);
+        self.sim.set_magnets(&extras.magnets);
         self.scene = scene;
         self.refresh_solids();
         self.sim.reset(particles);
@@ -147,6 +163,37 @@ impl World {
     }
 
     /// Places a current, unless the world already holds `MAX_CURRENTS`.
+    /// Uses this library of custom liquids: their definitions go into the material table.
+    pub fn set_library(&mut self, library: crate::library::Library) {
+        library.install(&mut self.sim.params);
+        self.saved_ids = library.custom.iter().map(|c| c.id.clone()).collect();
+        self.library = library;
+    }
+
+    /// Places a magnet, unless the world already holds `MAX_MAGNETS`.
+    pub fn add_magnet(&mut self, magnet: crate::sim::Magnet) -> bool {
+        let mut magnets = self.sim.magnets().to_vec();
+        if magnets.len() >= crate::sim::MAX_MAGNETS {
+            return false;
+        }
+        magnets.push(magnet);
+        self.sim.set_magnets(&magnets);
+        true
+    }
+
+    /// Removes the magnet under `pos`, if any.
+    pub fn remove_magnet_at(&mut self, pos: [f32; 2]) -> bool {
+        let mut magnets = self.sim.magnets().to_vec();
+        match magnets.iter().position(|m| (m.pos[0] - pos[0]).hypot(m.pos[1] - pos[1]) < m.radius.max(3.0)) {
+            Some(i) => {
+                magnets.remove(i);
+                self.sim.set_magnets(&magnets);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn add_current(&mut self, current: Current) -> bool {
         let mut currents = self.currents().to_vec();
         if currents.len() >= MAX_CURRENTS {
@@ -155,6 +202,12 @@ impl World {
         currents.push(current);
         self.sim.set_currents(&currents);
         true
+    }
+
+    /// The Current tool held at the cursor: the world's only current while held, none
+    /// otherwise.
+    pub fn hold_current(&mut self, current: Option<Current>) {
+        self.sim.set_currents(current.as_slice());
     }
 
     /// The topmost (latest) current under `pos`.
@@ -234,12 +287,17 @@ impl World {
         }
         let mut admission = self.admission(from, to, radius + 1.0, false);
         let mut particles = Vec::with_capacity(count.min(candidates.len()));
-        for pos in candidates {
+        for mut pos in candidates {
+            if spray {
+                // Off the lattice a little, so that the droplets do not leave in rows.
+                pos = [pos[0] + (self.rand() - 0.5) * 0.6 * spacing, pos[1] + (self.rand() - 0.5) * 0.6 * spacing];
+            }
             if self.solid_distance(pos) <= 0.4 {
                 continue;
             }
             let vel = if spray {
-                match brush::spray_velocity(pos, from, to, radius) {
+                let jitter = [self.rand(), self.rand()];
+                match brush::spray_velocity(pos, from, to, radius, jitter) {
                     Some(v) => v,
                     None => continue,
                 }

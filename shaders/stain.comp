@@ -1,0 +1,52 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "optics.glsl"
+
+// The stain map (README, "Look"): what liquids leave behind on solids and on the back wall
+// of the tank, kept for as long as the tank runs. One texel per cell: the stain's colour
+// (sRGB) times its cover, and the cover, 0..1.
+//
+// Each frame that simulated, every cell with liquid in it lays down its stain (the
+// material's `stain`, blended by concentration as the other optics are) at a rate that is
+// higher against a solid than in open water (where it marks the back wall), towards the
+// colour of that liquid. Liquid that does not stain washes the stain off, faster where it
+// moves. Everything is relaxation in the simulated time step, so it does not depend on the
+// frame rate.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform SPC {
+    float dt;          // simulated time since the last update, s
+    float wall_rate;   // 1/s, stain 1 against a solid
+    float back_rate;   // 1/s, stain 1 against the back wall
+    float wash_rate;   // 1/s, a liquid that does not stain, at rest
+} SP;
+
+layout(set = 0, binding = 58, rgba16f) uniform readonly image2DArray raw;
+layout(set = 0, binding = 64, rgba16f) uniform image2D stain;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid)) || SP.dt <= 0.0) return;
+    vec4 l4 = imageLoad(raw, ivec3(c, 4));
+    float occ = l4.w;
+    if (occ < 0.02) return;
+    vec4 st = imageLoad(stain, c);
+    float sk = clamp(imageLoad(raw, ivec3(c, 8)).x / occ, 0.0, 1.0);
+    float waq = l4.z, wot = max(occ - waq, 0.0);
+    vec3 ca = waq > 1e-4 ? resolve_colour(imageLoad(raw, ivec3(c, 0)) / waq) : vec3(0.0);
+    vec3 co = wot > 1e-4 ? resolve_colour(imageLoad(raw, ivec3(c, 1)) / wot) : vec3(0.0);
+    vec3 col = mix(ca, co, wot / occ);
+    int w1 = P.grid.x + 1, k = c.y * w1 + c.x;
+    float d = 0.25 * (sdf[k] + sdf[k + 1] + sdf[k + w1] + sdf[k + w1 + 1]);
+    float rate = mix(SP.back_rate, SP.wall_rate, 1.0 - smoothstep(1.0, 2.5, d));
+    // (A droplet marks what it passes nearly as well as a body of liquid: by the square
+    // root of the occupancy.)
+    float o = sqrt(min(occ, 1.0));
+    float dep = 1.0 - exp(-SP.dt * rate * sk * o);
+    float speed = imageLoad(raw, ivec3(c, 3)).w / occ;
+    float wash = 1.0 - exp(-SP.dt * SP.wash_rate * o * (1.0 - sk) * (0.25 + 2.0 * speed));
+    st = st * (1.0 - dep) * (1.0 - wash) + dep * vec4(col, 1.0);
+    imageStore(stain, c, st);
+}

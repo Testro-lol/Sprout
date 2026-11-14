@@ -3,15 +3,20 @@
 mod app;
 mod brush;
 mod camera;
+mod checks;
+mod editor;
 mod gpu;
 mod gui;
 mod headless;
+mod lab;
+mod library;
 mod maps;
 mod pacing;
 mod render;
 mod scene;
 mod selftest;
 mod sim;
+mod stress;
 mod ui;
 mod validate;
 mod world;
@@ -25,10 +30,15 @@ USAGE:
     sprout [OPTIONS]                 run the interactive sandbox
     sprout shot OUT.png [OPTIONS]    render a map off-screen
     sprout bench [OPTIONS]           measure simulation and rendering throughput
-    sprout validate [TEST]           run the physics and tool checks (hydrostatic, dam, ritter, layers,
-                                     viscosity, viscous, buoyancy, surface, settle, convergence, pour, current, tools)
+    sprout validate [TEST]           run the physics and tool checks; TEST picks one of hydrostatic, sealed, dam,
+                                     ritter, layers, viscosity, viscous, buoyancy, surface, settle, convergence,
+                                     pour, current, tools, thermal, rheology, suspension, elastic, metals, mixing,
+                                     and the robustness runs maps, liquids, abuse, extremes, render
+    sprout lab [SETTLE COOL RADIUS DIR]  lava into water under the Cool brush, with a heat budget (README)
+    sprout gallery [DIR] [SCENE]     render the reference pictures of every liquid, interaction and tool
     sprout --selftest                drive the real window through every tool and control
     sprout maps                      list the built-in maps
+    sprout params                    list every physics and solver parameter with its unit and range
 
 OPTIONS:
     --map <N|name>        starting map (default 0)
@@ -42,7 +52,18 @@ OPTIONS:
     --shots <DIR>         validate: save a picture of each scenario
     --no-vsync            present as fast as possible (uncapped frame rate)
     --frames <N>          run N frames, print frame timings and exit
-    --set <name=value>    override a physics parameter (repeatable, SI units), e.g. --set nu_syrup=0.09
+    --min-fps <F>         lowest frame rate kept at real time; heavier scenes go into slow
+                          motion instead (default 60, 20-240; also in the panel)
+    --set <name=value>    override a parameter (repeatable; units and ranges in `sprout params`),
+                          e.g. --set viscosity_syrup=0.09 or --set speed_cap=0 (off)
+
+ENVIRONMENT (developer aids):
+    SPROUT_FRAMES_CSV=<path>   with --frames: write every frame time (s) to <path>
+    SPROUT_CASE=<name>         validate surface: run one case (drop, oildisc, waterdrop, oildrop,
+                               syrup, contact, bead)
+    SPROUT_TRACE=1             validate surface: print the oscillation samples
+    SPROUT_RAD=<cells>         validate surface: radius of the oscillating drops (resolution
+                               studies; the checks' tolerances are set for the default 20)
 ";
 
 fn parse_pair(s: &str) -> Option<[u32; 2]> {
@@ -58,6 +79,7 @@ pub struct Options {
     pub positional: Vec<String>,
     pub vsync: bool,
     pub frames: Option<u64>,
+    pub min_fps: Option<f32>,
     pub with_ui: bool,
     pub selftest: bool,
     /// validate: directory for a picture of each scenario.
@@ -78,7 +100,7 @@ impl Options {
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
-    let mut o = Options { map: 0, grid: [512, 288], size: None, times: vec![2.0], positional: Vec::new(), vsync: true, frames: None, with_ui: false, selftest: false, shots: None, grid_given: false, times_given: false, map_given: false, overrides: Vec::new() };
+    let mut o = Options { map: 0, grid: [512, 288], size: None, times: vec![2.0], positional: Vec::new(), vsync: true, frames: None, min_fps: None, with_ui: false, selftest: false, shots: None, grid_given: false, times_given: false, map_given: false, overrides: Vec::new() };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
@@ -121,9 +143,14 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--set" => {
                 let v = value("--set")?;
                 let (k, x) = v.split_once('=').ok_or("--set expects name=value")?;
-                let x: f32 = x.parse().map_err(|_| format!("bad value in '{v}'"))?;
+                let x: f32 = x.parse().ok().filter(|x: &f32| !x.is_nan()).ok_or(format!("bad value in '{v}'"))?;
                 if !sim::SimParams::default().set(k, x) {
-                    return Err(format!("unknown parameter '{k}'"));
+                    let hint = match k {
+                        _ if k.starts_with("rho_") => " (densities are now density_syrup / density_oil, in kg/m³)",
+                        "sigma_oil" => " (use tension_oil for oil against air, tension_oil_water between oil and water)",
+                        _ => "",
+                    };
+                    return Err(format!("unknown parameter '{k}'{hint}; `sprout params` lists them"));
                 }
                 o.overrides.push((k.to_string(), x));
             }
@@ -131,6 +158,13 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--ui" => o.with_ui = true,
             "--selftest" => o.selftest = true,
             "--shots" => o.shots = Some(value("--shots")?),
+            "--min-fps" => {
+                let f: f32 = value("--min-fps")?.parse().map_err(|_| "--min-fps expects a number")?;
+                if !ui::MIN_FPS_RANGE.contains(&f) {
+                    return Err("--min-fps must be between 20 and 240".into());
+                }
+                o.min_fps = Some(f);
+            }
             "--frames" => o.frames = Some(value("--frames")?.parse().map_err(|_| "--frames expects a number")?),
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with("--") => return Err(format!("unknown option '{s}'")),
@@ -146,7 +180,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = match args.first().map(String::as_str) {
-        Some(c @ ("shot" | "maps" | "probe" | "bench" | "profile" | "validate")) => (c, &args[1..]),
+        Some(c @ ("shot" | "maps" | "params" | "probe" | "lab" | "bench" | "profile" | "validate" | "gallery")) => (c, &args[1..]),
         _ => ("run", &args[..]),
     };
     let o = match parse_options(rest) {
@@ -161,6 +195,7 @@ fn main() {
     };
 
     match command {
+        "params" => print!("{}", sim::describe()),
         "maps" => {
             for (i, m) in maps::MAPS.iter().enumerate() {
                 println!("{i}  {:<14} {}", m.name, m.blurb);
@@ -196,7 +231,16 @@ fn main() {
             let ok = validate::run_all(Gpu::new(None), &|p| o.apply(p), o.positional.first().map(String::as_str), o.shots.as_deref());
             std::process::exit(if ok { 0 } else { 1 });
         }
+        "gallery" => {
+            let dir = o.positional.first().cloned().unwrap_or_else(|| "gallery".into());
+            headless::gallery(Gpu::new(None), &dir, o.positional.get(1).map(String::as_str), &|p| o.apply(p));
+        }
         "profile" => headless::profile(Gpu::new(None), &|p| o.apply(p), o.grid, o.map, o.times[0]),
+        "lab" => {
+            // sprout lab [SETTLE_S] [COOL_S] [RADIUS] [OUT_DIR]
+            let num = |i: usize, d: f32| o.positional.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+            lab::run(Gpu::new(None), &|p| o.apply(p), o.grid, num(0, 8.0), num(1, 8.0), num(2, 60.0), o.positional.get(3).map(String::as_str));
+        }
         "probe" => {
             let gpu = Gpu::new(None);
             let depth: f32 = o.positional.first().and_then(|s| s.parse().ok()).unwrap_or(80.0);
@@ -216,6 +260,7 @@ fn main() {
                     grid: if o.selftest { [512, 288] } else { o.grid },
                     size: o.size.unwrap_or([1600, 900]),
                     vsync: o.vsync || o.selftest,
+                    min_fps: if o.selftest { None } else { o.min_fps },
                     overrides: o.overrides,
                     frames: o.frames,
                     selftest: o.selftest,
@@ -236,10 +281,10 @@ mod tests {
 
     #[test]
     fn options_parse() {
-        let o = parse(&["--quality", "high", "--map", "dam", "--set", "nu_syrup=0.09", "--no-vsync", "out.png"]).unwrap();
+        let o = parse(&["--quality", "high", "--map", "dam", "--set", "viscosity_syrup=0.09", "--no-vsync", "out.png"]).unwrap();
         assert_eq!(o.grid, [768, 432]);
         assert_eq!(maps::MAPS[o.map].name, "Dam Break");
-        assert_eq!(o.overrides, vec![("nu_syrup".to_string(), 0.09)]);
+        assert_eq!(o.overrides, vec![("viscosity_syrup".to_string(), 0.09)]);
         assert!(!o.vsync);
         assert_eq!(o.positional, vec!["out.png".to_string()]);
 
@@ -256,6 +301,8 @@ mod tests {
         assert!(parse(&["--grid", "8x8"]).is_err());
         assert!(parse(&["--set", "bogus=1"]).is_err());
         assert!(parse(&["--set", "nu_syrup"]).is_err());
+        assert!(parse(&["--set", "gravity=nan"]).is_err());
+        assert!(parse(&["--set", "rho_oil=0.8"]).err().is_some_and(|e| e.contains("kg/m³")));
         assert!(parse(&["--frobnicate"]).is_err());
         assert!(parse(&["--size"]).is_err());
     }

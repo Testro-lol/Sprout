@@ -1,0 +1,57 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// The glow field (README, "Look"): the light hot liquid gives off, blurred wide, at half the
+// grid's resolution. The composite lights the backdrop, solids and other liquids with it and
+// draws the bloom around a glowing melt (sampling it with a cubic B-spline, so the half
+// resolution does not show).
+//
+// Two passes of one separable Gaussian (sigma GLOW_SIGMA half-texels, 3 cells):
+//   dir 0  from the per-cell optics (cell_optics.comp, layer 3: emission x occupancy) and
+//          the cell temperature, the mean of each 2 x 2 cells, blurred across -> glow_a
+//   dir 1  glow_a blurred down -> glow_b, which the renderer samples.
+// rgb: emission (linear); a: unused (it held the heat of the heat haze, removed 2026-11-14).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform GPC {
+    int dir;
+} GP;
+
+layout(set = 0, binding = 58, rgba16f) uniform readonly image2DArray raw;
+layout(set = 0, binding = 62, rgba16f) uniform image2D glow_a;
+layout(set = 0, binding = 63, rgba16f) uniform writeonly image2D glow_b;
+
+const int R = 9;
+const float GLOW_SIGMA = 3.0;
+
+vec4 source(ivec2 h) {
+    vec4 s = vec4(0.0);
+    for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < 2; i++) {
+            ivec2 c = 2 * h + ivec2(i, j);
+            if (any(greaterThanEqual(c, P.grid))) continue;
+            s += vec4(imageLoad(raw, ivec3(c, 3)).rgb, 0.0);
+        }
+    }
+    return 0.25 * s;
+}
+
+void main() {
+    ivec2 h = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 hs = (P.grid + 1) / 2;
+    if (any(greaterThanEqual(h, hs))) return;
+    vec4 sum = vec4(0.0);
+    float norm = 0.0;
+    for (int t = -R; t <= R; t++) {
+        float w = exp(-0.5 * float(t * t) / (GLOW_SIGMA * GLOW_SIGMA));
+        norm += w;
+        ivec2 q = h + (GP.dir == 0 ? ivec2(t, 0) : ivec2(0, t));
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, hs))) continue;
+        sum += w * (GP.dir == 0 ? source(q) : imageLoad(glow_a, q));
+    }
+    sum /= norm;
+    if (GP.dir == 0) imageStore(glow_a, h, sum);
+    else imageStore(glow_b, h, sum);
+}

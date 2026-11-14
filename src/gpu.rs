@@ -15,7 +15,7 @@ use vulkano::{
     },
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     memory::allocator::StandardMemoryAllocator,
-    shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo, spirv::bytes_to_words},
+    shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo, SpecializationConstant, spirv::bytes_to_words},
     swapchain::Surface,
 };
 use winit::event_loop::EventLoop;
@@ -124,6 +124,16 @@ impl Gpu {
         let module = unsafe { ShaderModule::new(self.device.clone(), ShaderModuleCreateInfo::new(&words)) }
             .expect("failed to create shader module");
         module.entry_point("main").expect("shader has no main()")
+    }
+
+    /// Like `shader`, with 32-bit specialisation constants (id, value).
+    pub fn shader_specialized(&self, spirv: &[u8], constants: &[(u32, u32)]) -> EntryPoint {
+        let words = bytes_to_words(spirv).expect("corrupt SPIR-V");
+        // SAFETY: as in `shader`.
+        let module = unsafe { ShaderModule::new(self.device.clone(), ShaderModuleCreateInfo::new(&words)) }
+            .expect("failed to create shader module");
+        let info = constants.iter().map(|&(id, v)| (id, SpecializationConstant::U32(v))).collect();
+        module.specialize(info).expect("bad specialisation").entry_point("main").expect("shader has no main()")
     }
 }
 
