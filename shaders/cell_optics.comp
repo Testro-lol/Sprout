@@ -6,7 +6,7 @@
 // What the liquid in each cell looks like, for the renderer (README, "Look"). Run once per
 // rendered frame, after the last substep, from what that substep scattered to the grid:
 // the share and concentration of every material in the cell (as grid_prep.comp reads
-// them), the cell's temperature and velocity, and the optics table. The particles' own
+// them), each phase group's temperature, the cell's velocity, and the optics table. The particles' own
 // splat (render.rs) gives the sharp shapes; these soft fields give their colour and
 // manner, at the cell's resolution, which is finer than any blend the eye can follow.
 //
@@ -62,6 +62,28 @@ void main() {
             int ch = mats[present_row(j)].ia.z;
             if (ch >= 0) others += acc[k + ch];
         }
+        // Each phase group's own temperature (as grid_prep.comp has it): a drop of lava in
+        // water glows and freezes at its own heat, not at the cell's mean with the water.
+        float Tg[GROUPS];
+        {
+            float Csh = 0.0;
+            float Cg[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);
+            if (thermal) {
+                for (int j = 0; j < P.n_present; j++) {
+                    int r = present_row(j);
+                    ivec4 ia = mats[r].ia;
+                    if (ia.z < 0 && P.primary >= 0 && r != P.primary) continue;
+                    int w = ia.z >= 0 ? acc[k + ia.z] : max(cw - others, 0);
+                    if (w <= 0) continue;
+                    float sh = w >= cw ? 1.0 : clamp(float(w) / float(cw), 0.0, 1.0);
+                    float s = (ia.y >= 0 && ia.w >= 0) ? clamp(float(acc[k + ia.w]) / float(w), 0.0, 1.0) : 1.0;
+                    float cr = sh * thermal_of(uint(r), s).w;
+                    Csh += cr;
+                    Cg[ia.x] += cr;
+                }
+            }
+            group_temperatures(k, cw, Csh, Cg, T, Tg);
+        }
         vec4 aq = vec4(0.0), ot = vec4(0.0), opt = vec4(0.0), sty = vec4(0.0);
         vec4 iaq = vec4(0.0), iot = vec4(0.0), fx = vec4(0.0);
         vec2 fz = vec2(0.0);
@@ -85,11 +107,12 @@ void main() {
                 st = mix(d.sty, st, s);
                 ef = mix(d.fx, ef, s);
             }
-            // Frozen share at the cell's temperature (as grid_prep.comp has it).
+            // Frozen share at its group's temperature (as grid_prep.comp has it).
+            float Tm = Tg[ia.x];
             float fs = 0.0;
             if (thermal) {
                 vec4 th = thermal_of(uint(r), s);
-                fs = th.y > -1e8 ? clamp((th.y - T) / max(th.y - th.x, 1e-3), 0.0, 1.0) : 0.0;
+                fs = th.y > -1e8 ? clamp((th.y - Tm) / max(th.y - th.x, 1e-3), 0.0, 1.0) : 0.0;
                 op.w *= 1.0 - 0.6 * fs;
                 op.x = mix(op.x, max(op.x, 0.6), fs);
             }
@@ -107,7 +130,7 @@ void main() {
             opt += sh * op;
             fx += sh * ef;
             sty += sh * st;
-            em += sh * glow(T) * st.w;
+            em += sh * glow(Tm) * st.w;
         }
         // Speed: the face velocities around the cell.
         vec4 v = vel[i];

@@ -140,7 +140,7 @@ in a short toast.
 | 11 | Sunken Ruins | A dam-break wave threads open passages beneath ruined towers |
 | 12 | Oil Drops | A tabletop tank 51 cm wide (1 mm cells): oil beads into round drops and lenses |
 | 13 | Lava Meets Water | Lava at 1200 °C runs into a pool and spreads under the water as a molten sheet; water boils where it touches (reported as lost); the lava crusts and sets over minutes |
-| 14 | Density Tower | Mercury, water, oil and molten wax sort themselves by density (13.5 : 1) |
+| 14 | Density Tower | Mercury, water, oil and molten wax sort themselves by density (13.5 : 1), in a tower kept at 70 °C so the wax stays molten |
 | 15 | Glass and Slime | Glass droops in strands and sets as it cools; slime stretches over a peg and springs back |
 | 16 | Mud Flats | Mud slumps and settles out, sludge holds its shape, oobleck takes a falling ball of mercury |
 | 17 | Ferrofluid | 1 mm cells: a dish of ferrofluid over a magnet heaps up and spikes |
@@ -409,6 +409,26 @@ under water now spreads as a smooth sheet and cools only through `contact_heat`,
 1 cm cells and physical rates takes minutes (raise `heat_rate` or `contact_heat` for a faster
 crust). Frame times on Lava Meets Water (`--no-vsync --frames 1500`, two runs each): p90
 6.1 → 4.5 ms, p99 6.5 – 7.4 → 5.1 ms; Cold Snap p99 4.2 → 3.3 ms; Playground unchanged.
+
+The renderer now takes the same per-group temperatures (`group_temperatures`, common.glsl,
+shared with grid_prep.comp): `cell_optics.comp` evaluates each liquid's glow and frozen share
+at its own group's temperature. A drop of lava in water used to be drawn dark (its glow came
+from the cell's mean with the water, ~500 °C, and it was drawn frozen); it now glows orange.
+Flicker over the six `motion_droplets` frames: 0.002 → 0.019 % of pixels, the glowing drops
+moving as they sink (bright on blue changes more pixels than dark on blue did).
+
+**Oil and wax in Density Tower** (2026-11-14): the drift within a phase group (Model, "Liquids
+of one phase group sort themselves too") separates them. New check (`validate metals`): wax
+and oil, and gallium and mercury, laid out on a checkerboard of single cells, each pair at
+one temperature where both are liquid. Share of the light one in the upper half after 10 s:
+wax 50 → 100 %, gallium 62 → 91 % (without → with the drift). The tower itself is now kept at
+70 °C (`MapBuilder::fill_at`): at 20 °C, wax poured in at 75 °C sets into flakes of 900 kg/m³
+in oil of 898, which stay suspended as real ones do. The tower now ends in four clean layers
+within 12 s; water specks no longer hang in the warm (thinner) oil. `validate` 25 tests, 235
+checks, `--selftest`, `cargo test` (42) and clippy pass. Frame times (`--no-vsync --frames
+1500`, two interleaved runs, before → after): Playground p90 5.0 – 5.2 → 5.0 – 5.1 ms,
+Lava Meets Water p90 4.4 – 4.5 → 4.5 – 4.6 ms, Density Tower p90 5.4 → 5.1 – 5.4 ms (a warm
+tower after); simulated speed 0.90 – 0.96 × real time on both builds.
 
 **Thermal expansion** (`expansion` per liquid, 1/K; water 4.0e-4, a linear fit of 998 →
 958 kg/m³ over 20 – 100 °C; oil 7e-4, lava 1e-4, mercury 1.8e-4, ...). The density falls
@@ -1004,6 +1024,17 @@ its real viscosity, and it changes almost nothing at this scale (see Validation)
   1 mm cells into a cloud within half a second. The previous model used a
   fixed relaxation time, which made the drift ten times faster in cells per second at 1 mm
   cells and ignored viscosity; at 1 mm it broke up oil blobs.
+- **Liquids of one phase group sort themselves too** (2026-11-14). Oil and molten wax,
+  mercury and gallium, lava and glass have no interfacial tension between them, but
+  sub-cell blobs of them still rise or sink through each other long before they would
+  diffuse into one another (a 1 mm drop of wax rises through oil at ~1 mm/s; paraffin
+  needs ~1000 s to diffuse 1 mm). The same drift therefore also acts inside a group,
+  against the group's local mean density (in the Stokes regime that is exactly the
+  drift-flux slip, and its volume flux cancels). It uses each material's base density,
+  without thermal expansion or freezing (grid_prep.comp writes share × base density of each
+  group, `gbase`), so particles of one material never drift among themselves whatever
+  their temperatures. It does not act in the aqueous group or in any group holding a
+  concentrate or a diluent: water's families blend by their exchange instead.
 
 **Liquid and air.** Air is not simulated. A cell is liquid when it holds at least half its
 rest density; sparser spray flies ballistically until it lands.
@@ -1391,7 +1422,8 @@ Not fixed, with the cause found (Limitations): lava under water grows upward fin
 leaves voids the pressure solve takes for free surfaces, and they pull the lava up); oil and
 wax in Density Tower neither separate nor mix (no drift inside a phase group; the wax also
 sets at the tower's 20 °C air); a hot lava droplet in water is drawn dark (its glow comes
-from its cell's mean temperature; a real one crusts over almost at once anyway).
+from its cell's mean temperature; a real one crusts over almost at once anyway). All three were fixed later the same day
+("Each liquid at its own temperature" and what follows it).
 
 **A check reworked.** "After the stir: energy above rest falls" compared single samples
 2 s apart, as "Grab: the released pool only loses energy" did until the second fixes round,
@@ -1639,13 +1671,11 @@ spray-landing test and the collision rescue, which only runs after a second push
   pressure solve takes an empty cell for a free surface at zero pressure, it implodes, and
   the lava next to it is drawn up into it; the next boiling at the tip repeats it. A vapour
   phase (or a pressure for submerged voids) would be the fix; not done in this round.
-- **Liquids of one phase group neither separate nor mix** unless one is the other's diluent:
-  oil (898 kg/m³) and molten wax (780) in Density Tower stay a mottled patchwork for as long
-  as it runs (the sub-cell drift acts only between groups, and only a concentrate blends
-  with its diluent). At the tower's 20 °C air the wax also sets within seconds into chunks
-  as dense as the oil. A drift by density inside a group needs per-material densities on the
-  grid that leave out thermal expansion (else hot and cold parts of one liquid would drift
-  apart); not done in this round.
+- **Liquids of one phase group share one temperature per cell.** Different groups keep their
+  own; oil and wax in one cell do not, so hot wax stirred into cold oil meets it at the mean
+  and may set there (true of the mixture once it has exchanged heat, too early for the first
+  moment). The drift within a group uses base densities, so a small frozen fragment that no
+  rigid body holds drifts as if molten (wax: 780 instead of 900 kg/m³).
 - **A stream hitting the floor packs 20 – 50 particles per cell** into the thin sheet it
   spreads into, for a fraction of a second (`validate abuse`); the sheet relaxes as it slows.
 - **Boiling has no steam.** Water heated past its boiling point by its latent heat leaves the
@@ -1662,8 +1692,7 @@ spray-landing test and the collision rescue, which only runs after a second push
   given their ragged edge by noise, so a single drop's stain is a soft spot, not a splat.
   The stain map lasts while the tank runs; it is not saved with it.
 - **Small droplets among the other non-aqueous liquids** (lava in oil, oil on mercury) are
-  not drawn as beads; only aqueous-against-other droplets are. A droplet's glow comes from
-  its cell's mean temperature, so a hot lava drop in water shows dark rather than glowing.
+  not drawn as beads; only aqueous-against-other droplets are.
 - **Fixed-point scatter sums wrap past about 2 000 particles in one cell** (a few hundred
   for mercury); nothing known reaches that now (see Validation, "Brush clumps"), but a
   wrapped cell still runs away rather than failing safely.

@@ -196,6 +196,10 @@ layout(std430, set = 0, binding = 40) buffer AuxBuf { vec4 aux[]; };
 // Per cell, where phase groups meet (grid_prep.comp): share x density of each group, so that
 // the drift (particles.comp) can take each group's local mean density.
 layout(std430, set = 0, binding = 59) buffer GroupRhoBuf { vec4 grho[]; };
+// Per cell, where a phase group other than the aqueous one holds two or more materials
+// (`group_sorts`): share x base density (no expansion, not frozen) of groups 1 - 3, so that
+// the drift within a group (particles.comp) can take the group's local mean.
+layout(std430, set = 0, binding = 65) buffer GroupBaseBuf { vec4 gbase[]; };
 layout(std430, set = 0, binding = 41) buffer SPropBuf { vec4 sprop[]; };
 layout(std430, set = 0, binding = 42) buffer MixBuf { float mixb[]; };
 layout(std430, set = 0, binding = 43) buffer Surf2Buf { vec4 surf2[]; };
@@ -495,6 +499,51 @@ float blend_share(float s, float e) { return e == 1.0 ? s : pow(s, e); }
 // the first group in the tank takes what the others leave of the total, heat2.z).
 int group_heat_chan(int g) {
     return int((P.group_heat >> (8u * uint(g))) & 255u) - 1;
+}
+
+// Whether the materials of phase group g sort themselves by density below the grid's scale
+// (the drift within a group, particles.comp): g is not the aqueous group, holds two or more
+// materials in this tank, and none of them is a concentrate or a diluent (families mix
+// instead: their exchange in particles.comp evens out the concentration).
+bool group_sorts(int g) {
+    if (g <= 0) return false;
+    int n = 0;
+    for (int j = 0; j < P.n_present; j++) {
+        int r = present_row(j);
+        ivec4 ia = mats[r].ia;
+        if (ia.y >= 0 && mats[ia.y].ia.x == g) return false;
+        if (ia.x != g) continue;
+        if (ia.y >= 0) return false;
+        n++;
+    }
+    return n >= 2;
+}
+
+// The temperature of each phase group present in the cell at accumulator offset k (cw: its
+// particle weight), from its own heat channel and heat capacity Cg (share-weighted, as the
+// cell's total Csh); the first present group without a channel takes the rest of the total.
+// Liquids of different groups meet at a sharp interface and keep their own temperatures, so
+// neither the solver (grid_prep.comp) nor the look (cell_optics.comp) may evaluate lava that
+// touches water at the mean of the two. T comes in as the fallback and leaves as the mean.
+void group_temperatures(int k, int cw, float Csh, float Cg[GROUPS], inout float T, out float Tg[GROUPS]) {
+    for (int g = 0; g < GROUPS; g++) Tg[g] = T;
+    if (Csh <= 0.0) return;
+    int Htot = acc[k + int(P.heat2.z)];
+    T = float(Htot) * T_SCALE / (Csh * float(cw)) - 273.15;
+    for (int g = 0; g < GROUPS; g++) Tg[g] = T;
+    int rest = Htot;
+    int first = -1;
+    for (int g = 0; g < GROUPS; g++) {
+        int ch = group_heat_chan(g);
+        if (ch >= 0) {
+            int h = acc[k + ch];
+            rest -= h;
+            if (Cg[g] > 0.0) Tg[g] = float(h) * T_SCALE / (Cg[g] * float(cw)) - 273.15;
+        } else if (first < 0 && (P.group_mask & (1u << uint(g))) != 0u) {
+            first = g;
+        }
+    }
+    if (first >= 0 && Cg[first] > 0.0) Tg[first] = float(rest) * T_SCALE / (Cg[first] * float(cw)) - 273.15;
 }
 
 float row_lnu(uint row, float s, float T, bool thermal) {

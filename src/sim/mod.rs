@@ -822,6 +822,7 @@ impl FluidSim {
         let mats = device_buffer::<GpuMat>(&gpu, MAX_MATERIALS as u64, none);
         let aux = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let grho = device_buffer::<[f32; 4]>(&gpu, cells, none);
+        let gbase = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let sprop = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let mixb = device_buffer::<f32>(&gpu, cells * (MAX_PRESENT as u64 - 1), none);
         let surf2 = device_buffer::<[f32; 4]>(&gpu, cells, none);
@@ -975,6 +976,7 @@ impl FluidSim {
         put(39, mats.as_bytes().clone());
         put(40, aux.as_bytes().clone());
         put(59, grho.as_bytes().clone());
+        put(65, gbase.as_bytes().clone());
         put(41, sprop.as_bytes().clone());
         put(42, mixb.as_bytes().clone());
         put(43, surf2.as_bytes().clone());

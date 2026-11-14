@@ -296,6 +296,10 @@ void main() {
             vec3 sg = vec3(0.0);
             bool more = (P.group_mask & 12u) != 0u;
             bool groups = (P.group_mask & (P.group_mask - 1u)) != 0u;
+            // The drift within the particle's own group (below): share x base density of the
+            // group around it.
+            bool sorts = group_sorts(Mia.x);
+            float sbg = 0.0;
             int nmix = P.n_fam - 1;
             for (int b = 0; b < 3; b++) {
                 for (int a = 0; a < 3; a++) {
@@ -307,6 +311,7 @@ void main() {
                         sw += wt;
                         sg.x += wt * q.y;
                         if (more) sg.yz += wt * aux[ci].zw;
+                        if (sorts) sbg += wt * gbase[ci][Mia.x - 1];
                         float sb = fam > 0 ? mixb[ci * nmix + fam - 1] : q.z;
                         if (sb >= 0.0) {
                             sfw += wt;
@@ -463,6 +468,31 @@ void main() {
                         else gr = 0.5 * vec2(surf2[k + 1].y - surf2[k - 1].y, surf2[k + W].y - surf2[k - W].y);
                         float resolved = 1.0 - clamp((SLIP_GRAD_MAX - length(gr)) / (SLIP_GRAD_MAX - SLIP_GRAD_MIN), 0.0, 1.0);
                         slip *= 1.0 - hold * resolved;
+                    }
+                }
+
+                // Drift within a phase group: oil and molten wax, mercury and gallium, lava
+                // and glass have no interfacial tension between them (one group), but blobs
+                // of them below the grid's scale still rise or sink through each other long
+                // before they would diffuse into one another (a 1 mm drop of wax rises
+                // through oil at ~1 mm/s; paraffin needs ~1000 s to diffuse over 1 mm). Without
+                // it, particles of two such materials stirred together stay a mottle for good.
+                // Same model as between groups, against the group's local mean density:
+                // in the Stokes regime the drift of each material relative to its group is
+                // then exactly the drift-flux slip, and its volume flux cancels. The base
+                // density of each material is used (no expansion, not frozen): the particles
+                // of one material never drift among themselves, whatever their temperatures.
+                if (sorts && !held) {
+                    float fgi = groups ? sg[Mia.x - 1] : 1.0;
+                    if (fgi > 1e-4) {
+                        float rmean = sbg / sw / fgi;
+                        float drho = mats[row].a.x - rmean;
+                        ivec2 pc = clamp(ivec2(p.pos), ivec2(0), P.grid - 1);
+                        vec4 cq = cell[cidx(pc)];
+                        float nu_c = cq.y > 0.0 ? cq.z / cq.y : aux[cidx(pc)].x;
+                        float vt = terminal(drho, rmean, nu_c, P.sep_tau);
+                        float sep_max = P.corr.z > 0.0 ? P.cfl / dt : 1e30;  // params.rs: slip_cap
+                        slip -= min(vt, sep_max) * sign(drho);
                     }
                 }
 

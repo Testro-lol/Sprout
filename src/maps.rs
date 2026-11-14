@@ -99,6 +99,11 @@ impl MapBuilder {
     fn fill(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, material: Material) {
         self.fills.push(([x0, y0, x1, y1], material, None));
     }
+
+    /// A fill at `t` °C instead of the material's spawn temperature.
+    fn fill_at(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, material: Material, t: f32) {
+        self.fills.push(([x0, y0, x1, y1], material, Some(t)));
+    }
 }
 
 pub const MAPS: &[MapDef] = &[
@@ -352,13 +357,17 @@ pub const MAPS: &[MapDef] = &[
     },
     MapDef {
         name: "Density Tower",
-        blurb: "Mercury, water, oil and molten wax poured in the wrong order sort themselves by density.",
+        blurb: "Mercury, water, oil and molten wax poured in the wrong order sort themselves by density (a warm tower, 70 °C, so the wax stays molten).",
         width_m: 0.0,
         build: |m| {
+            // Warm, so that the wax stays molten (it melts at 52 - 62 °C): poured into
+            // oil at room temperature it sets into flakes about as dense as the oil
+            // (900 against 898 kg/m³), which then stay suspended in it, as real ones do.
+            m.air(70.0);
             m.fill(40.0, 0.0, 120.0, 10.0, Material::Wax);
-            m.fill(40.0, 10.0, 120.0, 20.0, Material::Oil);
-            m.fill(40.0, 20.0, 120.0, 32.0, Material::Water);
-            m.fill(60.0, 40.0, 100.0, 46.0, Material::Mercury);
+            m.fill_at(40.0, 10.0, 120.0, 20.0, Material::Oil, 70.0);
+            m.fill_at(40.0, 20.0, 120.0, 32.0, Material::Water, 70.0);
+            m.fill_at(60.0, 40.0, 100.0, 46.0, Material::Mercury, 70.0);
             m.rect(34.0, 0.0, 38.0, 50.0);
             m.rect(122.0, 0.0, 126.0, 50.0);
         },

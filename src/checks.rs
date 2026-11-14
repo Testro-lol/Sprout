@@ -449,6 +449,38 @@ pub fn metals(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.check("layers: mercury / water / oil / molten wax", format!("{hm:.0} / {hw:.0} / {ho:.0} / {hx:.0} cells"), "rising in that order", hm < hw && hw < ho && ho < hx);
     r.check("layers: pressure solves with a 13.5 density ratio", format!("{} unconverged of {}, most iterations {}", st.pressure_unconverged, st.substeps, st.pressure_iters_max), "0", st.pressure_unconverged == 0);
 
+    // ---- one phase group, two densities, stirred finer than a cell: molten wax and oil, and
+    // gallium and mercury, on a checkerboard of single cells, each pair at one temperature at
+    // which both are liquid (one group shares one temperature per cell: wax at 75 °C beside oil
+    // at 20 °C would meet at ~47 °C and set). With no interfacial tension between them nothing
+    // at the grid's scale tells them apart; the drift within a group (particles.comp) has to
+    // sort them. ------------------------------------------------------------------------------
+    let grid = [256, 144];
+    let checker = |rect: [f32; 4], a: Material, b: Material, t: f32| -> Vec<Particle> {
+        let odd = |p: &Particle| (p.pos[0].floor() as i32 + p.pos[1].floor() as i32) & 1 == 1;
+        let mut ps: Vec<Particle> = block(grid, rect, a).into_iter().filter(|p| !odd(p)).collect();
+        ps.extend(block(grid, rect, b).into_iter().filter(odd));
+        ps.into_iter().map(|p| p.at_temp(t)).collect()
+    };
+    let mut ps = checker([0.0, 0.0, 124.0, WALL + 30.0], Material::Wax, Material::Oil, 75.0);
+    ps.extend(checker([132.0, 0.0, 256.0, WALL + 10.0], Material::Gallium, Material::Mercury, 40.0));
+    let wall = Shape::Box { c: [128.0, 30.0], half: [4.0, 30.0], angle: 0.0 };
+    let mut w = build(gpu, grid, apply, vec![(wall, None)], ps, &|p: &mut SimParams| p.heat_rate = 0.0);
+    run(&mut w, 10.0);
+    r.shot(&w, "sort_in_group");
+    let ps = w.sim.download_particles();
+    // Share of the light material among the upper half of the pair's particles: 1 when
+    // fully sorted, 0.5 when still stirred.
+    let sorted = |light: Material, heavy: Material| -> f64 {
+        let mut hs: Vec<(f32, bool)> = ps.iter().filter(|p| p.is(light) || p.is(heavy)).map(|p| (p.pos[1], p.is(light))).collect();
+        hs.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let n = hs.iter().filter(|h| h.1).count();
+        hs[..n].iter().filter(|h| h.1).count() as f64 / n.max(1) as f64
+    };
+    let (sw, sg) = (sorted(Material::Wax, Material::Oil), sorted(Material::Gallium, Material::Mercury));
+    r.check("one group, stirred finer than a cell: molten wax rises out of oil", format!("{:.0} % of the wax on top after 10 s", sw * 100.0), "> 85 %", sw > 0.85);
+    r.check("one group, stirred finer than a cell: gallium rises out of mercury", format!("{:.0} % of the gallium on top after 10 s", sg * 100.0), "> 85 %", sg > 0.85);
+
     // ---- a mercury bead on the floor, zero gravity (as the contact-angle checks of
     // `validate surface`), 1 mm cells: the angle from the cap's area and apex height --------
     let grid = [512, 288];
