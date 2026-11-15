@@ -402,6 +402,20 @@ struct FilmPc {
     parity: u32,
     mob_scale: f32,
 }
+/// Periods of the patterns carried by the liquid (flow_map.comp; composite.frag: PERIOD_SHORT,
+/// PERIOD_LONG), s.
+pub const FLOW_PERIOD_SHORT: f32 = 4.0;
+pub const FLOW_PERIOD_LONG: f32 = 12.0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct FlowPc {
+    dt: f32,
+    now: f32,
+    period_s: f32,
+    period_l: f32,
+    parity: u32,
+}
 /// The vapour of escaped steam mixes away into the air with this share of `steam_life` as its
 /// time constant (smoke.comp).
 const SMOKE_FADE: f32 = 0.8;
@@ -699,6 +713,7 @@ struct Passes {
     cell_optics: Pass,
     light: Pass,
     optics_blur: Pass,
+    flow_map: Pass,
     glow: Pass,
     film_tiles: Pass,
     film: Pass,
@@ -718,6 +733,7 @@ struct Passes {
     visc_update: Pass,
     visc_dir: Pass,
     rhs: Pass,
+    rhs_visc: Pass,
     mg_build: Pass,
     mg_down: Pass,
     mg_up: Pass,
@@ -729,6 +745,7 @@ struct Passes {
     cg_update: [Pass; 2],
     cg_reduce: Pass,
     project: Pass,
+    project_visc: Pass,
     claim: Pass,
     count: Pass,
     stats: Pass,
@@ -805,6 +822,10 @@ pub struct FluidSim {
     film_c: Arc<ImageView>,
     film_h: Arc<ImageView>,
     film_parity: std::cell::Cell<u32>,
+    /// How far the liquid has moved since its patterns restarted (flow_map.comp): RGBA16F,
+    /// one texel per cell, layers 2 x copy + period; the copy that holds it now.
+    flow: Arc<ImageView>,
+    flow_parity: std::cell::Cell<u32>,
     film_in: Subbuffer<[u32]>,
     film_col: Subbuffer<[u32]>,
     film_tiles: Subbuffer<[u32]>,
@@ -975,6 +996,22 @@ impl FluidSim {
                     format,
                     extent: [fdim[0], fdim[1], 1],
                     array_layers: 2,
+                    usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .expect("out of GPU memory"),
+        )
+        .unwrap();
+        let flow = ImageView::new_default(
+            Image::new(
+                gpu.memory.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R16G16B16A16_SFLOAT,
+                    extent: [grid[0], grid[1], 1],
+                    array_layers: 4,
                     usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
                     ..Default::default()
                 },
@@ -1192,6 +1229,7 @@ impl FluidSim {
             cell_optics: Pass::with_images(&gpu, "cell_optics", spirv!("cell_optics.comp"), &table, &[(58, cellopt_raw.clone())]),
             light: Pass::with_images(&gpu, "light", spirv!("light.comp"), &table, &[(58, cellopt_raw.clone())]),
             optics_blur: Pass::with_images(&gpu, "optics_blur", spirv!("optics_blur.comp"), &table, &[(58, cellopt_raw.clone()), (60, cellopt.clone())]),
+            flow_map: Pass::with_images(&gpu, "flow_map", spirv!("flow_map.comp"), &table, &[(60, cellopt.clone()), (64, flow.clone())]),
             glow: Pass::with_images(&gpu, "glow", spirv!("glow.comp"), &table, &[(58, cellopt_raw.clone()), (62, glow_a.clone()), (63, glow_b.clone())]),
             film_tiles: Pass::build(&gpu, "film_tiles", gpu.shader_specialized(spirv!("film_tiles.comp"), &[(2, fres)]), &table, &[]),
             film: Pass::build(
@@ -1223,6 +1261,7 @@ impl FluidSim {
             visc_update: p("visc_update", spirv!("visc_update.comp")),
             visc_dir: p("visc_dir", spirv!("visc_dir.comp")),
             rhs: p("rhs", spirv!("rhs.comp")),
+            rhs_visc: p("rhs_visc", spirv!("rhs_visc.comp")),
             mg_build: p("mg_build", spirv!("mg_build.comp")),
             mg_down: p("mg_down", spirv!("mg_down.comp")),
             mg_up: p("mg_up", spirv!("mg_up.comp")),
@@ -1233,6 +1272,7 @@ impl FluidSim {
             cg_update: [p("cg_update", spirv!("cg_update.comp")), Pass::new(&gpu, "cg_update", spirv!("cg_update.comp"), &swapped)],
             cg_reduce: p("cg_reduce", spirv!("cg_reduce.comp")),
             project: p("project", spirv!("project.comp")),
+            project_visc: p("project_visc", spirv!("project_visc.comp")),
             claim: p("claim", spirv!("claim.comp")),
             count: p("count", spirv!("count.comp")),
             stats: p("stats", spirv!("stats.comp")),
@@ -1296,6 +1336,8 @@ impl FluidSim {
             film_c,
             film_h,
             film_parity: std::cell::Cell::new(0),
+            flow,
+            flow_parity: std::cell::Cell::new(0),
             film_in,
             film_col,
             film_tiles,
@@ -1380,7 +1422,7 @@ impl FluidSim {
         let dt = match self.stain_at.get() {
             Some((tank, t)) if tank == self.resets => (now - t).clamp(0.0, 0.25) as f32,
             _ => {
-                for img in [&self.film_c, &self.film_h] {
+                for img in [&self.film_c, &self.film_h, &self.flow] {
                     b.clear_color_image(vulkano::command_buffer::ClearColorImageInfo::image(img.image().clone())).unwrap();
                 }
                 b.fill_buffer(self.film_in.clone(), 0).unwrap();
@@ -1407,6 +1449,14 @@ impl FluidSim {
         dispatch(b, [self.grid[0], 1, 1]);
         self.pass.optics_blur.bind(b);
         dispatch(b, groups);
+        // The patterns' displacement, carried along by the smoothed velocity (flow_map.comp).
+        if dt > 0.0 {
+            let parity = self.flow_parity.get();
+            self.pass.flow_map.bind(b);
+            self.pass.flow_map.push(b, FlowPc { dt, now: now as f32, period_s: FLOW_PERIOD_SHORT, period_l: FLOW_PERIOD_LONG, parity });
+            dispatch(b, groups);
+            self.flow_parity.set(1 - parity);
+        }
         let half = [self.grid[0].div_ceil(2).div_ceil(GRID_GROUP), self.grid[1].div_ceil(2).div_ceil(GRID_GROUP), 1];
         self.pass.glow.bind(b);
         for dir in [0i32, 1] {
@@ -1497,6 +1547,11 @@ impl FluidSim {
     /// mobility (rgba16f), each an array of two copies; and the copy that holds it now.
     pub fn film_views(&self) -> (&Arc<ImageView>, &Arc<ImageView>, u32) {
         (&self.film_c, &self.film_h, self.film_parity.get())
+    }
+
+    /// The patterns' displacement map (flow_map.comp) and the copy that holds it now.
+    pub fn flow_view(&self) -> (&Arc<ImageView>, u32) {
+        (&self.flow, self.flow_parity.get())
     }
 
     /// Whether the film map can hold anything: a liquid that stains (or a concentrate of
@@ -1930,7 +1985,7 @@ impl FluidSim {
     }
 
     fn reduce(&self, b: &mut Recorder, mode: u32) {
-        let pressure = mode < 4;
+        let pressure = mode < 4 || mode == 8;
         let n_entries = self.entries();
         let (first, last) = if pressure { (0, n_entries - 2) } else { (n_entries - 2, n_entries) };
         self.pass.cg_reduce.bind_raw(b);
@@ -2107,7 +2162,7 @@ impl FluidSim {
             quant(self.pressure_rec),
             if viscous == Viscosity::Implicit { quant(self.viscosity_rec) } else { viscous as u32 },
             self.tank.stride.max(ACC_MIN),
-            self.caps(),
+            self.caps() | (self.params.viscous_projection.min(1) << 31),
         );
         if let Some(cb) = self.substep_cache.get(&key) {
             return cb.clone();
@@ -2182,18 +2237,36 @@ impl FluidSim {
             ps.heat.bind_raw(r);
             r.dispatch(grid_groups);
         }
-        match viscous {
+        let viscosity = |r: &mut Recorder| match viscous {
             Viscosity::None => {}
             Viscosity::Explicit => self.record_viscosity_explicit(r, grid_groups),
             Viscosity::Implicit => self.record_viscosity(r, grid_groups, v_iters),
+        };
+        // Viscosity between two pressure solves (`viscous_projection`): the first takes out
+        // what the liquid cannot follow (the pull of gravity on a resting pool), so the
+        // viscosity's no-slip walls see only real motion; the second projects out the
+        // divergence the viscosity left. With one solve after the viscosity, the walls held
+        // back the whole pull of gravity and the pressure pushed that layer up: every
+        // resting viscous pool circulated along its walls (README, Viscosity).
+        let twice = viscous == Viscosity::Implicit && self.params.viscous_projection != 0;
+        if !twice {
+            viscosity(r);
         }
         // rhs.comp marks the tiles that hold pressure unknowns.
         r.fill(&self.ptile.clone().slice(0..self.nwg as u64), 0);
         ps.rhs.bind_raw(r);
         r.dispatch(grid_groups);
-        self.record_pressure(r, p_iters);
+        self.record_pressure(r, p_iters, false);
         ps.project.bind_raw(r);
         r.dispatch(grid_groups);
+        if twice {
+            viscosity(r);
+            ps.rhs_visc.bind_raw(r);
+            r.dispatch(grid_groups);
+            self.record_pressure(r, p_iters, true);
+            ps.project_visc.bind_raw(r);
+            r.dispatch(grid_groups);
+        }
         if self.caps() & CAP_RIGID != 0 {
             for mode in 0..5u32 {
                 ps.rigid.bind_raw(r);
@@ -2355,10 +2428,22 @@ impl FluidSim {
         }
     }
 
-    fn record_pressure(&self, b: &mut Recorder, iters: u32) {
+    /// The pressure solve. `second`: the one after the viscosity (rhs_visc.comp), on the
+    /// same matrix and hierarchy, started from the first one's pressure as it is.
+    fn record_pressure(&self, b: &mut Recorder, iters: u32, second: bool) {
         let ps = &self.pass;
         let lv = &self.levels;
         let fine = [self.grid[0].div_ceil(GRID_GROUP), self.grid[1].div_ceil(GRID_GROUP), 1];
+        let half = self.nwg;
+        if second {
+            ps.cg_init.bind_raw(b);
+            ps.cg_init.push_raw(b, lv.pc(0, half));
+            b.dispatch(fine);
+            self.record_vcycle(b, false);
+            self.reduce(b, 8);
+            self.record_cg(b, iters);
+            return;
+        }
         for l in 1..=lv.tail {
             ps.mg_build.bind_raw(b);
             ps.mg_build.push_raw(b, lv.mg(l - 1, false));
@@ -2369,7 +2454,6 @@ impl FluidSim {
             ps.mg_tail.push_raw(b, lv.tail_pc(1));
             b.dispatch([1, 1, 1]);
         }
-        let half = self.nwg;
         ps.cg_scale.bind_raw(b);
         ps.cg_scale.push_raw(b, lv.pc(0, 0));
         b.dispatch(fine);
@@ -2378,6 +2462,14 @@ impl FluidSim {
         b.dispatch(fine);
         self.record_vcycle(b, false);
         self.reduce(b, 0);
+        self.record_cg(b, iters);
+    }
+
+    /// The iterations of a pressure solve and its closing statistics.
+    fn record_cg(&self, b: &mut Recorder, iters: u32) {
+        let ps = &self.pass;
+        let lv = &self.levels;
+        let half = self.nwg;
         for k in 0..iters as usize {
             // p = z + beta p (beta = 0 on the first pass), q = A p.
             let apply = &ps.cg_apply[k % 2];

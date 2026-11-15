@@ -1,0 +1,40 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#include "common.glsl"
+
+// Second projection, after the viscosity (see rhs_visc.comp): subtracts the gradient of
+// P2 = P - P1, the part of the pressure the second solve added. Air takes P2 = 0 (the
+// interface jumps belong to the first solve). The density-correction gradient (vel.zw)
+// stays as project.comp left it. Reports the fastest live face again for the CFL limit.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void report(float m) {
+    m = subgroupMax(m);
+    if (subgroupElect() && m > uintBitsToFloat(S.umax_grid)) atomicMax(S.umax_grid, floatBitsToUint(m));
+}
+
+float p2(int i) { return mgd[i] > 0.0 ? pres[i].x - prhs[i].z : 0.0; }
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x < 1 || c.y < 1 || c.x >= P.grid.x || c.y >= P.grid.y) {
+        report(0.0);
+        return;
+    }
+    int i = cidx(c);
+    vec4 cf = coef[i];
+    vec4 me = vel[i];
+    bool lu = face_live(me.z) && cf.x != 0.0, lv = face_live(me.w) && cf.y != 0.0;
+    if (lu || lv) {
+        float pc = p2(i);
+        if (lu) me.x -= cf.x * (pc - p2(i - 1));
+        if (lv) me.y -= cf.y * (pc - p2(i - P.grid.x));
+        vel[i] = me;
+    }
+    float m = 0.0;
+    if (lu) m = abs(me.x);
+    if (lv) m = max(m, abs(me.y));
+    report(m);
+}

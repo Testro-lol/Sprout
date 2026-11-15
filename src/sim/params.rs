@@ -222,11 +222,12 @@ pub struct SimParams {
     /// Rate at which the particles of a cell that holds steam even out their temperatures,
     /// 1/s (the exchange inside a cell, README "Heat"): far faster than conduction through a
     /// parcel the size of a particle, so that bubbles condense in colder water. 30 until the
-    /// third round of 2026-11-14, when bubbles popped within a cell or two of leaving hot water
-    /// (reported); at 3 they rise about twice as far through cool water (`LAB_BUBBLES=1 sprout
-    /// lab`: 23 -> ~45 cells through water at 20 deg C) and most still condense before the
-    /// surface of a 30-cell pool (`validate thermal`). (A sandbox choice: a bubble here holds
-    /// one parcel's vapour, not its real volume.)
+    /// third round of 2026-11-14, 3 the day after, when bubbles popped within a few cells of
+    /// leaving hot water (reported twice). At 1, bubbles boiled off lava resting under water
+    /// at 20 deg C rise ~10 cells before they condense (`LAB_LAVA_STEAM=1 sprout lab`; 3 at 3,
+    /// 1-2 at 30), and most still condense before the surface of a 30-cell pool (4.5 % escape;
+    /// `validate thermal`, which fails below ~0.7: steam lingers). (A sandbox choice: a bubble
+    /// here holds one parcel's vapour, not its real volume.)
     pub steam_mixing: f32,
     /// Speed at which escaped steam rises, m/s (a warm plume: 0.2 - 1), and how long it
     /// lasts, s: puffs lay vapour into the smoke field for this long, and the vapour mixes
@@ -267,6 +268,12 @@ pub struct SimParams {
     /// viscous step (accurate there, stable to ~0.12) instead of the implicit solve. 0 makes
     /// every tile of a viscous tank implicit. A cost saving, exact to the solver tolerance.
     pub implicit_viscosity_min: f32,
+    /// 1: the implicit viscosity runs between two pressure solves (gravity and the pressure
+    /// it raises first, then the viscosity, then a second solve for the divergence the
+    /// viscosity left). 0: one solve after the viscosity, cheaper, but its no-slip walls
+    /// then hold back the whole pull of gravity on a resting pool, which circulates along
+    /// the walls at about 6 cells/s (README, Viscosity).
+    pub viscous_projection: u32,
 
     // ---- stabilisation (README, "Numerical stabilisation"); see `PARAMS` for "off" -------
     /// Spray in free flight (less than half the rest density around it) may travel this many
@@ -353,7 +360,7 @@ impl Default for SimParams {
             steam: 1,
             steam_boil: 0.02,
             steam_condense: 0.005,
-            steam_mixing: 3.0,
+            steam_mixing: 1.0,
             steam_rise: 0.4,
             steam_life: 2.0,
             steam_swirl: 0.1,
@@ -374,6 +381,7 @@ impl Default for SimParams {
             correction_time: (1.0 / 240.0) / std::f32::consts::LN_2,
             correction_max: 0.5,
             correction_deadband: 0.25,
+            viscous_projection: 1,
             correction_step_max: 0.5,
             crowd_jitter: 0.5,
             tool_crowd_max: 2.0,
@@ -655,6 +663,8 @@ pub static PARAMS: &[Param] = &[
         "Most viscosity iterations recorded per substep."),
     param!("implicit_viscosity_min", Accuracy, "", [1e-4, 0.05], Some(0.0), false, |p| p.implicit_viscosity_min, |p, v| p.implicit_viscosity_min = v,
         "Diffusion number nu dt/dx² below which a tile takes the explicit viscous step; 0 = implicit everywhere."),
+    param!("viscous_projection", Accuracy, "", [0.0, 1.0], None, true, |p| p.viscous_projection as f32, |p, v| p.viscous_projection = v as u32,
+        "1: implicit viscosity between two pressure solves (a resting viscous pool stays at rest); 0 = one solve after it, cheaper, but resting pools circulate along the walls."),
     // ---- stabilisation ----
     param!("speed_cap", Stabilisation, "× √(2gH)", [1.0, 4.0], Some(0.0), false, |p| p.speed_cap, |p, v| p.speed_cap = v,
         "Particle speed cap as a multiple of the free-fall speed over the tank height; 0 = off."),

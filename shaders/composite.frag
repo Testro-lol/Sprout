@@ -1,6 +1,7 @@
 #version 460
 
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_control_flow_attributes : enable
 #include "optics.glsl"
 
 // Shades the liquid from the splat accumulation and its blurred copy, and draws the solids
@@ -40,6 +41,10 @@ layout(set = 0, binding = 10) uniform sampler2DArray film_h;
 layout(set = 0, binding = 7) uniform sampler2D vapour_map;
 // The smoke field (smoke.comp), two texels per cell: the vapour of escaped steam (r).
 layout(set = 0, binding = 9) uniform sampler2D smoke_map;
+// The flow map (flow_map.comp), one texel per cell: how far the liquid has moved since its
+// patterns restarted, two copies (xy, zw) for each of two periods; layer 2 pc.flow_layer +
+// 0 the short period, + 1 the long.
+layout(set = 0, binding = 11) uniform sampler2DArray flow_map;
 
 layout(push_constant) uniform PC {
     vec2 cam;         // world position at the centre of the view, cells
@@ -61,6 +66,7 @@ layout(push_constant) uniform PC {
     float stain_k;    // Display: how strongly stains show, 0 off
     float vapour;     // 1 when the tank has steam (the vapour field is drawn), else 0
     float film_layer; // the copy of the film map that holds it now (0 or 1)
+    float flow_layer; // the copy of the flow map that holds it now (0 or 1)
 } pc;
 
 layout(location = 0) out vec4 f_color;
@@ -273,21 +279,48 @@ float gnoise(vec2 p) {
 // spans 4 px or more, 0 below 2 px.
 float detail(float freq, float zoom) { return smoothstep(2.0, 4.0, zoom / freq); }
 
-// Noise carried by the flow `u` (cells / s), restarted every `period` seconds: two copies
-// half a period apart, each faded out when it restarts (a flow map, Vlachos 2010), each
-// restart at a new place in the pattern so that it never repeats. The pattern drifts at
-// ADVECT times the flow: carried all the way, shear drew it out into streaks within a
-// period.
-const float ADVECT = 0.35;
-float flow_noise(vec2 x, vec2 u, float freq, float period, float seed) {
-    float ph = pc.now / period + seed;
-    float t0 = fract(ph), t1 = fract(ph + 0.5);
-    float w0 = 1.0 - abs(2.0 * t0 - 1.0);
-    vec2 o0 = hash22(vec2(floor(ph), seed)) * 97.0, o1 = hash22(vec2(floor(ph + 0.5), seed + 0.5)) * 97.0;
-    float n0 = gnoise((x - u * (ADVECT * t0 * period)) * freq + o0);
-    float n1 = gnoise((x - u * (ADVECT * t1 * period)) * freq + o1);
-    // (The blend of two is flatter than either: stretch it back.)
-    return clamp(0.5 + (mix(n1, n0, w0) - 0.5) / sqrt(w0 * w0 + (1.0 - w0) * (1.0 - w0)), 0.0, 1.0);
+// Gradient noise in three dimensions, about 0..1, mean 0.5: a 2D pattern that evolves in
+// time (the third coordinate), rather than sliding.
+// (An integer hash, PCG3D (Jarzynski & Olano 2020): a float hash of the corner's position
+// gave two cells sharing a corner slightly different values, which the compiler rounds
+// differently in each, and now and then one wrapped round and drew a seam.)
+uvec3 pcg3d(ivec3 q) {
+    uvec3 v = uvec3(q) * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+vec3 hash33(ivec3 q) { return vec3(pcg3d(q)) * (1.0 / 4294967295.0); }
+
+// Two independent evolving noises from one evaluation: one hash's 96 bits are two
+// gradients of 16 bits a component (lava's glow and its veins; half the cost of two).
+vec2 gnoise3x2(vec3 p) {
+    vec3 fl = floor(p), f = p - fl;
+    ivec3 i = ivec3(fl);
+    vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    vec2 n[8];
+    for (int k = 0; k < 8; k++) {
+        ivec3 o = ivec3(k & 1, (k >> 1) & 1, k >> 2);
+        uvec3 h = pcg3d(i + o);
+        vec3 d = f - vec3(o);
+        vec3 g1 = vec3(h & 0xffffu) * (2.0 / 65535.0) - 1.0;
+        vec3 g2 = vec3(h >> 16u) * (2.0 / 65535.0) - 1.0;
+        n[k] = vec2(dot(g1, d), dot(g2, d));
+    }
+    vec2 r = mix(mix(mix(n[0], n[1], u.x), mix(n[2], n[3], u.x), u.y),
+                 mix(mix(n[4], n[5], u.x), mix(n[6], n[7], u.x), u.y), u.z);
+    return 0.5 + 0.8 * r;
+}
+float gnoise3(vec3 p) {
+    vec3 fl = floor(p), f = p - fl;
+    ivec3 i = ivec3(fl);
+    vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    #define G(a, b, c) dot(hash33(i + ivec3(a, b, c)) * 2.0 - 1.0, f - vec3(a, b, c))
+    float n = mix(mix(mix(G(0, 0, 0), G(1, 0, 0), u.x), mix(G(0, 1, 0), G(1, 1, 0), u.x), u.y),
+                  mix(mix(G(0, 0, 1), G(1, 0, 1), u.x), mix(G(0, 1, 1), G(1, 1, 1), u.x), u.y), u.z);
+    #undef G
+    return 0.5 + 0.8 * n;
 }
 
 // Seams of a cell pattern (Voronoi F2 - F1, in pattern cells): small on the seams.
@@ -305,18 +338,119 @@ float seams(vec2 p) {
     return sqrt(d2) - sqrt(d1);
 }
 
-// The same seams carried by the flow (as flow_noise): 0 on a seam, 1 well inside a plate.
+// ---- patterns carried by the liquid (flow_map.comp) ----
+// Each pattern is drawn at x - d, d how far the liquid there has moved since the pattern
+// restarted, so it moves exactly as the liquid does. Two copies half a period apart, each
+// faded out as it restarts (a flow map, Vlachos 2010). A copy that has moved shows a new
+// part of the pattern from its restart on (it would have been sheared into streaks); one
+// that has not moved shows the pattern at rest, the same in both copies, so liquid at rest
+// keeps its pattern instead of morphing every few seconds. sim/mod.rs: FLOW_PERIOD_*.
+const float PERIOD_SHORT = 4.0;
+const float PERIOD_LONG = 12.0;
+
+struct Carry {
+    vec2 dA, dB;     // displacement of each copy, cells
+    float w;         // weight of copy A (B: 1 - w)
+    vec2 gen;        // generation of each copy (restarts so far)
+    float stretch;   // areal stretch of the liquid since the restarts (div d, blended)
+    float strain;    // how far it has been sheared or stretched since (|sym grad d|, blended)
+};
+
+vec4 flow_at(vec2 x, float k) { return textureLod(flow_map, vec3(x / vec2(pc.grid), 2.0 * pc.flow_layer + k), 0.0); }
+
+Carry carry(vec2 x, bool long_period, bool strain) {
+    float k = long_period ? 1.0 : 0.0;
+    float period = long_period ? PERIOD_LONG : PERIOD_SHORT;
+    vec4 d = flow_at(x, k);
+    float ph = pc.now / period;
+    Carry c;
+    c.dA = d.xy;
+    c.dB = d.zw;
+    c.w = 1.0 - abs(2.0 * fract(ph) - 1.0);
+    c.gen = vec2(floor(ph), floor(ph + 0.5));
+    c.stretch = 0.0;
+    c.strain = 0.0;
+    if (strain) {
+        vec4 gx = 0.5 * (flow_at(x + vec2(1.0, 0.0), k) - flow_at(x - vec2(1.0, 0.0), k));
+        vec4 gy = 0.5 * (flow_at(x + vec2(0.0, 1.0), k) - flow_at(x - vec2(0.0, 1.0), k));
+        c.stretch = mix(gx.z + gy.w, gx.x + gy.y, c.w);
+        float sA = sqrt(gx.x * gx.x + gy.y * gy.y + 0.5 * (gx.y + gy.x) * (gx.y + gy.x));
+        float sB = sqrt(gx.z * gx.z + gy.w * gy.w + 0.5 * (gx.w + gy.z) * (gx.w + gy.z));
+        c.strain = mix(sB, sA, c.w);
+    }
+    return c;
+}
+
+// How far a copy has moved, in features of the pattern: 0 the pattern at rest, 1 a new one.
+float moved(vec2 d, float freq) { return smoothstep(0.3, 1.2, length(d) * freq); }
+
+// The pattern at rest is offset by `seed`; a moved copy's by its generation.
+vec2 rest_off(float seed) { return vec2(13.7, 7.3) * seed; }
+vec2 gen_off(float gen, float seed) { return hash22(vec2(gen, seed)) * 97.0 + 31.0; }
+
+float pattern(vec2 q, float evolve) { return evolve > 0.0 ? gnoise3(vec3(q, pc.now * evolve)) : gnoise(q); }
+
+// The (up to) four patterns behind a carried pattern: each copy's pattern at rest and its
+// moved one. Their weights (summing to 1) and the variance of their blend come first; where
+// each is read is worked out in the loop that reads it (kept as arrays, the four places held
+// so many registers that the whole shader ran slower: 0.27 ms a frame at 1080p in a tank
+// without a single pattern on screen). Where the two copies have moved alike, to a
+// twentieth of a feature, their patterns at rest are one: read once, at the weighted
+// displacement (most of a resting pool).
+struct Slots { vec4 c; float var; vec2 dA; };
+Slots slots(Carry k, float freq) {
+    float mA = moved(k.dA, freq), mB = moved(k.dB, freq);
+    Slots s;
+    s.c = vec4(k.w * (1.0 - mA), k.w * mA, (1.0 - k.w) * (1.0 - mB), (1.0 - k.w) * mB);
+    // (A blend of independent patterns is flatter than either; the two copies of the
+    // pattern at rest are the same pattern where they have moved alike.)
+    float same = 1.0 - smoothstep(0.25, 1.0, length(k.dA - k.dB) * freq);
+    s.var = dot(s.c, s.c) + 2.0 * same * s.c.x * s.c.z;
+    s.dA = k.dA;
+    if (length(k.dA - k.dB) * freq < 0.05 && s.c.x + s.c.z > 0.0) {
+        s.dA = mix(k.dB, k.dA, s.c.x / (s.c.x + s.c.z));
+        s.c.x += s.c.z;
+        s.c.z = 0.0;
+    }
+    return s;
+}
+// Where slot j is read.
+vec2 slot_q(vec2 x, Carry k, Slots s, int j, float freq, float seed) {
+    vec2 d = j < 2 ? s.dA : k.dB;
+    vec2 off = (j & 1) == 0 ? rest_off(seed) : gen_off(j < 2 ? k.gen.x : k.gen.y + 0.5, seed);
+    return (x - d) * freq + off;
+}
+
+// Gradient noise carried by the liquid (about 0..1, mean 0.5): `freq` features per cell,
+// evolving at `evolve` features per second even where the liquid rests (0: still).
+float carried_noise(vec2 x, Carry k, float freq, float seed, float evolve) {
+    Slots s = slots(k, freq);
+    float n = 0.0;
+    [[dont_unroll]] for (int j = 0; j < 4; j++)
+        if (s.c[j] > 0.0) n += s.c[j] * (pattern(slot_q(x, k, s, j, freq, seed), evolve) - 0.5);
+    return clamp(0.5 + n / sqrt(max(s.var, 1e-4)), 0.0, 1.0);
+}
+
+// Two evolving noises carried by the liquid at once (as carried_noise, `evolve` > 0).
+vec2 carried_noise2(vec2 x, Carry k, float freq, float seed, float evolve) {
+    Slots s = slots(k, freq);
+    float t = pc.now * evolve;
+    vec2 n = vec2(0.0);
+    [[dont_unroll]] for (int j = 0; j < 4; j++)
+        if (s.c[j] > 0.0) n += s.c[j] * (gnoise3x2(vec3(slot_q(x, k, s, j, freq, seed), t)) - 0.5);
+    return clamp(0.5 + n / sqrt(max(s.var, 1e-4)), 0.0, 1.0);
+}
+
+// The seams of a cell pattern carried by the liquid: 0 on a seam, 1 well inside a plate.
 // `width` in pattern cells, but never under about a pixel and a half: thinner seams winked
 // on and off as they drifted across pixels.
-float flow_seams(vec2 x, vec2 u, float freq, float period, float width, float zoom) {
+float carried_seams(vec2 x, Carry k, float freq, float width, float zoom, float seed) {
     width = max(width, 1.5 * freq / zoom);
-    float ph = pc.now / period;
-    float t0 = fract(ph), t1 = fract(ph + 0.5);
-    float w0 = 1.0 - abs(2.0 * t0 - 1.0);
-    vec2 o0 = hash22(vec2(floor(ph), 7.0)) * 61.0, o1 = hash22(vec2(floor(ph + 0.5), 7.5)) * 61.0;
-    float s0 = smoothstep(0.0, width, seams((x - u * (ADVECT * t0 * period)) * freq + o0));
-    float s1 = smoothstep(0.0, width, seams((x - u * (ADVECT * t1 * period)) * freq + o1));
-    return mix(s1, s0, w0);
+    Slots s = slots(k, freq);
+    float r = 0.0;
+    [[dont_unroll]] for (int j = 0; j < 4; j++)
+        if (s.c[j] > 0.0) r += s.c[j] * smoothstep(0.0, width, seams(slot_q(x, k, s, j, freq, seed)));
+    return r;
 }
 
 // The glow field at a world position, filtered with a cubic B-spline (four bilinear taps):
@@ -553,11 +687,10 @@ void main() {
     float opac = opt.x, scat = opt.y, metal = opt.z, gloss = opt.w;
     float body = sty.x / wo, foam_k = sty.y / wo;
     float fast = em.w;
-    // The effects (optics table `fx`), and the flow that carries their patterns.
+    // The effects (optics table `fx`), and how far the liquid has carried their patterns.
     vec4 fxv = co.fx / wo;
     float glint = fxv.y, irid = fxv.z, crackle = fxv.w;
-    vec2 uflow = co.fz.zw / wo;
-    uflow *= min(1.0, 10.0 / max(length(uflow), 1e-3));
+    Carry ks = carry(world, false, false), kl = carry(world, true, false);
     // The key light that reaches the liquid here through the liquid above it, and the
     // quenched skin of a melt.
     vec4 l9 = co.l9 / wo;
@@ -777,7 +910,8 @@ void main() {
             // with the flow in broad swirls and thins towards the edges; it shows where the
             // surface reflects (at its top and in thin layers), not through the body.
             if (irid > 0.01 && oily > 0.01) {
-                float swirl = flow_noise(world, uflow, 0.11, 6.0, 3.0) * 0.7 + flow_noise(world * 1.7 + 9.1, uflow, 0.11, 4.5, 8.0) * 0.3;
+                // (Broad swirls that the flow draws out, drifting slowly even on still oil.)
+                float swirl = carried_noise(world, kl, 0.11, 3.0, 0.03) * 0.7 + carried_noise(world, ks, 0.19, 8.0, 0.05) * 0.3;
                 float tnm = 180.0 + 720.0 * swirl + 160.0 * clamp(d, 0.0, 2.0);
                 vec3 film = vec3(0.0);
                 for (int k = -1; k <= 1; k++) {
@@ -821,7 +955,7 @@ void main() {
             // surface is never quite smooth. Only inside the highlight, never over the body.
             if (glint > 0.5 && nh > 0.6) {
                 float gf = detail(1.2, zoom);
-                float sp = flow_noise(world, uflow, 1.2, 2.2, 5.0);
+                float sp = carried_noise(world, ks, 1.2, 5.0, 0.0);  // (moving with the liquid; still on still honey)
                 float sparkle = smoothstep(0.62, 0.8, sp) * gf;
                 spec *= 1.0 + 2.5 * sparkle * (glint - 0.5) * 2.0;
                 spec += 0.18 * glint * pow(nh, 0.25 * shin) * (1.0 - 0.6 * metal);
@@ -840,23 +974,35 @@ void main() {
             // of melt is their ratio.)
             float skin_k = clamp(skin / max(crackle, 0.05), 0.0, 1.0) * smoothstep(0.0, 0.25, crackle) * smoothstep(0.2, 0.6, oily);
             if (crackle > 0.01 && (glow_lvl > 0.0 || skin_k > 0.01) && cgf > 0.0) {
-                // Molten: the glow churns with the flow, in broad swells and thin brighter veins.
-                float churn = flow_noise(world, uflow, 0.22, 3.0, 11.0);
-                float vein = 1.0 - abs(2.0 * flow_noise(world, uflow, 0.3, 2.5, 12.0) - 1.0);
-                vein = pow(vein, 6.0) * smoothstep(0.35, 0.75, churn) * detail(0.3, zoom);
-                glow *= mix(1.0, 0.68 + 0.5 * churn + 0.4 * vein, crackle * cgf);
+                // Molten: where the melt rests, its glow swells and fades slowly (it convects
+                // inside); where it flows, the flow draws hotter and cooler melt out into
+                // bright streaks along it, carried and stretched with the liquid: the more it
+                // has been sheared (the flow map's strain), the more of them.
+                Carry km = carry(world, false, true);
+                float flowing = smoothstep(0.08, 0.7, km.strain);
+                vec2 cv = carried_noise2(world, km, 0.25, 11.0, 0.08);
+                float churn = cv.x;
+                float vein = 1.0 - abs(2.0 * cv.y - 1.0);
+                vein = pow(vein, 6.0) * smoothstep(0.35, 0.75, churn) * detail(0.3, zoom) * mix(0.15, 1.0, flowing);
+                glow *= mix(1.0, 0.93 + mix(0.28, 0.55, flowing) * (churn - 0.5) * 2.0 * 0.5 + 0.4 * vein, crackle * cgf);
                 glow.g *= 1.0 + 0.18 * vein * crackle;
                 // (Not where it is mixed with another liquid from its own cooling: there a
                 // cell's temperature jumps with the share of each from frame to frame, and
                 // the plates and seams flickered; the skin is steady there.)
                 float crust = crackle * cgf * (1.0 - smoothstep(0.7, 1.22, glow_lvl)) * smoothstep(0.85, 0.97, os);
                 if (crust > 0.0) {
-                    float plate = flow_seams(world, uflow * 0.8, 0.34, 6.0, 0.22, zoom);
-                    plate = min(plate, mix(1.0, flow_seams(world + 13.1, uflow * 0.8, 1.0, 6.0, 0.14, zoom), 0.6 * detail(1.0, zoom)));
+                    // Plates of crust carried by the melt, which keep their size: where the melt
+                    // spreads (the stretch of the flow map) the crust tears and its seams open
+                    // onto the glowing melt; where it is pushed together they close.
+                    Carry kc = carry(world, true, true);
+                    float tear = clamp(2.5 * kc.stretch, -0.5, 1.0);
+                    float open = (1.0 + 1.6 * max(tear, 0.0)) * (1.0 + 0.6 * min(tear, 0.0));
+                    float plate = carried_seams(world, kc, 0.34, 0.22 * open, zoom, 7.0);
+                    plate = min(plate, mix(1.0, carried_seams(world, kc, 1.0, 0.14 * open, zoom, 13.0), 0.6 * detail(1.0, zoom)));
                     float seam = 1.0 - plate;
-                    vec3 rock = ob * (0.7 + 0.6 * mix(0.5, gnoise(world * 1.6), detail(1.6, zoom)));
+                    vec3 rock = ob * (0.7 + 0.6 * mix(0.5, carried_noise(world, kc, 1.6, 21.0, 0.0), detail(1.6, zoom)));
                     fc = mix(fc, rock, crust * plate);
-                    glow *= mix(1.0, mix(0.08, 1.0, seam) * (1.0 + 0.7 * seam), crust);
+                    glow *= mix(1.0, mix(0.08, 1.0, seam) * (1.0 + 0.7 * seam + 0.8 * max(tear, 0.0) * seam), crust);
                     glow.g *= 1.0 + 0.25 * seam * crust;
                 }
                 // The quenched skin (cell_optics.comp): a rind of dark glassy rock RIND cells
@@ -868,8 +1014,8 @@ void main() {
                 float skin_on = smoothstep(0.02, 0.12, skin_k) * cgf;
                 float rind = skin_on * (1.0 - clamp((to_edge - RIND) * zoom + 0.5, 0.0, 1.0));
                 if (rind > 0.0) {
-                    float crack = 1.0 - flow_seams(world + 41.7, uflow * 0.5, 0.22, 9.0, 0.10, zoom);
-                    vec3 glass = ob * (0.55 + 0.35 * mix(0.5, gnoise(world * 2.3 + 5.0), detail(2.3, zoom)));
+                    float crack = 1.0 - carried_seams(world, kl, 0.22, 0.10, zoom, 41.0);
+                    vec3 glass = ob * (0.55 + 0.35 * mix(0.5, carried_noise(world, kl, 2.3, 5.0, 0.0), detail(2.3, zoom)));
                     fc = mix(fc, glass, rind * (1.0 - 0.8 * crack));
                     glow *= mix(1.0, 0.04 + 0.5 * crack, rind);
                 }

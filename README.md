@@ -193,7 +193,15 @@ velocity of the frozen poured particles frame by frame, `LAB_BODIES=1` the rigid
 substep by substep, `LAB_PACE=1` the simulated time each frame covers under the app's pacing,
 `LAB_DIR=D` bursts of rendered frames. `LAB_WATER_T=T` leaves a pool of water at T °C in
 the air for SETTLE seconds and prints its mean temperature and the heat it has given the air
-(evaporation, Heat). `profile` also times the per-frame optics passes (cell optics, light,
+(evaporation, Heat). `LAB_LAVA_STEAM=1` pours lava into a pool of water at 20 °C and
+prints the steam (how many bubbles, how many lie against the lava, how high the highest
+rises), the water's temperature in five bands from floor to surface and the lava's.
+`LAB_LAVA_JITTER=1` lets a pool of lava (`LAB_JITTER_MAT=water` or `syrup`) settle under oil
+(`LAB_BARE=1`: under air; `LAB_FULL=1`: wall to wall, at rest from the start; `LAB_NOHEAT=1`:
+isothermal) for `LAB_SETTLE` seconds, then prints the velocity deep inside it frame by frame
+for 2 s: its mean, how much it varies and turns back; `LAB_MAP=1` a map of it in blocks,
+`LAB_WALL=1` cell by cell along the left wall and how far the particles there really moved.
+`profile` also times the per-frame optics passes (cell optics, light,
 smoothing, glow, film, smoke). `shot` renders
 any map at the given simulated times, with `--ui` to include the panel. `gallery DIR [SCENE]`
 renders a fixed set of deterministic scenes (each liquid alone, each pair meeting, every
@@ -530,7 +538,7 @@ is the water's), so the heat content is unchanged by boiling and condensing.
   cancels. Its low density also lightens the cell in the pressure solve, so a column of
   bubbles drives the liquid up with it.
 - **It condenses** back into water below x = `steam_condense` (0.005). The particles of a cell
-  that holds steam exchange heat at `steam_mixing` (3 /s; 30 until bubbles were reported popping
+  that holds steam exchange heat at `steam_mixing` (1 /s; 30, then 3, until bubbles were reported popping
   within a cell of leaving hot water) instead of the conduction rate of
   a particle-sized parcel (~0.1 /s): a bubble in colder water collapses within milliseconds,
   and before this it rose 15 – 50 cm through 20 °C water. The exchange is the same zero-sum
@@ -875,10 +883,14 @@ the optics table and the live fields, with no code for any one liquid:
   every melt was a dark, streaky, moving band (with the glow on, 0.12 % of the pixels of a
   lava cup were darker than with it off; now 0.00 %, `validate render`). Embers flickered
   over it. The glow above a melt is now a steady, smooth bloom.
-- *Molten rock* (`crackle`, lava 1): the glow churns in broad swells with brighter veins,
-  carried by the flow. In the freezing range (a glow of about 1.2 at lava's liquidus,
-  0.85 at its solidus) a crust forms: dark plates of a cell pattern with glowing seams that
-  are yellower and brighter than the plates were. Not where lava is mixed with another
+- *Molten rock* (`crackle`, lava 1): where the melt rests its glow swells and fades slowly
+  (a pattern that evolves in time rather than slides); where it flows, the flow draws it out
+  into bright streaks along the flow, as many as the melt has been sheared (the flow map's
+  strain, below). In the freezing range (a glow of about 1.2 at lava's liquidus, 0.85 at its
+  solidus) a crust forms: dark plates of a cell pattern with glowing seams that are yellower
+  and brighter than the plates were. The plates keep their size: where the melt spreads
+  (the flow map's areal stretch) the crust tears, its seams opening wider and brighter onto
+  the melt; where it is pushed together they close. Not where lava is mixed with another
   liquid: a cell's temperature there jumps with the share of each, and the plates
   flickered (Lava Meets Water 0.144 % of pixels); the quenched skin is drawn as frozen.
 - *Stains* (`stain`, blood 1; replaced by the film map in the third round of 2026-11-14,
@@ -911,12 +923,26 @@ the optics table and the live fields, with no code for any one liquid:
   constant across each texel, and mercury was drawn in vertical stripes and squares (it
   always had been). It is now a central difference over 1.5 texels.
 
-Every pattern is a smooth function of world position and simulated time, either fixed to
-the world or carried by the flow (two copies half a period apart, each faded out as it
-restarts, Vlachos 2010; carried at 0.35 of the flow, since carried all the way shear drew
-it into streaks within a period). Each fades out where its features would span less than
-about 2 px, and highlights are made broader at ordinary zooms, so nothing sparkles from
-frame to frame (flicker below).
+**Patterns carried by the liquid** (since 2026-11-15; `flow_map.comp`). Every pattern of a
+liquid (lava's glow, veins, crust plates, rind and its grain; oil's film colours; honey's
+glints) is drawn at x − d, where d is how far the liquid there has moved since the pattern
+last restarted: a map of it, one texel per cell, carried along with the liquid every frame
+(semi-Lagrangian, from the smoothed cell velocity) and grown by u dt. So the patterns move
+exactly as the liquid does, stretched by its shear. Each restarts, or shear would draw it
+into ever longer streaks: two copies half a period apart, each faded out as it restarts
+(a flow map, Vlachos 2010), with two periods (4 s and 12 s, `FLOW_PERIOD_*`). A copy that
+has moved shows a new part of the pattern from its restart on; one that has not shows the
+pattern at rest, the same in both copies, so a liquid at rest keeps its pattern (a crust
+does not morph every few seconds). From the map's gradient the composite also reads how far
+the liquid has been sheared and spread since the restarts (lava's streaks and tears, above).
+Before, the patterns were drawn at x − u t from the velocity of the moment, t up to a few
+seconds after the restart, at 0.35 of the flow: any wobble of the velocity moved the whole
+pattern t times as far, and lava lying in its crust stuttered back and forth (reported
+2026-11-15; Validation, "Resting lava"). Patterns fixed to something (back wall, solids)
+stay fixed to it. Each fades out where its features would span less than about 2 px, and
+highlights are made broader at ordinary zooms, so nothing sparkles from frame to frame
+(flicker below). The 3D noise of the evolving patterns uses an integer hash (PCG3D): with a
+float hash, cells sharing a corner were now and then given different values and drew seams.
 
 | New material property | Built-in values |
 |---|---|
@@ -994,7 +1020,7 @@ Lava Meets Water 0.054 → 0.024 %, Kitchen 0.014 → 0.013 %.
 | **Water** | Clear: pale aqua under its surface, deep blue at the floor of a deep pool; the back wall shows through, bent by the surface; a droplet is nearly transparent | A thin bright line where it faces up (light reflected inside it); edges mirror the tank (Fresnel) | Thin: the surface follows fine detail | Fast *and* thin is white: spray, splashes, the lip of a wave. Warm water steams |
 | **Oil** | Clear pale gold | A highlight, and Newton's thin-film colours along the surface and in thin layers | Medium | Stays gold: it never foams; its film colours drift with it |
 | **Syrup (honey)** | Gold where thin, dark amber in a mass, glowing gold where light leaves it on the far side | Sharp highlights broken into a few glistening points that move with it | Thick: its surface is drawn fuller and rounder, and it coats what it runs over | |
-| **Lava** | Molten: a churning glow with brighter veins, carried by the flow; cooling: dark plates with glowing seams | A rind of dark glassy rock with dim cracks where it meets air or water; a steady, soft bloom | Thick | Lights walls and liquids near it (water beside it turns orange); boils the water it meets; scorches what it touches |
+| **Lava** | Molten: a glow that swells slowly at rest and is drawn into bright streaks where it flows; cooling: dark plates with glowing seams that tear open where it spreads | A rind of dark glassy rock with dim cracks where it meets air or water; a steady, soft bloom | Thick | Lights walls and liquids near it (water beside it turns orange); boils the water it meets; scorches what it touches |
 | **Blood** | Deep red, opaque, glossy; scarlet where thin | A wet highlight | Medium | Spatters the back wall and what it hits; coats solids, and the coat runs down their faces in drips with beads at their heads; dries darker and browner |
 | **Mercury, gallium** | A smooth mirror of the tank (and of any glow nearby) | A hard highlight | Medium | |
 | **Ferrofluid** | A dark mirror: glossy black that shows the tank's light in its surface (until 2026-11-14 a black body with a quarter of a mirror, nearly invisible against the dark tank) | A hard highlight | Medium | Heaps up over a magnet |
@@ -1038,7 +1064,7 @@ Lava Meets Water 0.054 → 0.024 %, Kitchen 0.014 → 0.013 %.
 
 **Why it holds still.** Nothing in the picture depends on anything but those smooth fields
 and the simulated time, so nothing can flicker or pop that the particles themselves do not
-do: the noise of the effects is fixed to the world or carried by the flow, smooth in time,
+do: the noise of the effects is fixed to the world or carried by the liquid, smooth in time,
 and faded out below about 2 px; there is no screen-space pattern and no per-frame random
 number. Three devices deal with the cases that would otherwise shimmer:
 
@@ -1142,15 +1168,16 @@ low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each 
    particle 752 cells/s, now 11), was drawn as white water, and launched itself when nudged.
 3. Surface tension: curvature of smoothed liquid and oil indicators, turned into pressure
    jumps at liquid–air and oil–aqueous interfaces (below).
-4. Viscosity, full stress tensor (below).
-5. Pressure: the velocity field is made divergence-free with a variable-density, cut-cell,
+4. Pressure: the velocity field is made divergence-free with a variable-density, cut-cell,
    ghost-fluid Poisson solve, by conjugate gradients preconditioned with an aggregation
    multigrid V-cycle (red–black Gauss–Seidel smoothing, Galerkin coarse operators,
    coarse-correction weight 1.8). It stops at a relative residual of 1e-4, so its accuracy
    does not depend on the resolution: a resting pool needs 3 to 5 iterations, the dam
    break 8 to 12.
-6. A second solve with the same matrix corrects density errors by nudging particle
-   positions only; it never adds momentum.
+   A second potential, solved alongside with the same matrix, corrects density errors by
+   nudging particle positions only; it never adds momentum.
+5. Viscosity, full stress tensor (below), where it is implicit followed by a second
+   pressure solve on the same matrix (below).
 
 Both solves need a free surface somewhere in every connected body of liquid: a region
 sealed off by solids on all sides has a singular system. Where two shapes touch (the two
@@ -1239,6 +1266,23 @@ large for the time step. Where the viscous diffusion number `nu dt / dx²` is be
 (water: about 1e-5 on 1 cm cells) the same operator is applied explicitly instead, which is
 stable to about 0.12; in a water-only tank that is the whole tank, in mixed tanks the
 implicit solve runs only on 16 × 16 tiles near more viscous fluid.
+
+The implicit viscosity runs between two pressure solves (`viscous_projection` 1, 2026-11-15).
+The first takes out what the liquid cannot follow, above all the pull `g dt` of gravity on
+a pool at rest, so the no-slip walls of the viscosity see only real motion; the second
+removes the divergence the viscosity leaves (`rhs_visc.comp`, `project_visc.comp`). It
+reuses the matrix and multigrid hierarchy of the first, solves for the total pressure
+starting from the first one's (so its first residual is just the divergence the viscosity
+added, and a pool at rest needs no iterations), carries no interface jumps (the first solve
+took them) and leaves the density correction alone. With one solve after the viscosity
+(`viscous_projection=0`, the order before) the solve held back the whole pull of gravity
+along every wall and the pressure pushed that layer up: every resting viscous pool
+circulated along its walls at about 6 cells/s. Gravity added after the viscosity instead
+stops that but lets gravity-driven flows slip by `g dt` per substep at the walls (the
+sludge slump never stopped); the viscosity after a single projection leaves a divergent
+velocity (slump 65 cells against 47). The explicit step for water is not affected: it
+moves a wall face by `nu dt / dx²` of `g dt`, and a resting water pool shows no wall flow
+with either order.
 
 **Surface tension** uses the ghost-fluid method (Kang, Fedkiw & Liu 2000) for both kinds of
 interface, so the jump is as sharp as the free surface and is balanced exactly by the
@@ -1741,6 +1785,30 @@ defaults it also passes with `eddy_heat=0` or `contact_heat=300`. The Stefan fro
 within +1.5 – 1.9 % of the similarity solution (old build +1.7 – 2.1 %). Every heat budget
 still closes (`lab`: 0.000 %). `--selftest`, `cargo test` (42) and clippy pass.
 
+### Lava texture (2026-11-15)
+
+Reported: lava lying in its crust or in harder lava had a texture that jittered and
+stuttered back and forth. The patterns were drawn at x − u t from the cell velocity of the
+moment, t up to a few seconds since the pattern restarted: any wobble of the velocity moved
+the whole pattern t times as far. They are now carried by a displacement map (Look,
+"Patterns carried by the liquid"). The Playground with lava poured into its pool and left
+for 60 s, 30 frames 1/60 s apart, rows inside the lava only (`SPROUT_LAVA_POOL=1 sprout
+gallery DIR fx`):
+
+| | Mean change of a pixel channel, frame to frame | Largest | Frame 0 to 29 |
+|---|---|---|---|
+| before | 0.321 levels | 1.269 | 2.030 |
+| after | 0.033 | 0.087 | 0.382 |
+
+The look itself: resting lava glows in slow, evolving swells; flowing lava is drawn out
+into streaks along the flow (gallery `fx_lava_pour`); the crust tears where the melt
+spreads. In the search, the velocity inside resting lava was measured frame by frame
+(`LAB_LAVA_JITTER`): smooth from frame to frame (0.02 – 0.03 cells/s per frame), but the
+pool never comes to rest along the walls (Limitations), and the old patterns multiplied
+those slow swings of ±0.5 cells/s by seconds. `validate`: all 240 checks pass (the steam
+check that failed last round passes since `steam_mixing` 1); `--selftest`, `cargo test` (42)
+and clippy pass.
+
 ## Performance
 
 Hardware: AMD Ryzen 5 3600, NVIDIA RTX 3060 Ti 8 GB, Fedora 45, Wayland. All three versions
@@ -2004,7 +2072,43 @@ per-frame optics passes are under Look ("Stains and runs"): Playground 0.296 →
 Lava Meets Water 0.358 → 0.411 ms, Kitchen 0.383 → 0.473 ms. The eddy mixing and evaporation
 run inside the heat pass, which runs only in tanks with heat.
 
+### Lava texture (2026-11-15)
+
+The build before (the last commit with this round's steam changes, which are not part of
+the comparison) and after, same commands interleaved, two rounds each (`--no-vsync --frames
+1500`, first 360 frames skipped, `SPROUT_FRAMES_CSV`):
+
+| Scene | Build | p5 / p50 / p90 / p99 frame (ms) | simulated / wall |
+|---|---|---|---|
+| Playground | before | 0.78 / 0.84 / 5.04 / 5.55, 0.78 / 0.84 / 5.10 / 5.56 | 0.94×, 0.94× |
+| | after | 0.79 / 0.85 / 4.99 / 5.29, 0.80 / 0.84 / 5.07 / 5.35 | 0.94×, 0.94× |
+| Lava Meets Water | before | 0.75 / 0.81 / 4.88 / 5.41, 0.75 / 0.81 / 4.93 / 5.42 | 0.92×, 0.92× |
+| | after | 1.03 / 1.12 / 5.59 / 5.95, 1.04 / 1.12 / 5.64 / 6.00 | 0.94×, 0.93× |
+| Kitchen | before | 0.78 / 1.01 / 5.90 / 8.94, 0.77 / 1.00 / 5.92 / 8.93 | 0.95×, 0.95× |
+| | after | 0.98 / 2.29 / 9.56 / 10.57, 1.01 / 1.64 / 6.05 / 9.89 | 0.96×, 0.96× |
+
+Rendering alone (`bench --at 2 --size 1920x1080`, interleaved): Playground 1.006 / 0.999 →
+0.991 / 0.973 ms, Lava Meets Water 0.915 / 0.909 → 1.195 / 1.182 ms, Kitchen 0.957 / 0.973
+→ 1.194 / 1.202 ms; simulation speed unchanged. The flow map's own pass costs nothing
+measurable; the composite costs about 0.25 ms more where liquids with patterns are on
+screen. It is not the work done (a resting pool reads one pattern where it read two, and
+Kitchen draws only glints) but the size of the shader: returning early from either the
+carried noise or the carried seams alone brings Kitchen back to 0.95 ms, while removing the
+3D noise, the strain taps or the unrolling does not. Not resolved this round.
+
 ## Limitations
+
+- **A resting viscous pool still jitters at its free surface** (2026-11-15). The wall
+  circulation it used to have is gone (two pressure solves around the viscosity, Physics,
+  Viscosity): a wall-to-wall layer of lava at rest moves 0.02 cells in 2 s next to the
+  walls (was 11.6) and below its top cells by under 0.01 cells/s. What is left, about
+  0.04 – 0.07 cells/s mean particle speed, sits in the top cells and is the density
+  correction (with `correction_max=0` the pool is at 0.001 cells/s), as in the water pool
+  below.
+- **A still pool of water open to the air slowly gains motion** (found 2026-11-15): wall to
+  wall, its mean speed grows from 0.44 to 1.7 cells/s in 24 s, in a circulation that
+  converges at the surface. The density correction drives it (with `correction_max=0` it
+  stays at 0.1 cells/s); under oil the same water stays still.
 
 - **Liquids of one phase group share one temperature per cell.** Different groups keep their
   own; oil and wax in one cell do not, so hot wax stirred into cold oil meets it at the mean
@@ -2131,7 +2235,7 @@ run inside the heat pass, which runs only in tanks with heat.
 | [src/checks.rs](src/checks.rs) | The materials' validation scenarios |
 | [src/stress.rs](src/stress.rs) | Robustness runs with bounds instead of answers: every map, every liquid, tools at their limits, parameter extremes, the renderer (`validate maps liquids abuse extremes render`) |
 | `shaders/heat.comp`, `rigid.comp`, `rheo.comp`, `elastic.comp`, `settle.comp`, `magnet.comp`, `cell_optics.comp`, `optics_blur.comp` | Conduction (with eddy mixing and evaporation), rigid bodies, non-Newtonian viscosity, viscoelastic force, settling, magnetic energy, per-cell optics and their 3 × 3 smoothing |
-| `shaders/optics.glsl`, `light.comp`, `film.comp`, `film_tiles.comp`, `glow.comp`, `smoke.comp` | The render side of the simulation: colour from absorption and scattering, the light from above, the film map of stains and runs (and its list of tiles), the glow field, the smoke field |
+| `shaders/optics.glsl`, `light.comp`, `film.comp`, `film_tiles.comp`, `flow_map.comp`, `glow.comp`, `smoke.comp` | The render side of the simulation: colour from absorption and scattering, the light from above, the film map of stains and runs (and its list of tiles), how far the liquid has carried its patterns, the glow field, the smoke field |
 | [src/validate.rs](src/validate.rs), [src/selftest.rs](src/selftest.rs), [src/headless.rs](src/headless.rs) | Checks, benchmarks, screenshots |
 | [tools/drop_modes.py](tools/drop_modes.py) | Reference periods for the oil-drop oscillation check (viscous normal modes; plain Python) |
 

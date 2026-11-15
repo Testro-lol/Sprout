@@ -1,0 +1,44 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Right-hand side of the second pressure solve, which follows the viscosity (mod.rs,
+// `record_substep`). The first solve, before the viscosity, already took out the pull of
+// gravity a resting pool cannot follow; viscosity then acts only on motion. Its no-slip
+// walls and stress terms leave the velocity a little divergent, and this solve projects
+// that out again.
+//
+// It solves for the total pressure P = P1 + P2 on the matrix rhs.comp built (unchanged,
+// as is the multigrid hierarchy): b = -div(u) + A P1, starting from P1. Its first residual
+// is then just -div(u) of the viscous velocity, P1 stays the warm start of the next
+// substep's first solve, and project_visc.comp subtracts the gradient of P - P1 (kept in
+// prhs.z). P2 has no interface terms: the jumps were all taken by the first solve. The
+// density correction is not solved again (cg_reduce mode 8 marks it done) and keeps its
+// right-hand side and potential.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    float D = mgd[i];
+    if (D <= 0.0) {
+        prhs[i].z = 0.0;
+        return;
+    }
+    // Unknowns are never on the border (rhs.comp), so every neighbour exists.
+    int W = P.grid.x;
+    vec4 w = mga[i];
+    float p1 = pres[i].x;
+    float ap = D * p1;
+    if (mgd[i - 1] > 0.0) ap -= w.x * pres[i - 1].x;
+    if (mgd[i + 1] > 0.0) ap -= w.y * pres[i + 1].x;
+    if (mgd[i - W] > 0.0) ap -= w.z * pres[i - W].x;
+    if (mgd[i + W] > 0.0) ap -= w.w * pres[i + W].x;
+    float aL = solid[i].x, aB = solid[i].y, aR = solid[i + 1].x, aT = solid[i + W].y;
+    vec4 vme = vel[i];
+    float div = aR * vel[i + 1].x - aL * vme.x + aT * vel[i + W].y - aB * vme.y;
+    vec4 r = prhs[i];
+    prhs[i] = vec4(ap - div, r.y, p1, 0.0);
+}

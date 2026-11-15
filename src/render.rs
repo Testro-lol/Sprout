@@ -166,6 +166,7 @@ struct CompositePc {
     stains: f32,
     vapour: f32,
     film_layer: f32,
+    flow_layer: f32,
 }
 
 #[repr(C)]
@@ -594,6 +595,7 @@ impl Renderer {
                 WriteDescriptorSet::image_view_sampler(7, vapour_view, self.sampler.clone()),
                 WriteDescriptorSet::buffer(8, sim.optics_buffer().clone()),
                 WriteDescriptorSet::image_view_sampler(9, sim.smoke_view().clone(), self.sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(11, sim.flow_view().0.clone(), self.sampler.clone()),
             ],
             [],
         )
@@ -819,6 +821,7 @@ impl Renderer {
                     stains: self.look.stains,
                     vapour: if steam { 1.0 } else { 0.0 },
                     film_layer: sim.film_views().2 as f32,
+                    flow_layer: sim.flow_view().1 as f32,
                 },
             )
             .unwrap();

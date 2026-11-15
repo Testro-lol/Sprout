@@ -13,6 +13,8 @@
 //   mode 5  viscosity alpha  pq from part[n..2n).z
 //   mode 6  viscosity beta   rz, rr from part[0..n).xy
 //   mode 7  viscosity end    statistics
+//   mode 8  pressure start of the second solve, after the viscosity (rhs_visc.comp): as
+//           mode 0, but the density-correction potential counts as solved already
 // When a solve has converged, its entries in the indirect argument buffer are zeroed so
 // the iterations recorded after that point do no work.
 
@@ -64,7 +66,7 @@ void publish_pressure() {
 void main() {
     uint t = gl_LocalInvocationIndex;
     uint mode = R.mode;
-    if (mode == 0u) {
+    if (mode == 0u || mode == 8u) {
         vec4 a = total(0u);
         vec4 b = total(R.n);
         bool all_done = false;
@@ -77,6 +79,7 @@ void main() {
             K.p_iters = uvec2(0u);
             vec2 tol = P.tol.xy;
             bvec2 done = lessThanEqual(a.zw, tol * tol * b.xy);
+            if (mode == 8u) done.y = true;
             K.p_done = uvec2(done);
             K.solves += 1u;
         }

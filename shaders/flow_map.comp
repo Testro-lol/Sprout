@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// How far the liquid at each cell has moved since its pattern last restarted (README, "Look",
+// "Patterns carried by the liquid"): the displacement d, carried along with the liquid
+// (semi-Lagrangian, from the smoothed cell velocity, cell_optics.comp layer 7) and grown by
+// u dt every update. The composite draws a liquid's patterns at x - d, so they move exactly
+// as the liquid has moved.
+//
+// (It drew them at x - u t from the velocity of the moment, t up to a few seconds: any wobble
+// of the velocity moved the whole pattern t times as far, and lava resting in its crust
+// stuttered back and forth.)
+//
+// A pattern carried for good would be sheared into streaks, so each restarts: two copies
+// half a period apart, each restarted (d = 0) as its weight in the composite reaches zero
+// (a flow map). Two periods, each with its two copies, one copy per channel pair: layer
+// 2 parity + 0 the short one, + 1 the long one; this update writes the other parity.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 60, rgba16f) uniform readonly image2DArray smoothed;
+layout(set = 0, binding = 64, rgba16f) uniform image2DArray flow;
+
+layout(push_constant) uniform FPC {
+    float dt;
+    float now;       // simulated time after this update, s
+    float period_s;  // composite.frag: PERIOD_SHORT
+    float period_l;  // composite.frag: PERIOD_LONG
+    uint parity;     // the copy that holds the map now
+} F;
+
+const float SPEED_MAX = 30.0;  // cells/s
+
+// The map (layer L) at a cell-centred position, bilinear, clamped to the grid.
+vec4 sample_at(vec2 x, int L) {
+    vec2 q = clamp(x - 0.5, vec2(0.0), vec2(P.grid - 1));
+    ivec2 i0 = ivec2(floor(q));
+    ivec2 i1 = min(i0 + 1, P.grid - 1);
+    vec2 f = q - vec2(i0);
+    vec4 a = mix(imageLoad(flow, ivec3(i0.x, i0.y, L)), imageLoad(flow, ivec3(i1.x, i0.y, L)), f.x);
+    vec4 b = mix(imageLoad(flow, ivec3(i0.x, i1.y, L)), imageLoad(flow, ivec3(i1.x, i1.y, L)), f.x);
+    return mix(a, b, f.y);
+}
+
+// Whether the copy with phase offset `o` restarted between the last update and this one.
+bool restarted(float period, float o) {
+    return floor(F.now / period + o) != floor((F.now - F.dt) / period + o);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    // The liquid's velocity here (none in air: what an empty cell holds stays until liquid
+    // carries something else in).
+    float occ = imageLoad(smoothed, ivec3(c, 4)).w;
+    vec2 u = occ > 0.02 ? imageLoad(smoothed, ivec3(c, 7)).zw / occ : vec2(0.0);
+    float s = length(u);
+    if (s > SPEED_MAX) u *= SPEED_MAX / s;
+    vec2 here = vec2(c) + 0.5;
+    vec2 from = here - u * F.dt;
+    int src = 2 * int(F.parity), dst = 2 * (1 - int(F.parity));
+    for (int k = 0; k < 2; k++) {
+        float period = k == 0 ? F.period_s : F.period_l;
+        vec4 d = sample_at(from, src + k) + vec4(u, u) * F.dt;
+        if (restarted(period, 0.0)) d.xy = vec2(0.0);
+        if (restarted(period, 0.5)) d.zw = vec2(0.0);
+        imageStore(flow, ivec3(c, dst + k), d);
+    }
+}

@@ -240,7 +240,9 @@ void main() {
             && cell[cidx(clamp(ivec2(p.pos), ivec2(0), P.grid - 1))].w <= 0.0;
         // And any particle in a cell of a rigid body: its gather would otherwise mix in the
         // liquid faces around the body (a skin one cell thick would not hold).
-        bool in_body = has_cap(CAP_RIGID) && rl[cidx(clamp(ivec2(p.pos), ivec2(1), P.grid - 2))].x >= 0;
+        // (Never a bubble of steam: vapour against a crust of quenched lava is no part of it,
+        // and held there it clung to the crust instead of rising.)
+        bool in_body = has_cap(CAP_RIGID) && row != ROW_STEAM && rl[cidx(clamp(ivec2(p.pos), ivec2(1), P.grid - 2))].x >= 0;
         if ((frozen || plug || in_body) && has_cap(CAP_RIGID)) {
             ivec2 pc0 = clamp(ivec2(p.pos), ivec2(1), P.grid - 2);
             const ivec2 order[9] = ivec2[9](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1), ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
