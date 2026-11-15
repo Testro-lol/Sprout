@@ -402,6 +402,20 @@ struct FilmPc {
     parity: u32,
     mob_scale: f32,
 }
+/// Periods of the patterns carried by the liquid (flow_map.comp; composite.frag: PERIOD_SHORT,
+/// PERIOD_LONG), s.
+pub const FLOW_PERIOD_SHORT: f32 = 4.0;
+pub const FLOW_PERIOD_LONG: f32 = 12.0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct FlowPc {
+    dt: f32,
+    now: f32,
+    period_s: f32,
+    period_l: f32,
+    parity: u32,
+}
 /// The vapour of escaped steam mixes away into the air with this share of `steam_life` as its
 /// time constant (smoke.comp).
 const SMOKE_FADE: f32 = 0.8;
@@ -699,6 +713,7 @@ struct Passes {
     cell_optics: Pass,
     light: Pass,
     optics_blur: Pass,
+    flow_map: Pass,
     glow: Pass,
     film_tiles: Pass,
     film: Pass,
@@ -805,6 +820,10 @@ pub struct FluidSim {
     film_c: Arc<ImageView>,
     film_h: Arc<ImageView>,
     film_parity: std::cell::Cell<u32>,
+    /// How far the liquid has moved since its patterns restarted (flow_map.comp): RGBA16F,
+    /// one texel per cell, layers 2 x copy + period; the copy that holds it now.
+    flow: Arc<ImageView>,
+    flow_parity: std::cell::Cell<u32>,
     film_in: Subbuffer<[u32]>,
     film_col: Subbuffer<[u32]>,
     film_tiles: Subbuffer<[u32]>,
@@ -975,6 +994,22 @@ impl FluidSim {
                     format,
                     extent: [fdim[0], fdim[1], 1],
                     array_layers: 2,
+                    usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .expect("out of GPU memory"),
+        )
+        .unwrap();
+        let flow = ImageView::new_default(
+            Image::new(
+                gpu.memory.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R16G16B16A16_SFLOAT,
+                    extent: [grid[0], grid[1], 1],
+                    array_layers: 4,
                     usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
                     ..Default::default()
                 },
@@ -1192,6 +1227,7 @@ impl FluidSim {
             cell_optics: Pass::with_images(&gpu, "cell_optics", spirv!("cell_optics.comp"), &table, &[(58, cellopt_raw.clone())]),
             light: Pass::with_images(&gpu, "light", spirv!("light.comp"), &table, &[(58, cellopt_raw.clone())]),
             optics_blur: Pass::with_images(&gpu, "optics_blur", spirv!("optics_blur.comp"), &table, &[(58, cellopt_raw.clone()), (60, cellopt.clone())]),
+            flow_map: Pass::with_images(&gpu, "flow_map", spirv!("flow_map.comp"), &table, &[(60, cellopt.clone()), (64, flow.clone())]),
             glow: Pass::with_images(&gpu, "glow", spirv!("glow.comp"), &table, &[(58, cellopt_raw.clone()), (62, glow_a.clone()), (63, glow_b.clone())]),
             film_tiles: Pass::build(&gpu, "film_tiles", gpu.shader_specialized(spirv!("film_tiles.comp"), &[(2, fres)]), &table, &[]),
             film: Pass::build(
@@ -1296,6 +1332,8 @@ impl FluidSim {
             film_c,
             film_h,
             film_parity: std::cell::Cell::new(0),
+            flow,
+            flow_parity: std::cell::Cell::new(0),
             film_in,
             film_col,
             film_tiles,
@@ -1380,7 +1418,7 @@ impl FluidSim {
         let dt = match self.stain_at.get() {
             Some((tank, t)) if tank == self.resets => (now - t).clamp(0.0, 0.25) as f32,
             _ => {
-                for img in [&self.film_c, &self.film_h] {
+                for img in [&self.film_c, &self.film_h, &self.flow] {
                     b.clear_color_image(vulkano::command_buffer::ClearColorImageInfo::image(img.image().clone())).unwrap();
                 }
                 b.fill_buffer(self.film_in.clone(), 0).unwrap();
@@ -1407,6 +1445,14 @@ impl FluidSim {
         dispatch(b, [self.grid[0], 1, 1]);
         self.pass.optics_blur.bind(b);
         dispatch(b, groups);
+        // The patterns' displacement, carried along by the smoothed velocity (flow_map.comp).
+        if dt > 0.0 {
+            let parity = self.flow_parity.get();
+            self.pass.flow_map.bind(b);
+            self.pass.flow_map.push(b, FlowPc { dt, now: now as f32, period_s: FLOW_PERIOD_SHORT, period_l: FLOW_PERIOD_LONG, parity });
+            dispatch(b, groups);
+            self.flow_parity.set(1 - parity);
+        }
         let half = [self.grid[0].div_ceil(2).div_ceil(GRID_GROUP), self.grid[1].div_ceil(2).div_ceil(GRID_GROUP), 1];
         self.pass.glow.bind(b);
         for dir in [0i32, 1] {
@@ -1497,6 +1543,11 @@ impl FluidSim {
     /// mobility (rgba16f), each an array of two copies; and the copy that holds it now.
     pub fn film_views(&self) -> (&Arc<ImageView>, &Arc<ImageView>, u32) {
         (&self.film_c, &self.film_h, self.film_parity.get())
+    }
+
+    /// The patterns' displacement map (flow_map.comp) and the copy that holds it now.
+    pub fn flow_view(&self) -> (&Arc<ImageView>, u32) {
+        (&self.flow, self.flow_parity.get())
     }
 
     /// Whether the film map can hold anything: a liquid that stains (or a concentrate of

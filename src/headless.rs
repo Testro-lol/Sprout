@@ -685,6 +685,80 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         let mut w = pool(&[([150.0, WALL, 250.0, 40.0], Material::Mercury), ([262.0, WALL, 362.0, 40.0], Material::Lava)], &[wall(256.0)]);
         wait(&mut w, 1.0);
         save(&w, "fx_mercury_lava", zoom([256.0, 35.0], 3.5));
+        // Lava poured onto the floor, spreading: the flow draws its glow out into streaks.
+        let mut w = pool(&[], &[]);
+        hold(&mut w, Source::Pour, Material::Lava, [256.0, 120.0], 8.0, 6000.0, 2.0);
+        save(&w, "fx_lava_pour", zoom([256.0, 30.0], 3.0));
+        // Lava poured into the Playground's pool and left for a minute, partly frozen around
+        // its molten core (the user's screenshot of 2026-11-15); 30 frames 1/60 s apart.
+        if std::env::var("SPROUT_LAVA_POOL").is_ok() {
+            let mut w = map("Playground", G, 1.0);
+            w.sim.enable_heat();
+            hold(&mut w, Source::Pour, Material::Lava, [250.0, 150.0], 9.0, 6000.0, 4.0);
+            wait(&mut w, 60.0);
+            let view = zoom([250.0, 40.0], 3.0);
+            let mut frames = Vec::new();
+            for k in 0..30 {
+                frames.push(off.borrow_mut().capture(&w.sim, view));
+                if k % 10 == 0 {
+                    save(&w, &format!("fx_lava_pool_{k}"), view);
+                }
+                wait(&mut w, 1.0 / 60.0);
+            }
+            // Inside the lava only: rows 560 - 630 of the 720 (below its surface, above the floor).
+            let band = |f: &Vec<u8>| f[560 * 1280 * 4..630 * 1280 * 4].to_vec();
+            let frames: Vec<Vec<u8>> = frames.iter().map(band).collect();
+            let diffs: Vec<f64> = frames
+                .windows(2)
+                .map(|f| f[0].iter().zip(&f[1]).map(|(a, b)| (*a as i32 - *b as i32).abs() as f64).sum::<f64>() / f[0].len() as f64)
+                .collect();
+            let far: f64 = frames[0].iter().zip(&frames[29]).map(|(a, b)| (*a as i32 - *b as i32).abs() as f64).sum::<f64>() / frames[0].len() as f64;
+            println!(
+                "fx_lava_pool: mean change frame to frame {:.3} levels (largest {:.3}); frame 0 to 29 {:.3}",
+                diffs.iter().sum::<f64>() / diffs.len() as f64,
+                diffs.iter().cloned().fold(0.0, f64::max),
+                far
+            );
+        }
+        // Lava resting under oil until it crusts over (the user's report of 2026-11-15: the
+        // crust's pattern stuttered back and forth); frames 1/60 s apart and 1 s apart, and
+        // how many pixels change from frame to frame (README, "Look": the flicker metric).
+        let mut w = pool(&[([100.0, WALL, 412.0, 40.0], Material::Lava), ([WALL, 40.0, 509.0, 90.0], Material::Oil), ([WALL, WALL, 100.0, 40.0], Material::Oil), ([412.0, WALL, 509.0, 40.0], Material::Oil)], &[]);
+        w.sim.enable_heat();
+        wait(&mut w, 30.0);
+        let mut frames = Vec::new();
+        for k in 0..6 {
+            frames.push(off.borrow_mut().capture(&w.sim, zoom([256.0, 30.0], 3.0)));
+            if k == 0 {
+                save(&w, "fx_lava_crust", zoom([256.0, 30.0], 3.0));
+            }
+            wait(&mut w, 1.0 / 60.0);
+        }
+        // (And the mean change of a pixel channel, and the share of pixels whose largest
+        // channel change is over 4 levels: the slow sliding the flicker count passes over.)
+        let pairs: Vec<(f64, f64)> = frames
+            .windows(2)
+            .map(|f| {
+                let px = f[0].as_chunks::<4>().0.iter().zip(f[1].as_chunks::<4>().0);
+                let (mut sum, mut moved, mut n) = (0.0, 0.0, 0.0);
+                for (a, b) in px {
+                    let d = (0..3).map(|k| (a[k] as i32 - b[k] as i32).abs()).max().unwrap_or(0);
+                    sum += (0..3).map(|k| (a[k] as i32 - b[k] as i32).abs() as f64).sum::<f64>() / 3.0;
+                    moved += (d > 4) as u32 as f64;
+                    n += 1.0;
+                }
+                (sum / n, moved / n)
+            })
+            .collect();
+        let m = pairs.len() as f64;
+        println!(
+            "fx_lava_crust: {:.3} % of pixels flicker; mean change {:.3} levels, {:.2} % of pixels change by more than 4",
+            100.0 * crate::stress::flicker(&frames),
+            pairs.iter().map(|p| p.0).sum::<f64>() / m,
+            100.0 * pairs.iter().map(|p| p.1).sum::<f64>() / m
+        );
+        wait(&mut w, 1.0);
+        save(&w, "fx_lava_crust_1s", zoom([256.0, 30.0], 3.0));
         // Six frames, to look for flicker in the glow and crust.
         let mut w = pool(&[([200.0, WALL, 312.0, 60.0], Material::Lava)], &[wall(196.0), wall(316.0)]);
         wait(&mut w, 6.0);

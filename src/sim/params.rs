@@ -222,11 +222,12 @@ pub struct SimParams {
     /// Rate at which the particles of a cell that holds steam even out their temperatures,
     /// 1/s (the exchange inside a cell, README "Heat"): far faster than conduction through a
     /// parcel the size of a particle, so that bubbles condense in colder water. 30 until the
-    /// third round of 2026-11-14, when bubbles popped within a cell or two of leaving hot water
-    /// (reported); at 3 they rise about twice as far through cool water (`LAB_BUBBLES=1 sprout
-    /// lab`: 23 -> ~45 cells through water at 20 deg C) and most still condense before the
-    /// surface of a 30-cell pool (`validate thermal`). (A sandbox choice: a bubble here holds
-    /// one parcel's vapour, not its real volume.)
+    /// third round of 2026-11-14, 3 the day after, when bubbles popped within a few cells of
+    /// leaving hot water (reported twice). At 1, bubbles boiled off lava resting under water
+    /// at 20 deg C rise ~10 cells before they condense (`LAB_LAVA_STEAM=1 sprout lab`; 3 at 3,
+    /// 1-2 at 30), and most still condense before the surface of a 30-cell pool (4.5 % escape;
+    /// `validate thermal`, which fails below ~0.7: steam lingers). (A sandbox choice: a bubble
+    /// here holds one parcel's vapour, not its real volume.)
     pub steam_mixing: f32,
     /// Speed at which escaped steam rises, m/s (a warm plume: 0.2 - 1), and how long it
     /// lasts, s: puffs lay vapour into the smoke field for this long, and the vapour mixes
@@ -353,7 +354,7 @@ impl Default for SimParams {
             steam: 1,
             steam_boil: 0.02,
             steam_condense: 0.005,
-            steam_mixing: 3.0,
+            steam_mixing: 1.0,
             steam_rise: 0.4,
             steam_life: 2.0,
             steam_swirl: 0.1,

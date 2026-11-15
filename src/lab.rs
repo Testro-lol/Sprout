@@ -177,6 +177,14 @@ pub fn run(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], settle
         }
         return;
     }
+    if std::env::var("LAB_LAVA_JITTER").is_ok() {
+        lava_jitter(gpu, apply, grid);
+        return;
+    }
+    if std::env::var("LAB_LAVA_STEAM").is_ok() {
+        lava_steam(gpu, apply, grid);
+        return;
+    }
     if std::env::var("LAB_BUBBLES").is_ok() {
         // Bubbles through cool water: a pool at 20 deg C (or LAB_BUBBLES_T) boiled at its
         // floor by the Heat brush for 0.5 s; then, frame by frame for 1.25 s, the highest
@@ -635,4 +643,209 @@ fn drop_test(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], m: &
     let s: Vec<String> = means.iter().step_by(4).map(|m| format!("{:+.1}", m.1)).collect();
     println!("far box mean vy every 4 frames: {}", s.join(" "));
     println!("far box frame-to-frame jitter: {:.3} cells/s", (jit / nj.max(1) as f64).sqrt());
+}
+
+/// `LAB_LAVA_STEAM=1 sprout lab`: lava poured into the middle of a settled pool of water at
+/// 20 deg C for 1.5 s, then watched for 10 s. Every half second: the steam (how many bubbles, how
+/// many lie within 1.5 cells of lava, how high the highest is above the lava's top, how many
+/// have formed and escaped so far), the water's mean temperature in five bands from the floor
+/// to its surface, and the lava's mean temperature and frozen share. For "does the heat rise,
+/// do the bubbles", README, Heat.
+fn lava_steam(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2]) {
+    let scene = Scene::new(grid);
+    let (gw, gh) = (grid[0] as f32, grid[1] as f32);
+    let mut ps = Vec::new();
+    fill_rect(&scene, [0.0, 0.0, gw, 0.35 * gh], Material::Water, &mut ps);
+    let mut w = World::with_capacity(gpu, scene, ps, 400_000);
+    apply(&mut w.sim.params);
+    w.sim.step_blocking(0, ToolState::default());
+    for _ in 0..240 {
+        w.sim.advance_blocking(1.0 / 60.0, ToolState::default());
+    }
+    let at = [0.5 * gw, 0.6 * gh];
+    let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+    for _ in 0..(env("LAB_POUR_S", 1.5) * 60.0) as usize {
+        w.emit(crate::world::Source::Pour, Material::Lava, at, 8.0, 6000.0, 1.0 / 60.0);
+        w.sim.advance_blocking(1.0 / 60.0, crate::world::Source::Pour.nozzle(at, 8.0, 6000.0));
+    }
+    w.end_stroke();
+    let surface = 0.35 * gh;
+    println!("{:>5} | {:>6} {:>6} {:>8} {:>7} {:>7} | water T by band, floor .. surface (C)      | {:>7} {:>5}", "t", "steam", "atlava", "top", "formed", "escaped", "lava T", "frz");
+    for k in 0..=20 {
+        let sp = w.sim.params;
+        let ps = w.sim.download_particles();
+        let lava: Vec<&Particle> = ps.iter().filter(|p| p.material() == Some(Material::Lava)).collect();
+        // Lava's occupied cells, to tell which bubbles lie against it.
+        let mut cells = std::collections::HashSet::new();
+        for p in &lava {
+            cells.insert((p.pos[0] as i32, p.pos[1] as i32));
+        }
+        let near = |p: &Particle| {
+            let (x, y) = (p.pos[0], p.pos[1]);
+            [(-1.5f32, 0.0f32), (1.5, 0.0), (0.0, -1.5), (0.0, 1.5), (0.0, 0.0)].iter().any(|(dx, dy)| cells.contains(&((x + dx) as i32, (y + dy) as i32)))
+        };
+        let lava_top = lava.iter().map(|p| p.pos[1]).fold(0.0f32, f32::max);
+        let steam: Vec<&Particle> = ps.iter().filter(|p| p.is(Material::Steam)).collect();
+        let at_lava = steam.iter().filter(|p| near(p)).count();
+        let top = steam.iter().map(|p| p.pos[1] - lava_top).fold(f32::MIN, f32::max);
+        let mut band = [(0.0f64, 0usize); 5];
+        for p in ps.iter().filter(|p| p.material() == Some(Material::Water)) {
+            let b = ((p.pos[1] / surface * 5.0) as usize).min(4);
+            band[b].0 += sp.temperature(p).0 as f64;
+            band[b].1 += 1;
+        }
+        let bands: Vec<String> = band.iter().map(|(t, n)| format!("{:6.1}", t / (*n).max(1) as f64)).collect();
+        let st = stats(&lava, &sp);
+        let l = w.sim.download_ledger();
+        println!(
+            "{:5.1} | {:6} {:6} {:8.1} {:7} {:7} | {} | {:7.1} {:5.2}",
+            0.5 * k as f32, steam.len(), at_lava, if steam.is_empty() { 0.0 } else { top },
+            l.steam_count.iter().sum::<u32>(), l.boiled_count[Material::Steam.index()], bands.join(" "), st.mean_t, st.frozen
+        );
+        for _ in 0..30 {
+            w.sim.advance_blocking(1.0 / 60.0, ToolState::default());
+        }
+    }
+}
+
+/// `LAB_LAVA_JITTER=1 sprout lab`: a pool of lava on the floor under oil (`LAB_BARE=1`: under
+/// air), left to settle and crust over, then watched frame by frame (1/60 s) for 2 s. For the
+/// cells deep in the lava (every cell of the 3 x 3 around it holds lava): the velocity at the
+/// cell's centre (as cell_optics.comp works it out, which the renderer's patterns follow), its
+/// mean over time, how much it varies from frame to frame, and how often it turns back.
+fn lava_jitter(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2]) {
+    let scene = Scene::new(grid);
+    let (gw, gh) = (grid[0] as f32, grid[1] as f32);
+    let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+    let depth = env("LAB_LAVA_DEPTH", 0.12) * gh;
+    let what = match std::env::var("LAB_JITTER_MAT").as_deref() {
+        Ok("water") => Material::Water,
+        Ok("syrup") => Material::Syrup,
+        _ => Material::Lava,
+    };
+    let mut ps = Vec::new();
+    // (`LAB_FULL=1`: wall to wall, a state at rest from the start.)
+    let full = std::env::var("LAB_FULL").is_ok();
+    let (x0, x1) = if full { (0.0, gw) } else { (0.2 * gw, 0.8 * gw) };
+    fill_rect(&scene, [x0, 0.0, x1, depth], what, &mut ps);
+    if std::env::var("LAB_BARE").is_err() {
+        fill_rect(&scene, [0.0, depth, gw, depth + 0.2 * gh], Material::Oil, &mut ps);
+        if !full {
+            fill_rect(&scene, [0.0, 0.0, 0.2 * gw, depth], Material::Oil, &mut ps);
+            fill_rect(&scene, [0.8 * gw, 0.0, gw, depth], Material::Oil, &mut ps);
+        }
+    }
+    let mut w = World::with_capacity(gpu, scene, ps, 400_000);
+    apply(&mut w.sim.params);
+    if std::env::var("LAB_NOHEAT").is_err() {
+        w.sim.enable_heat();
+    }
+    w.sim.step_blocking(0, ToolState::default());
+    let settle = env("LAB_SETTLE", 8.0);
+    let mut t = 0.0;
+    while t < settle {
+        w.sim.advance_blocking(4.0, ToolState::default());
+        t += 4.0;
+        let ps = w.sim.download_particles();
+        let l: Vec<f32> = ps.iter().filter(|p| p.material() == Some(what)).map(|p| (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt()).collect();
+        let o: Vec<f32> = ps.iter().filter(|p| p.material() == Some(Material::Oil)).map(|p| (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt()).collect();
+        let m = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+        println!("t {t:5.1} s  {:?} speed {:.3}  oil {:.3} cells/s", what, m(&l), m(&o));
+    }
+    let (gx, gy) = (grid[0] as usize, grid[1] as usize);
+    // Cells deep in the lava, from the particles.
+    let ps = w.sim.download_particles();
+    let mut lava = vec![0u32; gx * gy];
+    for p in ps.iter().filter(|p| p.material() == Some(what)) {
+        let (x, y) = (p.pos[0] as usize, p.pos[1] as usize);
+        if x < gx && y < gy {
+            lava[y * gx + x] += 1;
+        }
+    }
+    let st = stats(&ps.iter().filter(|p| p.material() == Some(what)).collect::<Vec<_>>(), &w.sim.params);
+    let deep: Vec<usize> = (1..gy - 1)
+        .flat_map(|y| (1..gx - 1).map(move |x| (x, y)))
+        .filter(|&(x, y)| (-1i32..=1).all(|b| (-1i32..=1).all(|a| lava[(y as i32 + b) as usize * gx + (x as i32 + a) as usize] >= 2)))
+        .map(|(x, y)| y * gx + x)
+        .collect();
+    let start: std::collections::HashMap<u32, [f32; 2]> = w.sim.download_particles().iter().filter(|p| p.material() == Some(what)).map(|p| (p.id, p.pos)).collect();
+    let frames = 120;
+    let mut series: Vec<Vec<[f32; 2]>> = vec![Vec::with_capacity(frames); deep.len()];
+    let mut sp = Vec::new();
+    for _ in 0..frames {
+        w.sim.advance_blocking(1.0 / 60.0, ToolState::default());
+        let g = w.sim.download_grid();
+        for (k, &i) in deep.iter().enumerate() {
+            let (v, r, t) = (g.vel[i], g.vel[i + 1], g.vel[i + gx]);
+            series[k].push([0.5 * (v[0] + r[0]), 0.5 * (v[1] + t[1])]);
+        }
+        let ps = w.sim.download_particles();
+        let l: Vec<f32> = ps.iter().filter(|p| p.material() == Some(what)).map(|p| (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt()).collect();
+        sp.push(l.iter().sum::<f32>() / l.len().max(1) as f32);
+    }
+    if std::env::var("LAB_WALL").is_ok() {
+        // How far the particles actually went in the 2 s, by starting column (x 0 .. 13; y
+        // 10 .. 30), cells.
+        let mut acc = [[0.0f32; 3]; 14];
+        for p in w.sim.download_particles().iter().filter(|p| p.material() == Some(what)) {
+            if let Some(s0) = start.get(&p.id) {
+                let x = s0[0] as usize;
+                if x < 14 && s0[1] > 10.0 && s0[1] < 30.0 {
+                    acc[x][0] += p.pos[0] - s0[0];
+                    acc[x][1] += p.pos[1] - s0[1];
+                    acc[x][2] += 1.0;
+                }
+            }
+        }
+        let line: Vec<String> = acc.iter().enumerate().filter(|(_, a)| a[2] > 0.0).map(|(x, a)| format!("x{x}: {:+.2},{:+.2} ({})", a[0] / a[2], a[1] / a[2], a[2])).collect();
+        println!("moved {}", line.join("  "));
+    }
+    if std::env::var("LAB_MAP").is_ok() {
+        // Mean velocity over the 2 s in blocks of 32 x 8 cells (x right, y up), top row first.
+        let mut acc = std::collections::BTreeMap::new();
+        for (k, &i) in deep.iter().enumerate() {
+            let m = series[k].iter().fold([0.0f32; 2], |a, v| [a[0] + v[0], a[1] + v[1]]);
+            let e = acc.entry((i / gx / 8, i % gx / 32)).or_insert([0.0f32; 3]);
+            e[0] += m[0] / frames as f32;
+            e[1] += m[1] / frames as f32;
+            e[2] += 1.0;
+        }
+        if std::env::var("LAB_WALL").is_ok() {
+            // Each cell by the left wall, x 0 .. 13.
+            let ys: std::collections::BTreeSet<usize> = deep.iter().map(|i| i / gx).collect();
+            for &y in ys.iter().rev() {
+                let mut line = format!("y{y:3}");
+                for x in 0..14 {
+                    let i = y * gx + x;
+                    line += &match deep.iter().position(|&d| d == i) {
+                        Some(k) => {
+                            let m = series[k].iter().fold([0.0f32; 2], |a, v| [a[0] + v[0], a[1] + v[1]]);
+                            format!(" {:+5.1},{:+5.1}", m[0] / frames as f32, m[1] / frames as f32)
+                        }
+                        None => "      .     ".into(),
+                    };
+                }
+                println!("{line}");
+            }
+        }
+        let rows: std::collections::BTreeSet<usize> = acc.keys().map(|k| k.0).collect();
+        for r in rows.iter().rev() {
+            let line: Vec<String> = (0..gx / 32).map(|c| acc.get(&(*r, c)).map_or("     .     ".into(), |e| format!("{:+5.2},{:+5.2}", e[0] / e[2], e[1] / e[2]))).collect();
+            println!("y{:3} {}", r * 8, line.join(" "));
+        }
+    }
+    let n = deep.len().max(1) as f32;
+    let (mut mean, mut dev, mut step, mut flips) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for s in &series {
+        let m = s.iter().fold([0.0f32; 2], |a, v| [a[0] + v[0], a[1] + v[1]]);
+        let m = [m[0] / frames as f32, m[1] / frames as f32];
+        mean += (m[0] * m[0] + m[1] * m[1]).sqrt();
+        dev += (s.iter().map(|v| (v[0] - m[0]).powi(2) + (v[1] - m[1]).powi(2)).sum::<f32>() / frames as f32).sqrt();
+        step += s.windows(2).map(|p| ((p[1][0] - p[0][0]).powi(2) + (p[1][1] - p[0][1]).powi(2)).sqrt()).sum::<f32>() / (frames - 1) as f32;
+        flips += s.windows(2).filter(|p| p[0][0] * p[1][0] < 0.0 || p[0][1] * p[1][1] < 0.0).count() as f32 / (frames - 1) as f32;
+    }
+    println!(
+        "lava {:.0} C, {:.0} % frozen; {} deep cells; centre velocity (grid units): mean {:.4}, varies {:.4} about it, changes {:.4} per frame, turns back in {:.0} % of frames; particle speed mean {:.4}",
+        st.mean_t, 100.0 * st.frozen, deep.len(), mean / n, dev / n, step / n, 100.0 * flips / n, sp.iter().sum::<f32>() / frames as f32
+    );
 }
