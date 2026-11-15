@@ -8,6 +8,7 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const float BRIDGE_LEVEL = 0.05;
+const float RESTING_LEVEL = 0.25;  // occupancy of a sparse cell lying on liquid that keeps it liquid
 
 // Whether cell `i` holds enough particles to count as liquid on its own.
 bool packed(int i) {
@@ -187,6 +188,16 @@ void main() {
     if (has && level <= 0.0 && c.x > 0 && c.y > 0 && c.x < P.grid.x - 1 && c.y < P.grid.y - 1) {
         int W = P.grid.x;
         if ((packed(i - 1) && packed(i + 1)) || (packed(i - W) && packed(i + W))) level = BRIDGE_LEVEL;
+        // So does a cell lying on packed liquid that holds at least a quarter of its rest
+        // occupancy: the top of a pool whose level falls inside a cell. As air, its
+        // particles gathered the air faces above them, which gain gravity every substep that
+        // no pressure answers; they sank into the cell below while the density correction
+        // lifted them back, and the momentum fed in at the surface grew into a circulation
+        // (a resting layer 35 cells deep went from 0.44 to 1.7 cells/s in 24 s; now about
+        // 0.01). Stray particles above a full row stay air (below a quarter), and so does a
+        // cell of a non-Newtonian liquid: the plug holds the sparse top of a yield-stress
+        // pile (particles.comp), which as liquid ran out 60 % further.
+        else if (P.gravity > 0.0 && nn.x <= 0.0 && phi_t > RESTING_LEVEL && packed(i - W)) level = BRIDGE_LEVEL;
     }
 
     // An open cell without liquid: its region has a free surface (see rhs.comp).

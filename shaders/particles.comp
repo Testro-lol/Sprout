@@ -179,35 +179,22 @@ void main() {
             ivec2 base = ivec2(floor(gp - 0.5));
             vec2 f = gp - vec2(base);
             bspline(f, w);
-            vec4 sp = vec4(0.0), sa = vec4(0.0);  // weight, u, corr, -; projected / ballistic
-            vec4 dp = vec4(0.0), da = vec4(0.0);  // sum w d, sum w u d
+            float sw = 0.0, su = 0.0, sc = 0.0;
+            vec2 sd = vec2(0.0), sud = vec2(0.0);
             for (int b = 0; b < 3; b++) {
                 for (int a = 0; a < 3; a++) {
-                    int fi = cidx(base + ivec2(a, b));
-                    vec4 q = vel[fi];
+                    vec4 q = vel[cidx(base + ivec2(a, b))];
                     if (face_live(q.z)) {
                         float wt = w[a].x * w[b].y;
                         vec2 d = vec2(a, b) - f;
-                        vec4 t = vec4(wt, wt * q.x, wt * q.z, 0.0);
-                        vec4 e = vec4(wt * d, wt * q.x * d);
-                        if (coef[fi].x != 0.0) { sp += t; dp += e; } else { sa += t; da += e; }
+                        sw += wt;
+                        su += wt * q.x;
+                        sc += wt * q.z;
+                        sd += wt * d;
+                        sud += wt * q.x * d;
                     }
                 }
             }
-            // Faces the projection acted on (beside liquid) and ballistic ones (air only, with
-            // the momentum of the particles around them plus gravity) are summed apart, and
-            // the ballistic ones count with their own share of the weight: spray far from the
-            // liquid gathers them in full, a particle at the surface hardly at all. The top
-            // particles of a pool sit in cells too sparse to count as liquid; at full weight
-            // the air faces above them handed them a share of gravity every substep that no
-            // pressure answered, so they sank into the row below while the density
-            // correction lifted them back, and the momentum they fed in at the surface grew
-            // into a circulation (a resting layer 35 cells deep reached 1.7 cells/s in 24 s;
-            // now 0.1, as with the correction off).
-            float fa = sa.x / max(sp.x + sa.x, 1e-9);
-            vec4 st = sp + fa * sa, dt4 = dp + fa * da;
-            float sw = st.x, su = st.y, sc = st.z;
-            vec2 sd = dt4.xy, sud = dt4.zw;
             if (sw > 1e-4) {
                 float u = su / sw;
                 v.x = u;
@@ -221,25 +208,22 @@ void main() {
             ivec2 base = ivec2(floor(gp - 0.5));
             vec2 f = gp - vec2(base);
             bspline(f, w);
-            vec4 sp = vec4(0.0), sa = vec4(0.0);  // weight, u, corr, -; projected / ballistic
-            vec4 dp = vec4(0.0), da = vec4(0.0);  // sum w d, sum w u d
+            float sw = 0.0, su = 0.0, sc = 0.0;
+            vec2 sd = vec2(0.0), sud = vec2(0.0);
             for (int b = 0; b < 3; b++) {
                 for (int a = 0; a < 3; a++) {
-                    int fi = cidx(base + ivec2(a, b));
-                    vec4 q = vel[fi];
+                    vec4 q = vel[cidx(base + ivec2(a, b))];
                     if (face_live(q.w)) {
                         float wt = w[a].x * w[b].y;
                         vec2 d = vec2(a, b) - f;
-                        vec4 t = vec4(wt, wt * q.y, wt * q.w, 0.0);
-                        vec4 e = vec4(wt * d, wt * q.y * d);
-                        if (coef[fi].y != 0.0) { sp += t; dp += e; } else { sa += t; da += e; }
+                        sw += wt;
+                        su += wt * q.y;
+                        sc += wt * q.w;
+                        sd += wt * d;
+                        sud += wt * q.y * d;
                     }
                 }
             }
-            float fa = sa.x / max(sp.x + sa.x, 1e-9);  // as for u above
-            vec4 st = sp + fa * sa, dt4 = dp + fa * da;
-            float sw = st.x, su = st.y, sc = st.z;
-            vec2 sd = dt4.xy, sud = dt4.zw;
             if (sw > 1e-4) {
                 float u = su / sw;
                 v.y = u;

@@ -1502,11 +1502,11 @@ fn settle(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         rows.windows(3).all(|w| w[2].2 < w[0].2) && jitter < 0.5 * rows[0].2 && share < 0.02,
     );
 
-    // A shallow layer at rest from the start, open to the air. Its top row of particles sits
-    // in cells too sparse to count as liquid; when they gathered the unprojected air faces
-    // above them (which gain gravity every substep) at full weight, they kept sinking into
-    // the row below while the density correction kept lifting them back, and the downward
-    // momentum fed in at the surface grew into a circulation (1.7 cells/s after 24 s).
+    // A shallow layer at rest from the start, open to the air, its level halfway up a row of
+    // cells. While that row counted as air, its particles gathered the air faces above them
+    // (which gain gravity every substep), kept sinking into the row below while the density
+    // correction kept lifting them back, and the downward momentum fed in at the surface
+    // grew into a circulation (1.7 cells/s after 24 s; grid_prep.comp, RESTING_LEVEL).
     println!("\nShallow pool open to the air (512 x 288, wall to wall, 34.6 cells deep, 24 s)");
     let grid = [512, 288];
     let scene = Scene::new(grid);
