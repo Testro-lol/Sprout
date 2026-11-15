@@ -2098,13 +2098,23 @@ carried noise or the carried seams alone brings Kitchen back to 0.95 ms, while r
 
 ## Limitations
 
-- **A resting viscous pool still jitters at its free surface** (2026-11-15). The wall
-  circulation it used to have is gone (two pressure solves around the viscosity, Physics,
-  Viscosity): a wall-to-wall layer of lava at rest moves 0.02 cells in 2 s next to the
-  walls (was 11.6) and below its top cells by under 0.01 cells/s. What is left, about
-  0.04 – 0.07 cells/s mean particle speed, sits in the top cells and is the density
-  correction (with `correction_max=0` the pool is at 0.001 cells/s), as in the water pool
-  below.
+- **A resting pool of a viscous liquid circulates along the walls** (found 2026-11-15,
+  `LAB_LAVA_JITTER=1 LAB_FULL=1 LAB_BARE=1 LAB_NOHEAT=1 LAB_WALL=1 sprout lab`). Gravity is
+  added before the viscosity solve and the pressure after it, so the solve takes the whole
+  pull `g dt` of a pool at rest for a motion and holds the liquid along every no-slip wall
+  against it; the pressure then pushes that liquid up. A wall-to-wall layer of lava or
+  syrup at rest rises along each wall at about 6 cells/s (11.6 cells in 2 s next to it,
+  whatever its viscosity) and sinks a few cells out, 0.41 cells/s on average; water, barely
+  viscous, does not. Tried and set aside: gravity added after the viscosity (0.006 cells/s
+  at rest, but flows that gravity drives against a wall slipped: the sludge slump never
+  stopped, the Bingham slot was 95 % off); last substep's pressure gradient taken off before
+  the viscosity and given back (frozen bodies drifted at 157 cells/s); the same capped to
+  the upward push of gravity (the slump ran out to 81 cells); the viscosity after the
+  pressure (slump 65 cells against 47 ± 20 %). In progress (branch
+  `solver/wall-circulation`, `docs/wip/wall-circulation.md`): a second pressure solve after
+  the viscosity (`viscous_projection`) removes the wall flow (wall particles 0.02 cells in
+  2 s; what is left, 0.04 – 0.07 cells/s at the free surface, is the density correction),
+  but `validate` still fails the layers overturn and two steam checks.
 - **A still pool of water open to the air slowly gains motion** (found 2026-11-15): wall to
   wall, its mean speed grows from 0.44 to 1.7 cells/s in 24 s, in a circulation that
   converges at the surface. The density correction drives it (with `correction_max=0` it
