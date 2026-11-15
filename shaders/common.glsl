@@ -19,6 +19,14 @@ struct Particle {
 };
 
 const uint KIND_DEAD = 0u;
+// A puff of steam that escaped at the free surface (params.rs: KIND_PUFF): low byte 0, `s`
+// its age. Drawn only; particles.comp moves it, nothing else sees it.
+const uint KIND_PUFF = 0x40000u;
+// Of steam (row ROW_STEAM): the table row + 1 of the liquid it boiled from, in bits 8 - 15
+// (params.rs: KIND_SRC); it condenses back into that liquid.
+const uint KIND_SRC = 0xff00u;
+const uint ROW_WATER = 0u;   // material.rs: Material::Water
+const uint ROW_STEAM = 19u;  // material.rs: Material::Steam
 const int GROUPS = 4;        // material.rs: GROUPS (0 aqueous, 1 oil-like, 2 liquid metal, 3 silicate melt)
 const int MAX_PRESENT = 12;  // material.rs: MAX_PRESENT
 
@@ -70,6 +78,9 @@ layout(std140, set = 0, binding = 0) uniform Params {
     vec4 magnet[MAX_MAGNETS];      // position (cells), radius (cells), field at the radius (T)
     vec4 magnet_dir[MAX_MAGNETS];  // pole direction
     vec4 elastic;         // accumulator channel of the stress (3 channels); largest shear modulus in the tank (grid units); most stress, x modulus; most deformation per substep
+    vec4 steam;           // vapour quality below which steam condenses; puff rise speed (cells / s); puff lifetime (s); quality at which boiling water becomes steam
+    vec4 steam2;          // rate of the exchange inside a cell that holds steam (1 / s); 1: boiling aqueous liquid turns into steam (0: it leaves at once); eddy speed of the air puffs ride (cells / s); eddy size (cells)
+    vec4 heat3;           // Smagorinsky constant of the sub-grid heat mixing (0 off); evaporation: L_vap / c_p,air (K, 0 off); unused; unused
 } P;
 
 layout(std430, set = 0, binding = 1) buffer ParticleBuf { Particle particles[]; };
@@ -199,6 +210,7 @@ layout(std430, set = 0, binding = 59) buffer GroupRhoBuf { vec4 grho[]; };
 // Per cell, where a phase group other than the aqueous one holds two or more materials
 // (`group_sorts`): share x base density (no expansion, not frozen) of groups 1 - 3, so that
 // the drift within a group (particles.comp) can take the group's local mean.
+// xyz: share x base density of groups 1 - 3 (the drift within a group); w: share of steam.
 layout(std430, set = 0, binding = 65) buffer GroupBaseBuf { vec4 gbase[]; };
 layout(std430, set = 0, binding = 41) buffer SPropBuf { vec4 sprop[]; };
 layout(std430, set = 0, binding = 42) buffer MixBuf { float mixb[]; };
@@ -290,6 +302,7 @@ const uint CAP_RHEO = 8u;       // a non-Newtonian liquid (or one with a skin) i
 const uint CAP_MAGNET = 16u;    // a magnet and a susceptible liquid: magnet.comp runs
 const uint CAP_ELASTIC = 32u;   // a viscoelastic liquid: particles carry a stress, elastic.comp runs
 const uint CAP_SETTLE = 64u;    // a suspension whose grains settle: settle.comp runs
+const uint CAP_STEAM = 128u;    // boiling aqueous liquid turns into steam (README, "Steam")
 
 // Specialisation constant 0 (sim/mod.rs: CapsPass): the CAP_* bits the pipeline was built for.
 // has_cap() of a bit outside them is constant false, so the driver drops the code behind it
@@ -364,6 +377,7 @@ layout(std430, set = 0, binding = 46) readonly buffer SolidTBuf { float solid_t[
 //                     cool tool, 6 carried off by evaporated liquid
 //   [16 + m]          particles of row m that boiled away
 //   [80 + m]          particles of row m left behind as residue
+//   [144 + m]         particles of row m that turned into steam (README, "Steam")
 layout(std430, set = 0, binding = 47) buffer LedgerBuf { uint ledger[]; };
 const float NO_TEMP = -1e9;
 const float LEDGER_SCALE = 65536.0;

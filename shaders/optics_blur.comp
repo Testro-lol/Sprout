@@ -22,7 +22,9 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 58, rgba16f) uniform readonly image2DArray raw;
 layout(set = 0, binding = 60, rgba16f) uniform writeonly image2DArray smooth_out;
 
-const int LAYERS = 9;  // sim/mod.rs: CELL_OPTICS_LAYERS
+const int LAYERS = 12;  // sim/mod.rs: CELL_OPTICS_LAYERS; layer 10 (drying time) only film.comp reads, unsmoothed
+const int LIGHT_SPREAD = 14;     // cells each way
+const float LIGHT_SIGMA = 6.0;   // cells
 
 // Signed distance to the solids at a node-centred position (nearest node; cells).
 float sdf_at(vec2 x) {
@@ -34,7 +36,8 @@ void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(c, P.grid))) return;
     const float K[3] = float[3](1.0, 2.0, 1.0);
-    vec4 s[LAYERS] = vec4[LAYERS](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
+    vec4 s[LAYERS];
+    for (int l = 0; l < LAYERS; l++) s[l] = vec4(0.0);
     float wsum = 0.0;
     vec2 here = vec2(c) + 0.5;
     for (int b = -1; b <= 1; b++) {
@@ -44,10 +47,26 @@ void main() {
             if ((a != 0 || b != 0) && sdf_at(here + 0.5 * vec2(a, b)) < 0.0) continue;
             float w = K[a + 1] * K[b + 1];
             wsum += w;
-            for (int l = 0; l < LAYERS; l++) s[l] += w * imageLoad(raw, ivec3(q, l));
+            for (int l = 0; l < LAYERS; l++) if (l != 10) s[l] += w * imageLoad(raw, ivec3(q, l));
         }
     }
     // Normalised by the kernel weight that was used, so a cell next to a wall or the edge
     // keeps its level (the layers are already premultiplied by occupancy).
-    for (int l = 0; l < LAYERS; l++) imageStore(smooth_out, ivec3(c, l), s[l] / wsum);
+    for (int l = 0; l < LAYERS; l++) s[l] /= wsum;
+    // The light from above (light.comp, layer 10 yzw, every cell): averaged across a broad
+    // Gaussian sideways, as light from a wide sky arrives from many directions, then times the
+    // smoothed occupancy as the other layers are.
+    {
+        vec3 il = vec3(0.0);
+        float iw = 0.0;
+        for (int a = -LIGHT_SPREAD; a <= LIGHT_SPREAD; a++) {
+            int qx = c.x + a;
+            if (qx < 0 || qx >= P.grid.x) continue;
+            float w = exp(-0.5 * float(a * a) / (LIGHT_SIGMA * LIGHT_SIGMA));
+            il += w * imageLoad(raw, ivec3(qx, c.y, 10)).yzw;
+            iw += w;
+        }
+        s[9].rgb = il / max(iw, 1e-6) * s[4].w;
+    }
+    for (int l = 0; l < LAYERS; l++) if (l != 10) imageStore(smooth_out, ivec3(c, l), s[l]);
 }

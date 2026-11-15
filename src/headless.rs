@@ -444,6 +444,9 @@ pub fn profile(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], ma
         let ms = world.sim.dispatch_floor(2000, rebind, fine);
         println!("dispatch floor: {:.2} us per {} dispatch{}", ms * 1e3, if fine { "full-grid cg_scale" } else { "single-group" }, if rebind { " (rebinding each time)" } else { "" });
     }
+    for _ in 0..2 {
+        println!("per-frame optics passes: {:.3} ms per frame", world.sim.profile_optics(300));
+    }
     let passes = world.sim.profile_passes();
     let line: Vec<String> = passes.iter().map(|(n, ms)| format!("{n} {ms:.3}")).collect();
     println!("one substep, GPU ms by pass: {}", line.join(", "));
@@ -457,6 +460,52 @@ pub fn profile(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], ma
 // ---- gallery -------------------------------------------------------------------------
 
 /// Renders a fixed set of pictures that covers every liquid, every way two of them meet and
+/// Connected pieces of liquid (8-connected occupied cells): how many, how many of them are
+/// small (under 40 particles: droplets), and how many particles those hold.
+pub fn blob_stats(ps: &[Particle], grid: [u32; 2]) -> (usize, usize, usize) {
+    let (w, h) = (grid[0] as usize, grid[1] as usize);
+    let mut count = vec![0u32; w * h];
+    for p in ps {
+        let (x, y) = (p.pos[0] as usize, p.pos[1] as usize);
+        if x < w && y < h {
+            count[y * w + x] += 1;
+        }
+    }
+    let mut label = vec![usize::MAX; w * h];
+    let (mut blobs, mut drops, mut dropped) = (0, 0, 0);
+    for start in 0..w * h {
+        if count[start] == 0 || label[start] != usize::MAX {
+            continue;
+        }
+        let mut stack = vec![start];
+        label[start] = start;
+        let mut n = 0;
+        while let Some(c) = stack.pop() {
+            n += count[c] as usize;
+            let (x, y) = ((c % w) as i64, (c / w) as i64);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                        continue;
+                    }
+                    let k = ny as usize * w + nx as usize;
+                    if count[k] > 0 && label[k] == usize::MAX {
+                        label[k] = start;
+                        stack.push(k);
+                    }
+                }
+            }
+        }
+        blobs += 1;
+        if n < 40 {
+            drops += 1;
+            dropped += n;
+        }
+    }
+    (blobs, drops, dropped)
+}
+
 /// every tool, at several zoom levels and resolutions (`sprout gallery DIR`). The scenes are
 /// deterministic, so two builds can be compared picture by picture.
 pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut SimParams)) {
@@ -644,6 +693,46 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
             wait(&mut w, 1.0 / 60.0);
         }
     }
+    // Steam (README, "Steam"): a cup of water held over the Heat brush until it boils, close,
+    // and six consecutive frames of it for flicker; then lava poured into a shallow pan.
+    if wants("steam") {
+        let mut w = pool(&[([200.0, WALL, 312.0, WALL + 30.0], Material::Water)], &[crate::scene::Shape::Box { c: [196.0, 50.0], half: [4.0, 48.0], angle: 0.0 }, crate::scene::Shape::Box { c: [316.0, 50.0], half: [4.0, 48.0], angle: 0.0 }]);
+        w.sim.enable_heat();
+        let brush = ToolState::heat([256.0, WALL + 5.0], 14.0, false);
+        for _ in 0..(8 * 60) {
+            w.sim.advance_blocking(1.0 / 60.0, brush);
+            off.borrow_mut().track(&w.sim);
+        }
+        save(&w, "steam_boil", fit);
+        save(&w, "steam_boil_zoom", zoom([256.0, 45.0], 3.0));
+        for k in 0..6 {
+            save(&w, &format!("motion_steam_{k}"), zoom([256.0, 45.0], 3.0));
+            w.sim.advance_blocking(1.0 / 60.0, brush);
+            off.borrow_mut().track(&w.sim);
+        }
+        // Steam meeting an object: a cup boiling under a tilted shelf, which the plume has
+        // to spread along and spill around.
+        let mut w = pool(
+            &[([200.0, WALL, 312.0, WALL + 30.0], Material::Water)],
+            &[
+                crate::scene::Shape::Box { c: [196.0, 50.0], half: [4.0, 48.0], angle: 0.0 },
+                crate::scene::Shape::Box { c: [316.0, 50.0], half: [4.0, 48.0], angle: 0.0 },
+                crate::scene::Shape::Box { c: [250.0, 150.0], half: [45.0, 3.0], angle: 0.25 },
+            ],
+        );
+        w.sim.enable_heat();
+        for _ in 0..(8 * 60) {
+            w.sim.advance_blocking(1.0 / 60.0, brush);
+            off.borrow_mut().track(&w.sim);
+        }
+        save(&w, "steam_shelf", zoom([256.0, 110.0], 2.2));
+        // Lava poured into a shallow pan of water.
+        let mut w = pool(&[([100.0, WALL, 412.0, WALL + 12.0], Material::Water)], &[]);
+        w.sim.enable_heat();
+        hold(&mut w, Source::Pour, Material::Lava, [256.0, 120.0], 6.0, 6000.0, 1.5);
+        wait(&mut w, 2.5);
+        save(&w, "steam_lava_pan", zoom([256.0, 40.0], 3.0));
+    }
     // Tools.
     if wants("spray") {
         let mut w = pool(&[([0.0, 0.0, 512.0, 50.0], Material::Water)], &[]);
@@ -759,6 +848,26 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
                 wait(&mut w, 1.0 / 60.0);
             }
         }
+    }
+    // Slime (README, "Viscoelasticity"): the cup drop over time.
+    if wants("slime") {
+        let wall = |x: f32| crate::scene::Shape::Box { c: [x, 40.0], half: [4.0, 38.0], angle: 0.0 };
+        let peg = crate::scene::Shape::Circle { c: [236.0, 20.0], r: 8.0 };
+        let mut w = pool(&[([226.0, 40.0, 296.0, 90.0], Material::Slime)], &[wall(176.0), wall(336.0), peg]);
+        let mut t = 0.0;
+        for k in [0.3f32, 0.6, 0.9, 1.2, 1.6, 2.4, 3.2] {
+            wait(&mut w, k - t);
+            t = k;
+            save(&w, &format!("slime_drop_{:02}", (k * 10.0).round() as u32), zoom([256.0, 55.0], 2.2));
+        }
+        // A block set down on the floor, and a rope poured from above.
+        let mut w = pool(&[([206.0, WALL, 306.0, WALL + 40.0], Material::Slime)], &[wall(176.0), wall(336.0)]);
+        wait(&mut w, 3.0);
+        save(&w, "slime_rest", zoom([256.0, 55.0], 2.2));
+        let mut w = pool(&[], &[wall(176.0), wall(336.0)]);
+        hold(&mut w, Source::Pour, Material::Slime, [256.0, 120.0], 3.0, 3000.0, 2.0);
+        wait(&mut w, 0.5);
+        save(&w, "slime_pour", zoom([256.0, 70.0], 2.2));
     }
     // Every liquid on its own: a block dropped into a cup with a peg, 1.6 s later.
     for (row, b) in crate::sim::BUILTINS.iter().enumerate() {

@@ -52,6 +52,9 @@ impl Material {
     pub const Gallium: Material = Material(17);
     /// Dry salt: what evaporating brine leaves behind. Not a liquid the picker offers.
     pub const Salt: Material = Material(18);
+    /// Water vapour: what boiling aqueous liquid turns into (README, "Steam"). Not a liquid
+    /// the picker offers.
+    pub const Steam: Material = Material(19);
 
     pub fn index(self) -> usize {
         self.0 as usize
@@ -198,17 +201,22 @@ pub struct MatProps {
     pub skin: f32,
 
     // ---- optics (README, "Look") ------------------------------------------------------------------
-    /// Body colour, gamma space.
+    // A liquid's colour comes from how it absorbs and scatters light (Beer-Lambert), so that
+    // mixtures add up as real solutions do: a little syrup in water is pale gold, a little
+    // blood a pink-red cloud, never a hue in between the two colours (until 2026-11-14 blends
+    // averaged hues in OKLab: syrup or blood in water passed through violet).
+    /// Body colour, gamma space. For a clear liquid (`scatter` 0), the colour of light that
+    /// has come through `tint_depth` cells of it; for a scattering one, the colour of a deep
+    /// layer of it in light (its diffuse albedo).
     pub color: [f32; 3],
     /// Colour when frozen.
     pub color_solid: [f32; 3],
-    /// Colour at half concentration against the diluent, if the blend should not be a
-    /// straight one (syrup in water passes through violet and rose, like grenadine); any
-    /// negative component: none.
-    pub color_mid: [f32; 3],
-    /// 0 clear (shallows show, depth darkens) .. 1 opaque paint.
+    /// 0 clear .. 1 opaque: how deep the colour builds up, `tint_depth` = 0.5 + 30 (1 - opacity)²
+    /// cells (water 30, honey 3, blood half a cell).
     pub opacity: f32,
-    /// 0 none .. 1 milky: multiple scattering lifts the body towards its own colour.
+    /// 0 clear .. 1 milky: how strongly it scatters light. A scattering liquid shows its own
+    /// colour lit from the front (milk, mud, blood, chocolate); a clear one shows light that
+    /// has come through it, darker and deeper in hue the further it went (water, honey, oil).
     pub scatter: f32,
     /// 0 dielectric .. 1 mirror metal.
     pub metal: f32,
@@ -276,7 +284,6 @@ impl Default for MatProps {
             skin: 0.0,
             color: [0.17, 0.52, 0.94],
             color_solid: [0.8, 0.9, 1.0],
-            color_mid: [-1.0; 3],
             opacity: 0.0,
             scatter: 0.0,
             metal: 0.0,
@@ -352,7 +359,7 @@ fn water() -> MatProps {
         emissivity: 0.96,
         foam: 1.0,
         gloss: 0.35,
-        color: [0.17, 0.52, 0.94],
+        color: [0.04, 0.38, 0.70],
         color_solid: [0.78, 0.90, 0.98],
         dry_time: 2.0,
         glint: 0.3,
@@ -379,13 +386,13 @@ fn syrup() -> MatProps {
         melt_hi: -1.0e9,
         boil: 110.0,
         latent_vap: 2257.0e3,
-        color: [0.74, 0.36, 0.03],
-        color_mid: [1.0, 0.58, 0.0],
-        opacity: 0.7,
-        gloss: 0.25,
+        color: [0.92, 0.58, 0.10],
+        opacity: 0.55,
+        gloss: 0.9,
         body: 1.0,
         dry_time: 30.0,
         glint: 1.0,
+        scatter: 0.04,
         ..Default::default()
     }
 }
@@ -406,9 +413,9 @@ fn oil() -> MatProps {
         melt_hi: -4.0,
         latent: 150.0e3,
         density_solid: 925.0,
-        color: [0.99, 0.79, 0.20],
+        color: [0.95, 0.80, 0.30],
         color_solid: [0.93, 0.86, 0.55],
-        opacity: 0.35,
+        opacity: 0.25,
         gloss: 1.0,
         body: 0.4,
         dry_time: 12.0,
@@ -444,7 +451,7 @@ fn mud() -> MatProps {
         color: [0.40, 0.29, 0.18],
         color_solid: [0.50, 0.42, 0.33],
         opacity: 1.0,
-        scatter: 0.35,
+        scatter: 1.0,
         gloss: 0.25,
         body: 0.6,
         dry_time: 40.0,
@@ -515,6 +522,7 @@ fn chocolate() -> MatProps {
         dry_time: 60.0,
         stain: 0.45,
         glint: 0.7,
+        scatter: 1.0,
         ..Default::default()
     }
 }
@@ -543,7 +551,7 @@ fn sludge() -> MatProps {
         color: [0.24, 0.23, 0.17],
         color_solid: [0.34, 0.32, 0.26],
         opacity: 1.0,
-        scatter: 0.2,
+        scatter: 1.0,
         gloss: 0.35,
         body: 1.0,
         dry_time: 90.0,
@@ -573,14 +581,15 @@ fn blood() -> MatProps {
         freeze_shift: -0.6,
         boil: 101.0,
         latent_vap: 2257.0e3,
-        color: [0.42, 0.02, 0.04],
+        color: [0.40, 0.02, 0.035],
         color_solid: [0.30, 0.05, 0.06],
         opacity: 0.97,
-        gloss: 0.5,
+        gloss: 0.8,
         body: 0.3,
         dry_time: 45.0,
         stain: 1.0,
         glint: 0.55,
+        scatter: 0.7,
         ..Default::default()
     }
 }
@@ -614,6 +623,7 @@ fn mercury() -> MatProps {
         body: 1.0,
         dry_time: 0.5,
         glint: 0.6,
+        scatter: 1.0,
         ..Default::default()
     }
 }
@@ -651,6 +661,7 @@ fn lava() -> MatProps {
         stain: 0.3,
         glint: 0.0,
         crackle: 1.0,
+        scatter: 1.0,
         ..Default::default()
     }
 }
@@ -721,10 +732,14 @@ fn slime() -> MatProps {
     MatProps {
         // PVA-borax slime: 1030 kg/m³, a Maxwell liquid with G ~ 100 Pa and a relaxation
         // time ~1 s (Cassagnau & Michel; Koopmans' measurements of "silly putty"-like
-        // gels span 0.1 - 10 s). Its viscosity at short times, ~1 Pa s, is a sandbox choice;
-        // it is also what holds it to walls (no-slip comes from the viscosity solve).
+        // gels span 0.1 - 10 s). Its viscosity at short times (the solvent's, beside the
+        // network's G lambda = 100 Pa s) is 10 Pa s: slime made from white PVA glue, which
+        // runs at several Pa s itself. At 1 Pa s (until 2026-11-14) a dropped blob stored
+        // its impact elastically and flung it back out as sheets that tore into hundreds of
+        // droplets (README, "Viscoelasticity"). The viscosity is also what holds it to walls
+        // (no-slip comes from the viscosity solve).
         density: 1030.0,
-        viscosity: 1.0e-3,
+        viscosity: 1.0e-2,
         shear_modulus: 100.0,
         relax_time: 1.0,
         tension: 0.06,
@@ -743,6 +758,7 @@ fn slime() -> MatProps {
         dry_time: 60.0,
         stain: 0.3,
         glint: 0.85,
+        scatter: 0.15,
         ..Default::default()
     }
 }
@@ -776,6 +792,7 @@ fn ferrofluid() -> MatProps {
         stain: 0.12,
         glint: 0.7,
         iridescence: 0.15,
+        scatter: 1.0,
         ..Default::default()
     }
 }
@@ -799,7 +816,7 @@ fn brine() -> MatProps {
         latent_vap: 2257.0e3,
         residue: Material::Salt.0 as i32,
         residue_share: 0.144,
-        color: [0.62, 0.80, 0.86],
+        color: [0.14, 0.50, 0.62],
         color_solid: [0.90, 0.94, 0.96],
         opacity: 0.05,
         gloss: 0.35,
@@ -833,7 +850,7 @@ fn wax() -> MatProps {
         color: [0.97, 0.90, 0.72],
         color_solid: [0.95, 0.94, 0.88],
         opacity: 0.3,
-        scatter: 0.3,
+        scatter: 0.6,
         gloss: 0.8,
         body: 0.6,
         dry_time: 80.0,
@@ -868,7 +885,7 @@ fn oobleck() -> MatProps {
         color: [0.93, 0.91, 0.85],
         color_solid: [0.95, 0.94, 0.90],
         opacity: 0.95,
-        scatter: 0.9,
+        scatter: 1.0,
         gloss: 0.2,
         body: 1.0,
         dry_time: 50.0,
@@ -909,6 +926,7 @@ fn gallium() -> MatProps {
         body: 1.0,
         dry_time: 1.0,
         glint: 0.6,
+        scatter: 1.0,
         ..Default::default()
     }
 }
@@ -937,8 +955,33 @@ fn salt() -> MatProps {
     }
 }
 
+fn steam() -> MatProps {
+    MatProps {
+        // Saturated steam at 100 °C: 0.60 kg/m³, dynamic viscosity 1.2e-5 Pa s. A particle of
+        // steam stands for the vapour of the water parcel it boiled from: it carries that
+        // parcel's mass and heat (its heat capacity per particle is water's, sim/mod.rs:
+        // `gpu_materials`), so it condenses back into exactly that water. Its density is the
+        // vapour's, so it is buoyant; its volume is one particle's, not the 1600 times more
+        // the vapour of that much water would fill (README, Limitations). Conductivity and
+        // surface tension are water's: what the bubble exchanges heat through, and what its
+        // surface is, is the water film around it.
+        density: 0.6,
+        viscosity: 2.0e-5,
+        expansion: 0.0,
+        boil: 100.0,
+        latent_vap: 2257.0e3,
+        emissivity: 0.0,
+        color: [0.92, 0.94, 0.96],
+        color_solid: [0.92, 0.94, 0.96],
+        gloss: 0.0,
+        glint: 0.0,
+        dry_time: 0.0,
+        ..Default::default()
+    }
+}
+
 /// The built-in materials, in table order (`Material::Water` ...).
-pub static BUILTINS: [Builtin; 19] = [
+pub static BUILTINS: [Builtin; 20] = [
     Builtin { key: "water", name: "Water", category: "Everyday", props: water },
     Builtin { key: "syrup", name: "Syrup", category: "Everyday", props: syrup },
     Builtin { key: "oil", name: "Oil", category: "Everyday", props: oil },
@@ -958,11 +1001,13 @@ pub static BUILTINS: [Builtin; 19] = [
     Builtin { key: "oobleck", name: "Oobleck", category: "Strange", props: oobleck },
     Builtin { key: "gallium", name: "Liquid gallium", category: "Metal", props: gallium },
     Builtin { key: "salt", name: "Salt", category: "Residue", props: salt },
+    Builtin { key: "steam", name: "Steam", category: "Vapour", props: steam },
 ];
 
-/// Rows the liquid picker offers (Salt is only ever left behind by evaporating brine).
+/// Rows the liquid picker offers (Salt is only ever left behind by evaporating brine, steam
+/// only by boiling).
 pub fn pickable(row: usize) -> bool {
-    row != Material::Salt.index()
+    row != Material::Salt.index() && row != Material::Steam.index()
 }
 
 /// Explicit exceptions to the mixing rules (README, "Mixing rules"), keyed by
@@ -1047,11 +1092,10 @@ const _: () = assert!(std::mem::size_of::<GpuMat>() == 160);
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GpuOptics {
-    /// Body colour as OKLab L, a, b and chroma; the same when frozen.
-    lab: [f32; 4],
-    lab_solid: [f32; 4],
-    /// Colour at half concentration (OKLab, chroma), or chroma -1: a straight blend.
-    lab_mid: [f32; 4],
+    /// Absorption coefficient (linear RGB) and scattering coefficient, 1/cell (`absorption`).
+    absorb: [f32; 4],
+    /// Colour when frozen, linear RGB; tint depth, cells.
+    solid: [f32; 4],
     /// Opacity, scattering, metal, gloss.
     opt: [f32; 4],
     /// Body (thickness of the look), foam, drying time (s), emissivity.
@@ -1062,19 +1106,42 @@ pub struct GpuOptics {
     fx: [f32; 4],
 }
 
-/// sRGB (gamma) to OKLab (Ottosson 2020), with the chroma as a fourth value.
-pub fn oklab(c: [f32; 3]) -> [f32; 4] {
-    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
-    let (r, g, b) = (lin(c[0]), lin(c[1]), lin(c[2]));
-    let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_99 * b).cbrt();
-    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
-    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
-    let lab = [
-        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
-        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
-        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
-    ];
-    [lab[0], lab[1], lab[2], lab[1].hypot(lab[2])]
+/// sRGB (gamma) to linear.
+pub fn linear(c: [f32; 3]) -> [f32; 3] {
+    c.map(|v| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) })
+}
+
+/// Cells of liquid through which a clear one shows its `color` (`MatProps::opacity`).
+pub fn tint_depth(m: &MatProps) -> f32 {
+    let clear = 1.0 - m.opacity.clamp(0.0, 1.0);
+    0.5 + 30.0 * clear * clear
+}
+
+/// Absorption (linear RGB) and scattering coefficients of a material, 1/cell. A clear one
+/// absorbs so that `tint_depth` cells pass `color`. A scattering one scatters `3 scatter /
+/// tint_depth` per cell (mostly opaque within its tint depth) and absorbs what makes the
+/// diffuse reflectance of a deep layer equal to `color`: per channel, from R = (1 - q)/(1 + q),
+/// q = sqrt(1 - albedo) (two-stream, Hapke), the single-scattering albedo is 1 - ((1-R)/(1+R))²;
+/// between the two, the absorption blends by `scatter`.
+/// Coefficients add over a mixture by share, as concentrations do in Beer's law.
+pub fn absorption(m: &MatProps) -> [f32; 4] {
+    let lin = linear(m.color).map(|v| v.clamp(1e-3, 0.995));
+    let depth = tint_depth(m);
+    if m.scatter <= 0.0 {
+        let a = lin.map(|v| -v.ln() / depth);
+        return [a[0], a[1], a[2], 0.0];
+    }
+    // A weakly scattering liquid (honey) is mostly seen by the light through it: its
+    // absorption blends from the clear one's to the one its albedo asks for, by `scatter`.
+    let sc = m.scatter.clamp(0.0, 1.0);
+    let ss = 3.0 * sc / depth;
+    let a = lin.map(|r| {
+        let q = (1.0 - r) / (1.0 + r);
+        let w = (1.0 - q * q).max(1e-4);
+        let clear = -r.ln() / depth;
+        clear + sc * (ss * (1.0 - w) / w - clear)
+    });
+    [a[0], a[1], a[2], ss]
 }
 
 /// The optics table for the live material table.
@@ -1082,10 +1149,10 @@ pub fn optics_table(p: &super::SimParams) -> Vec<GpuOptics> {
     (0..MAX_MATERIALS)
         .map(|r| {
             let m: &MatProps = &p.mat[r];
+            let sl = linear(m.color_solid);
             GpuOptics {
-                lab: oklab(m.color),
-                lab_solid: oklab(m.color_solid),
-                lab_mid: if m.color_mid.iter().any(|&c| c < 0.0) { [0.0, 0.0, 0.0, -1.0] } else { oklab(m.color_mid) },
+                absorb: absorption(m),
+                solid: [sl[0], sl[1], sl[2], tint_depth(m)],
                 opt: [m.opacity, m.scatter, m.metal, m.gloss],
                 sty: [m.body, m.foam, m.dry_time, m.emissivity],
                 idx: [m.diluent, m.group as i32, 0, 0],
@@ -1094,4 +1161,3 @@ pub fn optics_table(p: &super::SimParams) -> Vec<GpuOptics> {
         })
         .collect()
 }
-

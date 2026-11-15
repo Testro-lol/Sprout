@@ -115,6 +115,20 @@ struct SplatPc {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct SteamPc {
+    scale: [f32; 2],
+    offset: [f32; 2],
+    bubble: f32,
+    bubble_w: f32,
+}
+
+/// The vapour field (steam.vert): kernel radius of a bubble of steam in the liquid, cells.
+/// A lone one (weight 1) is drawn out to where the field crosses composite.frag's
+/// `BUBBLE_CUT`: `BUBBLE_RADIUS * sqrt(1 - sqrt(0.45))`, 0.5 cells; crowded ones merge.
+const BUBBLE_RADIUS: f32 = 0.85;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct DownPc {
     src_texel: [f32; 2],
     src_max: [f32; 2],
@@ -150,6 +164,8 @@ struct CompositePc {
     wet_tint: f32,
     glow: f32,
     stains: f32,
+    vapour: f32,
+    film_layer: f32,
 }
 
 #[repr(C)]
@@ -205,6 +221,11 @@ struct Targets {
     down_set: Arc<DescriptorSet>,
     blur_sets: [Arc<DescriptorSet>; 2],
     composite_set: Arc<DescriptorSet>,
+    /// The vapour field (steam.vert), laid out as `accum`: bubbles, puffs.
+    vapour: Arc<Framebuffer>,
+    /// Whether the vapour field may hold anything (it is drawn into, or new): without steam
+    /// it is cleared once, not every frame (a 1080p clear costs ~0.1 ms).
+    vapour_dirty: std::cell::Cell<bool>,
 }
 
 /// Display settings for how the liquid and solids are drawn (Display panel).
@@ -244,8 +265,11 @@ pub struct Renderer {
     down: Arc<GraphicsPipeline>,
     blur: Arc<GraphicsPipeline>,
     composite: Arc<GraphicsPipeline>,
+    composite_dry: Arc<GraphicsPipeline>,
+    steam: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
     splat_set: Option<Arc<DescriptorSet>>,
+    steam_set: Option<Arc<DescriptorSet>>,
     accum: Option<Targets>,
     targets: Vec<(Arc<ImageView>, Arc<Framebuffer>)>,
 }
@@ -265,15 +289,30 @@ fn pipeline(
     subpass: Subpass,
     blend: Option<AttachmentBlend>,
 ) -> Arc<GraphicsPipeline> {
+    pipeline_with(gpu, vs, gpu.shader(fs), subpass, blend, None)
+}
+
+/// `pipeline` with a fragment entry point of its own (specialised), and optionally the
+/// layout of another pipeline, so that the two can share descriptor sets.
+fn pipeline_with(
+    gpu: &Gpu,
+    vs: &[u8],
+    fs: vulkano::shader::EntryPoint,
+    subpass: Subpass,
+    blend: Option<AttachmentBlend>,
+    layout: Option<Arc<PipelineLayout>>,
+) -> Arc<GraphicsPipeline> {
     let device = gpu.device.clone();
-    let stages = [PipelineShaderStageCreateInfo::new(gpu.shader(vs)), PipelineShaderStageCreateInfo::new(gpu.shader(fs))];
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
+    let stages = [PipelineShaderStageCreateInfo::new(gpu.shader(vs)), PipelineShaderStageCreateInfo::new(fs)];
+    let layout = layout.unwrap_or_else(|| {
+        PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        )
+        .unwrap()
+    });
     GraphicsPipeline::new(
         device,
         None,
@@ -329,7 +368,7 @@ impl Renderer {
             alpha_blend_op: BlendOp::Add,
         };
         let accum_subpass = || Subpass::from(field_pass.clone(), 0).unwrap();
-        let splat = pipeline(&gpu, spirv!("splat.vert"), spirv!("splat.frag"), Subpass::from(field_pass.clone(), 0).unwrap(), Some(additive));
+        let splat = pipeline(&gpu, spirv!("splat.vert"), spirv!("splat.frag"), Subpass::from(field_pass.clone(), 0).unwrap(), Some(additive.clone()));
         let wet_pipeline =
             pipeline(&gpu, spirv!("composite.vert"), spirv!("wet.frag"), Subpass::from(wet_pass.clone(), 0).unwrap(), None);
         let down = pipeline(&gpu, spirv!("composite.vert"), spirv!("down.frag"), accum_subpass(), None);
@@ -341,6 +380,17 @@ impl Renderer {
             Subpass::from(final_pass.clone(), 0).unwrap(),
             None,
         );
+        // Without steam, the same shader with the vapour field compiled out (HAS_VAPOUR):
+        // its code cost ~0.09 ms a 1080p frame even where it never ran.
+        let composite_dry = pipeline_with(
+            &gpu,
+            spirv!("composite.vert"),
+            gpu.shader_specialized(spirv!("composite.frag"), &[(0, 0)]),
+            Subpass::from(final_pass.clone(), 0).unwrap(),
+            None,
+            Some(composite.layout().clone()),
+        );
+        let steam = pipeline(&gpu, spirv!("steam.vert"), spirv!("steam.frag"), accum_subpass(), Some(additive));
         let sampler = Sampler::new(
             device,
             SamplerCreateInfo {
@@ -352,7 +402,26 @@ impl Renderer {
         )
         .unwrap();
 
-        Renderer { look: Look::default(), gpu, field_pass, wet_pass, final_pass, wet_pipeline, wet: None, splat, down, blur, composite, sampler, splat_set: None, accum: None, targets: Vec::new() }
+        Renderer {
+            look: Look::default(),
+            gpu,
+            field_pass,
+            wet_pass,
+            final_pass,
+            wet_pipeline,
+            wet: None,
+            splat,
+            down,
+            blur,
+            composite,
+            composite_dry,
+            steam,
+            sampler,
+            splat_set: None,
+            steam_set: None,
+            accum: None,
+            targets: Vec::new(),
+        }
     }
 
     /// The subpass of the final (on-screen) pass, for overlays that draw into it.
@@ -370,6 +439,7 @@ impl Renderer {
         self.targets.clear();
         self.accum = None;
         self.splat_set = None;
+        self.steam_set = None;
         self.wet = None;
     }
 
@@ -492,6 +562,7 @@ impl Renderer {
         }
         let wet_view = self.wet.as_ref().expect("the wet map comes first").view.clone();
         let (accum_view, accum) = self.field_target(extent);
+        let (vapour_view, vapour) = self.field_target(extent);
 
         let wide_extent = [
             (extent[0] as f32 / WIDE_MIN_FACTOR).ceil().max(1.0) as u32,
@@ -518,8 +589,11 @@ impl Renderer {
                 WriteDescriptorSet::image_view_sampler(3, wet_view, self.sampler.clone()),
                 WriteDescriptorSet::image_view_sampler(4, sim.cell_optics_view().clone(), self.sampler.clone()),
                 WriteDescriptorSet::image_view_sampler(5, sim.glow_view().clone(), self.sampler.clone()),
-                WriteDescriptorSet::image_view_sampler(6, sim.stain_view().clone(), self.sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(6, sim.film_views().0.clone(), self.sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(10, sim.film_views().1.clone(), self.sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(7, vapour_view, self.sampler.clone()),
                 WriteDescriptorSet::buffer(8, sim.optics_buffer().clone()),
+                WriteDescriptorSet::image_view_sampler(9, sim.smoke_view().clone(), self.sampler.clone()),
             ],
             [],
         )
@@ -532,6 +606,8 @@ impl Renderer {
             down_set: sampled(&self.down, &accum_view),
             blur_sets: [sampled(&self.blur, &wide0_view), sampled(&self.blur, &wide1_view)],
             composite_set,
+            vapour,
+            vapour_dirty: std::cell::Cell::new(true),
         });
     }
 
@@ -558,6 +634,17 @@ impl Renderer {
                         WriteDescriptorSet::buffer(0, sim.particle_buffer().clone()),
                         WriteDescriptorSet::buffer(1, sim.material_buffer().clone()),
                     ],
+                    [],
+                )
+                .unwrap(),
+            );
+        }
+        if self.steam_set.is_none() {
+            self.steam_set = Some(
+                DescriptorSet::new(
+                    self.gpu.descriptors.clone(),
+                    self.steam.layout().set_layouts()[0].clone(),
+                    [WriteDescriptorSet::buffer(0, sim.particle_buffer().clone())],
                     [],
                 )
                 .unwrap(),
@@ -614,6 +701,40 @@ impl Renderer {
             b.end_render_pass(SubpassEndInfo::default()).unwrap();
         }
 
+        // Pass 1b: the vapour field (bubbles and puffs of steam), in the same layout. Without
+        // steam it is only cleared once: the composite pass binds it (and ignores it,
+        // `vapour` 0), so it has to hold something.
+        let steam = sim.has_steam() && sim.slots() > 0;
+        if steam || t.vapour_dirty.replace(steam) {
+            let (size, d) = (accum_size, div);
+            let padded = [size[0] as f32 * d * 0.5, size[1] as f32 * d * 0.5];
+            let scale = [view.zoom / padded[0], -view.zoom / padded[1]];
+            b.begin_render_pass(clear(&t.vapour), inline()).unwrap();
+            if steam {
+                let bubble = BUBBLE_RADIUS.max(SPLAT_MIN_TEXELS * d / view.zoom);
+                b.bind_pipeline_graphics(self.steam.clone())
+                    .unwrap()
+                    .set_viewport(0, [viewport(size)].into_iter().collect())
+                    .unwrap()
+                    .bind_descriptor_sets(PipelineBindPoint::Graphics, self.steam.layout().clone(), 0, self.steam_set.clone().unwrap())
+                    .unwrap()
+                    .push_constants(
+                        self.steam.layout().clone(),
+                        0,
+                        SteamPc {
+                            scale,
+                            offset: [-view.center[0] * scale[0] + half[0] / padded[0] - 1.0, -view.center[1] * scale[1] + half[1] / padded[1] - 1.0],
+                            bubble,
+                            bubble_w: (BUBBLE_RADIUS / bubble).powi(2),
+                        },
+                    )
+                    .unwrap();
+                // SAFETY: as the splat: gl_VertexIndex / 3 stays below the slot count.
+                unsafe { b.draw(sim.slots() * 3, 1, 0, 0) }.unwrap();
+            }
+            b.end_render_pass(SubpassEndInfo::default()).unwrap();
+        }
+
         // Passes 2 to 4: the wide field. Downsample, then blur across and down.
         let wide = WideLayout::new(view.zoom, div, extent, t.wide_extent);
         let wide_texel = [1.0 / t.wide_extent[0] as f32, 1.0 / t.wide_extent[1] as f32];
@@ -662,7 +783,7 @@ impl Renderer {
             inline(),
         )
         .unwrap();
-        b.bind_pipeline_graphics(self.composite.clone())
+        b.bind_pipeline_graphics(if steam { self.composite.clone() } else { self.composite_dry.clone() })
             .unwrap()
             .set_viewport(0, [viewport(extent)].into_iter().collect())
             .unwrap()
@@ -696,6 +817,8 @@ impl Renderer {
                     wet_tint: self.look.wet_tint,
                     glow: self.look.glow,
                     stains: self.look.stains,
+                    vapour: if steam { 1.0 } else { 0.0 },
+                    film_layer: sim.film_views().2 as f32,
                 },
             )
             .unwrap();

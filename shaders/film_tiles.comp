@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Which tiles of the film map (film.comp) need work this frame, one thread per 16 x 16-texel
+// tile, and the list of them that film.comp is dispatched over (one workgroup each).
+//
+// ftile, per tile, in sections of ntiles words:
+//   0, 1  the state of each copy there: TILE_EMPTY, TILE_DRY, TILE_WET
+//   2     1 if drops were laid into the tile since the last update (particles.comp)
+//   3     1 if the two copies are known to hold the same there
+//   4     bit 0: liquid in the tile's cells, bit 1: staining liquid (cell_optics.comp, this
+//         frame); a tile's work depends on its neighbours' too (a coat reaches up to two
+//         cells, film runs in from above)
+// A tile's work:
+//   3  the full update: drops were laid into it, staining liquid is in or next to it, or it
+//      holds film that is wet (it runs and dries), lies under wet film (that runs in) or under
+//      any liquid (which wets or washes it);
+//   2  otherwise, if it holds dry film: copy it into the other copy, once;
+//   1  otherwise, if the other copy still holds film there: empty it, once;
+//   0  nothing (not listed).
+
+layout(local_size_x = 64) in;
+
+layout(constant_id = 2) const uint FILM_RES_U = 4u;
+const int R = int(FILM_RES_U);
+
+layout(push_constant) uniform TPC {
+    uint parity;   // the copy holding the film now
+} TP;
+
+layout(std430, set = 0, binding = 74) buffer FilmTileBuf { uint ftile[]; };
+// x: tiles listed (the indirect dispatch's x; the caller sets it to 0, y and z to 1); then
+// the list: tile | state << 28.
+layout(std430, set = 0, binding = 75) buffer FilmListBuf { uint flist[]; };
+
+const uint TILE_EMPTY = 0u, TILE_DRY = 1u, TILE_WET = 2u;
+
+void main() {
+    ivec2 dimF = P.grid * R;
+    int tiles_x = (dimF.x + 15) / 16, tiles_y = (dimF.y + 15) / 16;
+    uint ntiles = uint(tiles_x * tiles_y);
+    uint tile = gl_GlobalInvocationID.x;
+    if (tile >= ntiles) return;
+    ivec2 tc = ivec2(int(tile) % tiles_x, int(tile) / tiles_x);
+    uint cur = TP.parity, nxt = 1u - TP.parity;
+    uint here = ftile[cur * ntiles + tile];
+    uint above = tc.y + 1 < tiles_y ? ftile[cur * ntiles + tile + uint(tiles_x)] : TILE_EMPTY;
+    bool intake = ftile[2u * ntiles + tile] != 0u;
+    uint near = 0u;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            ivec2 q = tc + ivec2(i, j);
+            if (q.x < 0 || q.y < 0 || q.x >= tiles_x || q.y >= tiles_y) continue;
+            near |= ftile[4u * ntiles + uint(q.y * tiles_x + q.x)];
+        }
+    }
+    bool full = intake || (near & 2u) != 0u || here == TILE_WET || above == TILE_WET || (here != TILE_EMPTY && (near & 1u) != 0u);
+    bool same = ftile[3u * ntiles + tile] != 0u;
+    uint other = ftile[nxt * ntiles + tile];
+    uint state = full ? 3u : here == TILE_DRY ? (same ? 0u : 2u) : (other != TILE_EMPTY ? 1u : 0u);
+    if (intake) ftile[2u * ntiles + tile] = 0u;
+    if (state == 3u) ftile[3u * ntiles + tile] = 0u;
+    if (state == 2u) { ftile[3u * ntiles + tile] = 1u; ftile[nxt * ntiles + tile] = TILE_DRY; }
+    if (state == 1u) { ftile[3u * ntiles + tile] = 1u; ftile[nxt * ntiles + tile] = TILE_EMPTY; }
+    if (state != 0u) {
+        uint k = atomicAdd(flist[0], 1u);
+        flist[3u + k] = tile | (state << 28);
+    }
+}

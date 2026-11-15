@@ -42,7 +42,13 @@ const float STREAK_MAX = 1.5;
 
 void main() {
     Particle p = particles[gl_VertexIndex / 3];
-    if (p.kind == 0u) {
+    // Dead slots and puffs of escaped steam (low byte 0: steam.vert draws them). Steam still
+    // in the liquid (row 19, material.rs: Steam) is part of the body here, in its group
+    // (aqueous): the liquid stays whole around a bubble, and the vapour field (steam.vert,
+    // composite.frag) draws the bubble inside it. (Drawn as the holes they leave, a boiling
+    // pool showed the dark back wall between its bubbles.)
+    uint low = p.kind & 255u;
+    if (low == 0u) {
         gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
         v_uv = vec2(0.0);
         v_d0 = vec4(0.0);

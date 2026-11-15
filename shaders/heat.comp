@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
+#include "air.glsl"
 
 // Heat conduction on the grid, explicit, in energy form.
 //
@@ -36,6 +37,17 @@
 // between cells. (Relaxing towards the kernel-weighted temperature of the 3 x 3 cells around
 // a particle did: it diffused heat between cells some 17 times faster than conduction.)
 //
+// Two sub-grid processes (README, "Heat"), both switchable in params.rs:
+//   - eddy mixing (eddy_heat): between two cells of the same liquid, an eddy diffusivity
+//     (C_s dx)^2 |S| / Pr_t is added to the conductivity, |S| the strain rate of the resolved
+//     flow between them (the difference of the two cells' centre velocities, the same seen
+//     from either side, so the face still moves exactly what one cell loses to the other).
+//     Stirred or convecting water carries heat through eddies far smaller than a cell;
+//     molecular conduction alone took twelve minutes to even out one 1 cm cell of water.
+//   - evaporation (evaporation): an aqueous free surface warmer than the air loses
+//     h / c_p,air x L x (Y_sat(T) - Y_sat(T_air)) (Lewis analogy, Y the mass fraction of vapour
+//     at saturation), and lays mist into the smoke field (air.glsl) in proportion.
+//
 // Exchange with air and solids goes into the ledger, so the energy budget can be checked.
 // Sparse cells conduct in proportion to their occupancy, which also keeps the explicit
 // step stable for them; the time step is limited on the CPU (SimParams::dt_thermal).
@@ -43,6 +55,28 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const float PHI_MIN = 0.04;
+const float PR_T = 0.85;          // turbulent Prandtl number
+// Mist laid into the smoke field per second by a surface cell evaporating 1 kW/m² (smoke
+// field units, as a puff's 40): what shows is condensed droplets in the cold air, far more
+// visible than the vapour's mass alone would suggest. A look setting.
+const float MIST_PER_KW = 0.9;
+
+// Mass fraction of water vapour in saturated air at T (deg C), 1 atm (Tetens' formula for
+// the vapour pressure, kPa), held below the boiling point (boiling takes over there).
+float y_sat(float T) {
+    T = clamp(T, -40.0, 99.0);
+    float p = 0.61078 * exp(17.27 * T / (T + 237.3));
+    return 0.622 * p / (101.325 - 0.378 * p);
+}
+
+// Velocity at a cell's centre, cells / s (the mean of its live faces).
+vec2 centre_vel(int i) {
+    int last = P.grid.x * P.grid.y - 1;
+    vec4 v = vel[i], vr = vel[min(i + 1, last)], vt = vel[min(i + P.grid.x, last)];
+    vec2 a = vec2(face_live(v.z) ? v.x : 0.0, face_live(v.w) ? v.y : 0.0);
+    vec2 b = vec2(face_live(vr.z) ? vr.x : 0.0, face_live(vt.w) ? vt.y : 0.0);
+    return 0.5 * (a + b);
+}
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -58,6 +92,16 @@ void main() {
     vec2 own = vec2(0.0);
     if (hsum.x > 0 && me.y > 0.0 && phi > 0.0) {
         float rate = 5.78 * me.z * 3.14159265 / (P.inv_ppc * me.y * P.inv_ppc / phi);
+        // A cell of aqueous liquid that holds steam mixes far faster: a bubble in colder
+        // water collapses within milliseconds, its vapour condensing on the water around it
+        // (README, "Steam"; P.steam2.x). It is the same exchange, so it still sums to zero
+        // over the cell. Not where another liquid shares the cell: lava under water boils
+        // it through a vapour film, whose rate `contact_heat` sets (heat between the
+        // particles of one cell is not limited by it).
+        if (has_cap(CAP_STEAM) && gbase[i].w > 0.0) {
+            bool others = (P.group_mask & ~1u) != 0u && comp[i].y + aux[i].z + aux[i].w > 1e-3;
+            if (!others) rate = max(rate, P.steam2.x);
+        }
         own = vec2(1.0 - exp(-k * rate), float(hsum.y) / float(hsum.x));  // mean (T + 273.15) / T_SCALE
     }
     if (phi <= PHI_MIN || me.y <= 0.0 || c.x < 1 || c.y < 1 || c.x >= P.grid.x - 1 || c.y >= P.grid.y - 1) {
@@ -73,6 +117,17 @@ void main() {
     float cpc = me.y * P.inv_ppc;  // heat capacity of the cell, cell volumes of water
     float hc = P.heat2.w;
     int lead = int(fract(sprop[i].w) * 128.0 + 0.5);
+    // Eddy mixing: (C_s dx)^2 / Pr_t, cells^2, times the strain rate at each face below; at
+    // most what keeps the explicit step stable (a fifth of a cell^2 per substep).
+    float eddy_l2 = P.heat3.x * P.heat3.x / PR_T;
+    bool eddy = eddy_l2 > 0.0 && me.w < 0.5;
+    vec2 u_me = eddy ? centre_vel(i) : vec2(0.0);
+    // (Eddies are carried by the resolved flow, which runs in real time: unlike conduction
+    // they do not speed up with the heat rate, so they are divided by it here, where k
+    // multiplies every conductance by it.)
+    float eddy_max = 0.2 / max(k, 1e-9);
+    float per_rate = 1.0 / max(P.heat.y, 1e-6);
+    float evap = 0.0;
     for (int q = 0; q < 4; q++) {
         int n = nb[q];
         float a = open[q];
@@ -85,6 +140,15 @@ void main() {
             float pl = (pn > PHI_MIN && o.y > 0.0) ? min(pn, 1.0) : 0.0;
             if (pl > 0.0) {
                 float gc = 2.0 * me.z * o.z / max(me.z + o.z, 1e-12);
+                // Eddies within one liquid (not across an interface, not in frozen cells), as
+                // a conductivity: the eddy diffusivity times the volumetric heat capacity of
+                // the liquid, harmonic between the two cells as conduction is.
+                if (eddy && o.w < 0.5 && int(fract(sprop[n].w) * 128.0 + 0.5) == lead) {
+                    float strain = 1.4142 * length(centre_vel(n) - u_me);
+                    float alpha = min(eddy_l2 * strain * per_rate, eddy_max);
+                    float c1 = cpc / phi, c2 = o.y * P.inv_ppc / pl;
+                    gc += alpha * 2.0 * c1 * c2 / max(c1 + c2, 1e-12);
+                }
                 cond += a * min(phi, pl) * gc * (o.x - me.x);
                 if (hc > 0.0 && int(fract(sprop[n].w) * 128.0 + 0.5) != lead) {
                     // Each half cell conducts at least as well as the boundary layer.
@@ -100,6 +164,11 @@ void main() {
                 // Free surface: film + radiation, linearised about the two temperatures.
                 float h = P.heat.z + emis * P.heat.w * (Ta * Ta + Tk * Tk) * (Ta + Tk);
                 air += a * exposed * h * (P.heat.x - me.x);
+                // Evaporation from an aqueous surface (the cell's leading liquid; one that
+                // boils near water's point). Never below the air's own saturation: the
+                // ambient pool is in equilibrium with its air.
+                if (P.heat3.y > 0.0 && lead > 0 && mats[lead - 1].ia.x == 0 && mats[lead - 1].th2.z < 150.0 && me.w < 0.5)
+                    evap += a * exposed * P.heat.z * P.heat3.y * max(y_sat(me.x) - y_sat(P.heat.x), 0.0);
             }
         }
         if (a < 1.0) {
@@ -109,6 +178,15 @@ void main() {
     }
     // The exchange with a reservoir is unconditionally stable in this form: the cell
     // relaxes towards it and cannot overshoot, however thin the cell.
+    if (evap > 0.0) {
+        // (Linearised as the film is: it stops at the air's temperature, where it is zero.)
+        air -= evap;
+        // The mist it makes: heat flux in kW/m² (evap is in K/s x water volumes, times
+        // rho c dx of water) over the substep.
+        float kw = evap * 4.182e3 * P.misc.z;
+        // (Only while the smoke field is kept: a tank with steam, sim/mod.rs: record_smoke.)
+        if (has_cap(CAP_STEAM)) smoke_inject(vec2(c) + vec2(0.5, 1.0), MIST_PER_KW * kw * S.dt * P.heat.y);
+    }
     air *= k;
     wall *= k;
     float lim = cpc * abs(P.heat.x - me.x);

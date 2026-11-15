@@ -2,6 +2,53 @@
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #include "common.glsl"
+#include "air.glsl"
+#include "optics.glsl"
+
+layout(std430, set = 0, binding = 57) readonly buffer OptBuf { Optics optics[]; };
+// The film map's intake (film.comp): thickness per film texel and colour per cell.
+layout(std430, set = 0, binding = 72) buffer FilmInBuf { uint film_in[]; };
+layout(std430, set = 0, binding = 73) buffer FilmColBuf { uint film_col[]; };
+layout(std430, set = 0, binding = 74) buffer FilmTileBuf { uint ftile[]; };
+
+// Spatter (README, "Stains and runs"): a drop of a staining liquid in free flight marks the
+// back wall SPATTER_RATE times a second (x its stain), and one that strikes a solid marks it
+// IMPACT_RATE times a second, each mark a dot SPATTER_H thick (0.1 mm units) on one texel
+// of the film map. (A look: in a slice the drops never reach the back wall; in the tank the
+// slice stands for, the spray of a splash does.)
+const float SPATTER_RATE = 0.7;
+const float IMPACT_RATE = 10.0;
+const float SPATTER_H = 5.0;
+const float SPATTER_CROWD = 0.25;  // occupancy around a drop below which it counts as spray
+const float FILM_FIX = 256.0;  // film.comp
+
+// A mark of radius `r` texels (a dot, or a disc for a big drop), `amount` thick in its middle.
+void film_spatter(vec2 x, vec3 col, float amount, float r) {
+    int R = int(P.heat3.z);
+    if (R <= 0) return;
+    ivec2 dimF = P.grid * R;
+    vec2 g = x * float(R);
+    int ri = int(ceil(r));
+    for (int j = -ri; j <= ri; j++) {
+        for (int i = -ri; i <= ri; i++) {
+            ivec2 t = ivec2(floor(g)) + ivec2(i, j);
+            if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, dimF))) continue;
+            vec2 o = vec2(t) + 0.5 - g;
+            float w = clamp(1.0 - dot(o, o) / max(r * r, 0.36), 0.0, 1.0);
+            if (w <= 0.0) continue;
+            uint q = uint(amount * w * FILM_FIX + 0.5);
+            atomicAdd(film_in[t.y * dimF.x + t.x], q);
+            uint ci = uint(cidx(t / R)) * 4u;
+            atomicAdd(film_col[ci], uint(col.r * float(q)));
+            atomicAdd(film_col[ci + 1u], uint(col.g * float(q)));
+            atomicAdd(film_col[ci + 2u], uint(col.b * float(q)));
+            atomicAdd(film_col[ci + 3u], q);
+            // The tile's intake flag (film.comp: after the two copies' flags).
+            uint tx = uint(dimF.x + 15) / 16u, nt = tx * (uint(dimF.y + 15) / 16u);
+            ftile[2u * nt + uint(t.y / 16) * tx + uint(t.x / 16)] = 1u;
+        }
+    }
+}
 
 // The one per-particle pass of a substep. For every live particle:
 //   1. gather  (grid -> particle): APIC velocity + affine matrix from the projected grid,
@@ -24,77 +71,6 @@ const float SLIP_GRAD_MIN = 0.04;
 const float SLIP_GRAD_MAX = 0.12;
 
 const uint KIND_FRESH = 0x10000u;  // params.rs: KIND_FRESH (spawned since the last substep)
-
-uint hash(uint x) {
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
-}
-
-float sample_sdf(vec2 x, out vec2 grad) {
-    vec2 g = clamp(x, vec2(0.0), vec2(P.grid) - 0.001);
-    ivec2 i = ivec2(g);
-    vec2 f = g - vec2(i);
-    int w1 = P.grid.x + 1;
-    int k = i.y * w1 + i.x;
-    float d00 = sdf[k], d10 = sdf[k + 1], d01 = sdf[k + w1], d11 = sdf[k + w1 + 1];
-    grad = vec2(mix(d10 - d00, d11 - d01, f.y), mix(d01 - d00, d11 - d10, f.x));
-    return mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
-}
-
-// Velocity the mouse tool drives a particle towards; `d` points from the particle to the
-// cursor. Grab (1) carries liquid along with the cursor and pulls it in; push (3) drives it
-// radially outwards at the speed in tool_vel.x, with a smooth centre where the direction is
-// undefined; a stream's nozzle (4) holds it at the launch velocity.
-vec2 tool_target(vec2 d) {
-    if (P.tool_mode == 3) return -d / max(length(d), 0.15 * P.tool_radius) * P.tool_vel.x;
-    if (P.tool_mode == 4) return P.tool_vel;
-    return P.tool_vel + d * 4.0;
-}
-
-// Grid velocity at x, bilinear over the live faces around it; components with no live face
-// nearby (spray in free flight) keep `fallback`.
-vec2 sample_vel(vec2 x, vec2 fallback) {
-    vec2 o = fallback;
-    {
-        vec2 gp = x - vec2(0.0, 0.5);
-        ivec2 base = ivec2(floor(gp));
-        vec2 f = gp - vec2(base);
-        float sw = 0.0, su = 0.0;
-        for (int b = 0; b < 2; b++) {
-            for (int a = 0; a < 2; a++) {
-                vec4 q = vel[cidx(base + ivec2(a, b))];
-                if (face_live(q.z)) {
-                    float wt = (a == 0 ? 1.0 - f.x : f.x) * (b == 0 ? 1.0 - f.y : f.y);
-                    sw += wt;
-                    su += wt * q.x;
-                }
-            }
-        }
-        if (sw > 1e-3) o.x = su / sw;
-    }
-    {
-        vec2 gp = x - vec2(0.5, 0.0);
-        ivec2 base = ivec2(floor(gp));
-        vec2 f = gp - vec2(base);
-        float sw = 0.0, su = 0.0;
-        for (int b = 0; b < 2; b++) {
-            for (int a = 0; a < 2; a++) {
-                vec4 q = vel[cidx(base + ivec2(a, b))];
-                if (face_live(q.w)) {
-                    float wt = (a == 0 ? 1.0 - f.x : f.x) * (b == 0 ? 1.0 - f.y : f.y);
-                    sw += wt;
-                    su += wt * q.y;
-                }
-            }
-        }
-        if (sw > 1e-3) o.y = su / sw;
-    }
-    return o;
-}
 
 // One push out of the solids: to the surface, then (with `beyond`) as far beyond it as the
 // particle was inside, so fluid caught under a newly placed solid keeps its area instead of
@@ -136,6 +112,40 @@ void main() {
     if (id >= P.n_slots) return;
     Particle p = particles[id];
     if (p.kind == KIND_DEAD) return;
+    if ((p.kind & 255u) == 0u) {
+        // A puff of steam that escaped at the surface (KIND_PUFF): it left the tank (the
+        // ledger has its heat) and is a tracer in the air above the liquid (air.glsl) that
+        // lays its vapour into the smoke field (README, "Steam"). It is gone after P.steam.z
+        // seconds, or at the edge of the grid.
+        float dt = S.dt;
+        p.s += dt;
+        if (p.s >= P.steam.z || any(lessThan(p.pos, vec2(2.01))) || any(greaterThan(p.pos, vec2(P.grid) - 2.01))) {
+            particles[id].kind = KIND_DEAD;
+            return;
+        }
+        float occ;
+        vec2 target = air_velocity(p.pos, puff_lean(p.id), occ);
+        // A puff that a wave or a splash swallows condenses (it is gone).
+        if (occ > 0.6 && p.s > 0.1) {
+            particles[id].kind = KIND_DEAD;
+            return;
+        }
+        if (P.tool_mode == 2 && distance(P.tool_pos, p.pos) < P.tool_radius) {
+            particles[id].kind = KIND_DEAD;
+            return;
+        }
+        // A tracer follows the air within a fraction of a second (it keeps the push it
+        // escaped with for that long).
+        p.vel = mix(p.vel, target, 1.0 - exp(-dt / PUFF_FOLLOW));
+        p.pos += p.vel * dt;
+        collide(p.pos, p.vel, false);
+        // It lays its vapour into the smoke field (smoke.comp), most of it soon after it
+        // escaped: what it lays down along its path is drawn as the wisps.
+        float a0 = (p.s - dt) / PUFF_EMIT, a1 = p.s / PUFF_EMIT;
+        smoke_inject(p.pos, PUFF_VAPOUR * (exp(-max(a0, 0.0)) - exp(-a1)));
+        particles[id] = p;
+        return;
+    }
 
     float dt = S.dt;
     uint row = (p.kind & 255u) - 1u;
@@ -300,6 +310,9 @@ void main() {
             // group around it.
             bool sorts = group_sorts(Mia.x);
             float sbg = 0.0;
+            // And the rise of steam through the aqueous liquid around it: the share of steam.
+            bool steamy = has_cap(CAP_STEAM) && Mia.x == 0;
+            float sfv = 0.0;
             int nmix = P.n_fam - 1;
             for (int b = 0; b < 3; b++) {
                 for (int a = 0; a < 3; a++) {
@@ -312,6 +325,7 @@ void main() {
                         sg.x += wt * q.y;
                         if (more) sg.yz += wt * aux[ci].zw;
                         if (sorts) sbg += wt * gbase[ci][Mia.x - 1];
+                        if (steamy) sfv += wt * gbase[ci].w;
                         float sb = fam > 0 ? mixb[ci * nmix + fam - 1] : q.z;
                         if (sb >= 0.0) {
                             sfw += wt;
@@ -496,6 +510,22 @@ void main() {
                     }
                 }
 
+                // Steam rises through the water around it (README, "Steam"): the same drift,
+                // a bubble of the unresolved size (P.sep_tau) at its terminal velocity in
+                // water, in proportion to the share of water around it; the water drifts
+                // down by the share of steam, so the volume flux cancels and the water of a
+                // pool without steam does not drift at all.
+                if (steamy && !held) {
+                    float fv = clamp(sfv / sw, 0.0, 1.0);
+                    if (fv > 1e-4) {
+                        float rw = mats[ROW_WATER].a.x;
+                        float vt = terminal(mats[ROW_STEAM].a.x - rw, rw, exp(mats[ROW_WATER].a.y), P.sep_tau);
+                        float sep_max = P.corr.z > 0.0 ? P.cfl / dt : 1e30;  // params.rs: slip_cap
+                        vt = min(vt, sep_max);
+                        slip += row == ROW_STEAM ? vt * (1.0 - fv) : -vt * fv;
+                    }
+                }
+
                 // Miscible exchange within a family (a material and its diluent): relax the
                 // particle's concentration towards the local mean of its family. Scatter
                 // and gather use the same weights, so each component is conserved to
@@ -593,20 +623,75 @@ void main() {
         }
 
         // ---- boiling ------------------------------------------------------------------------
-        // There is no gas phase: liquid heated past its boiling point by its latent heat of
-        // vaporisation leaves the simulation, taking that heat with it (ledger entry 6), and
-        // is counted as lost. What it had dissolved stays behind as particles of its residue
-        // (salt from brine), one per `residue share` of evaporated concentrate on average.
+        // Liquid heated past its boiling point takes up latent heat of vaporisation as it
+        // goes on heating (its enthalpy temperature runs ahead of the boiling point, which
+        // the scatter caps it at); the share of that latent heat it holds is its vapour
+        // quality x.
+        // Aqueous liquid turns into steam (README, "Steam"; CAP_STEAM, while P.steam2.y is on)
+        // at x = P.steam.w: a parcel of liquid and vapour, which even at a few per cent
+        // quality is nearly all vapour by volume, so it is a bubble. It keeps the parcel's
+        // mass and heat, and remembers the liquid it boiled from and its concentration
+        // (KIND_SRC, p.s); it rises through the liquid (the drift above) and condenses back
+        // into that liquid where it has given up its vapour (x below P.steam.x). At the free
+        // surface its vapour escapes: with probability x the whole particle leaves as a
+        // puff, taking its heat with it (ledger entry 6) and counted as boiled away;
+        // otherwise it gives up its latent heat the same way and stays, as its liquid at the
+        // boiling point. Mass and heat leave as the vapour share x would, on average; the
+        // ledger counts exactly what left.
+        // Any other liquid, or with steam off, leaves the tank at once when it has taken up
+        // all of its latent heat (x = 1), wherever it is.
+        // What leaves (escaping steam, or a liquid boiled away) leaves what it had dissolved
+        // behind as particles of its residue (salt from brine), one per `residue share` of
+        // concentrate on average.
         if (thermal) {
             vec4 th = thermal_of(row, p.s);
             vec2 bo = mats[row].th2.zw;
             if (Mia.y >= 0) bo = mix(mats[Mia.y].th2.zw, bo, p.s);
-            if (p.t >= bo.x + bo.y) {
+            bool vapour = has_cap(CAP_STEAM) && Mia.x == 0 && (P.steam2.y > 0.5 || row == ROW_STEAM);
+            bool leave = false;  // the whole particle boils away (or escapes as steam)
+            if (vapour && row == ROW_STEAM) {
+                float x = (p.t - bo.x) / max(bo.y, 1e-3);
+                ivec2 pc = clamp(ivec2(p.pos), ivec2(0), P.grid - 1);
+                bool surface = cell[cidx(pc)].w <= 0.0 || cell[cidx(min(pc + ivec2(0, 1), P.grid - 1))].w <= 0.0;
+                float u = float(hash(p.id ^ hash(S.substeps ^ 0x2545f491u)) >> 8) / 16777216.0;
+                if (surface && u < x) {
+                    leave = true;
+                } else if (x < P.steam.x || surface) {
+                    // Back into the liquid it boiled from: at the surface, having given up
+                    // its latent heat to the air; below it, condensed.
+                    if (surface) {
+                        ledger_add(6, max(th.w * (p.t - bo.x), 0.0) * P.inv_ppc);
+                        p.t = bo.x;
+                    }
+                    uint src = (p.kind & KIND_SRC) >> 8;
+                    row = src > 0u ? src - 1u : ROW_WATER;
+                    Mia = mats[row].ia;
+                    fam = mats[row].ib.x;
+                    p.kind = (p.kind & ~(255u | KIND_SRC)) | (row + 1u);
+                    p.t = keep_heat(p.t, th.w, thermal_of(row, p.s).w);
+                }
+            } else if (p.t >= bo.x + bo.y * (vapour ? P.steam.w : 1.0)) {
+                if (vapour) {
+                    float c1 = thermal_of(ROW_STEAM, 1.0).w;
+                    atomicAdd(ledger[144u + row], 1u);
+                    p.kind = (p.kind & ~(255u | KIND_SRC)) | ((row + 1u) << 8) | (ROW_STEAM + 1u);
+                    row = ROW_STEAM;
+                    Mia = mats[row].ia;
+                    fam = -1;
+                    p.t = keep_heat(p.t, th.w, c1);
+                } else {
+                    leave = true;
+                }
+            }
+            if (leave) {
+                // What it leaves behind: its source liquid's residue, by its concentration.
+                uint src = row == ROW_STEAM ? ((p.kind & KIND_SRC) >> 8) : row + 1u;
+                uint from = src > 0u ? src - 1u : ROW_WATER;
+                int res = mats[from].ib.w;
+                float share = mats[from].el.w * (mats[from].ia.y >= 0 ? p.s : 1.0);
                 // Heat content counted from absolute zero, as the ledger's other entries and
                 // `heat_content` count it.
                 float e = th.w * (p.t + 273.15);
-                int res = mats[row].ib.w;
-                float share = mats[row].el.w * (Mia.y >= 0 ? p.s : 1.0);
                 atomicAdd(ledger[16u + row], 1u);
                 if (res >= 0 && float(hash(p.id ^ 0x9e3779b9u) >> 8) / 16777216.0 < share) {
                     atomicAdd(ledger[80u + uint(res)], 1u);
@@ -616,12 +701,19 @@ void main() {
                     p.s = 1.0;
                     p.t = bo.x - thermal_of(row, 1.0).z;  // the residue is a solid (common.glsl: phase_of)
                     e -= thermal_of(row, 1.0).w * (p.t + 273.15);
+                    ledger_add(6, max(e, 0.0) * P.inv_ppc);
                 } else {
                     ledger_add(6, max(e, 0.0) * P.inv_ppc);
-                    particles[id].kind = KIND_DEAD;
+                    if (row == ROW_STEAM) {
+                        p.kind = KIND_PUFF;
+                        p.s = 0.0;
+                        p.vel = v;
+                        particles[id] = p;
+                    } else {
+                        particles[id].kind = KIND_DEAD;
+                    }
                     return;
                 }
-                ledger_add(6, max(e, 0.0) * P.inv_ppc);
             }
         }
 
@@ -733,6 +825,34 @@ void main() {
         p.vel = v;
         p.c = C;
         p.kind &= ~KIND_FRESH;
+        // Spatter from a drop of a staining liquid in free flight, or striking a solid.
+        // (Only a drop on its own: a stream or a sheet is not spray, and liquid leaving the
+        // pour or jet's nozzle neither: counted as airborne there, a pour laid a red cloud
+        // over the back wall around its nozzle.)
+        bool at_nozzle = P.tool_mode == 4 && distance(P.tool_pos, x) < 2.0 * P.tool_radius + 4.0;
+        if (crowd < SPATTER_CROWD && !at_nozzle && P.heat3.z > 0.0) {
+            float stain = optics[row].fx.x;
+            int dil = mats[row].ia.y;
+            if (dil >= 0) stain = mix(optics[dil].fx.x, stain, p.s);
+            if (stain > 0.01) {
+                vec2 n;
+                float d = sample_sdf(x, n);
+                float sp = length(va);
+                bool wall = d < P.wall_margin + 0.4 && length(n) > 1e-5;
+                float rate = wall ? IMPACT_RATE * clamp(sp / 20.0, 0.2, 1.0) : SPATTER_RATE * clamp(sp / 30.0, 0.0, 1.0);
+                uint hs = hash(p.id * 747796405u + S.substeps * 2891336453u);
+                if (float(hs & 0xffffu) * (1.0 / 65535.0) < 1.0 - exp(-rate * stain * dt)) {
+                    vec4 k = optics[row].absorb;
+                    if (dil >= 0) k = mix(optics[dil].absorb, k, p.s);
+                    vec2 at = wall ? x - normalize(n) * (d + 0.35) : x;
+                    // Drop sizes as a spray makes them: many fine ones, a few large (a cubed
+                    // uniform number); a large one is thicker, and runs.
+                    float u = float(hs >> 16) / 65535.0;
+                    float size = u * u * u;
+                    film_spatter(at, film_colour(k, 0.35), SPATTER_H * mix(0.5, 3.0, size) * (wall ? 1.4 : 1.0), mix(0.5, 2.6, size));
+                }
+            }
+        }
         particles[id] = p;
     }
     float rho_p = row_density(row, p.s);

@@ -77,14 +77,16 @@ const RIGID_BODIES: u64 = 4096;
 /// Words per body in the body table (`BODY_WORDS` in common.glsl).
 const BODY_WORDS: u64 = 32;
 /// Words of the heat ledger (`LedgerBuf` in common.glsl).
-const LEDGER_WORDS: u64 = 16 + 2 * MAX_MATERIALS as u64;
-/// How fast a liquid with `stain` 1 stains a solid it lies against, and the back wall, 1/s;
-/// how fast liquid that does not stain washes a stain off, at rest, 1/s (stain.comp).
+const LEDGER_WORDS: u64 = 16 + 3 * MAX_MATERIALS as u64;
+/// How fast a liquid with `stain` 1 coats a solid it lies against, and the back wall, 1/s;
+/// how fast liquid that does not stain washes a film off, at rest, 1/s (film.comp).
 const STAIN_WALL_RATE: f32 = 3.0;
-const STAIN_BACK_RATE: f32 = 1.2;
+const STAIN_BACK_RATE: f32 = 0.4;
 const STAIN_WASH_RATE: f32 = 0.06;
+/// Thickness unit of the film map, m (film.comp: 0.1 mm).
+const FILM_UNIT: f32 = 1.0e-4;
 /// Layers of the per-cell optics image (cell_optics.comp writes them, composite.frag reads them).
-const CELL_OPTICS_LAYERS: u32 = 9;
+const CELL_OPTICS_LAYERS: u32 = 12;
 const PARTICLE_GROUP: u32 = 128;
 /// Substeps between two particle sorts (see `sort.comp`), and the particle count below
 /// which sorting is not worth its dispatches.
@@ -158,6 +160,9 @@ pub struct Ledger {
     /// Per table row: particles that boiled away, and particles left behind as its residue.
     pub boiled_count: [u32; MAX_MATERIALS],
     pub residue_count: [u32; MAX_MATERIALS],
+    /// Per table row: particles that turned into steam (README, "Steam"); what boiled away
+    /// of it is counted under `Material::Steam` in `boiled_count`.
+    pub steam_count: [u32; MAX_MATERIALS],
 }
 
 impl Default for Ledger {
@@ -172,6 +177,7 @@ impl Default for Ledger {
             boiled: 0.0,
             boiled_count: [0; MAX_MATERIALS],
             residue_count: [0; MAX_MATERIALS],
+            steam_count: [0; MAX_MATERIALS],
         }
     }
 }
@@ -216,6 +222,27 @@ pub struct Tank {
 }
 
 impl Tank {
+    /// `layout`, with steam (and the water it condenses into) added to the rows while heat
+    /// is simulated and an aqueous liquid in the tank can boil (README, "Steam"). If the
+    /// rows do not fit with it, the tank does without: boiled liquid then leaves at once.
+    pub fn layout_steam(rows: &[usize], p: &SimParams, thermal: bool) -> Option<Tank> {
+        let steam = Material::Steam.index();
+        let boils = |r: usize| r != steam && p.mat[r].group == PhaseGroup::Aqueous as u32 && p.mat[r].boil < 1.0e8;
+        if thermal && p.steam != 0 && !rows.contains(&steam) && rows.iter().any(|&r| boils(r)) {
+            let mut more = rows.to_vec();
+            for r in [Material::Water.index(), steam] {
+                if !more.contains(&r) {
+                    more.push(r);
+                }
+            }
+            more.sort_unstable();
+            if let Some(t) = Tank::layout(&more, p, thermal) {
+                return Some(t);
+            }
+        }
+        Tank::layout(rows, p, thermal)
+    }
+
     /// Lays the channels out for `rows` (ascending). The first row's weight is the
     /// remainder of the cell weight and costs no channel, so water, the usual first row,
     /// scatters exactly what it always did. Returns `None` if the rows do not fit.
@@ -349,6 +376,45 @@ enum Viscosity {
     None = 0,
     Explicit = 1,
     Implicit = 2,
+}
+
+/// Texels of the smoke field per cell (smoke.comp: SMOKE_RES): 2, or 1 on grids wider than
+/// 640 cells, where a cell is already small on screen and the field's cost (it is memory
+/// bound) would grow with the square.
+fn smoke_res(grid: [u32; 2]) -> u32 {
+    if grid[0] > 640 { 1 } else { 2 }
+}
+/// Texels of the film map per cell (film.comp: FILM_RES; README, "Stains and runs"): 4 up to
+/// the medium grid, 2 above (a power of two that divides the 16-texel tile, so that a cell's
+/// texels share a workgroup), keeping the map under ~2.4 million texels.
+fn film_res(grid: [u32; 2]) -> u32 {
+    let cells = grid[0] * grid[1];
+    if cells * 16 <= 2_400_000 { 4 } else if cells * 4 <= 2_400_000 { 2 } else { 1 }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct FilmPc {
+    dt: f32,
+    wall_rate: f32,
+    back_rate: f32,
+    wash_rate: f32,
+    parity: u32,
+    mob_scale: f32,
+}
+/// The vapour of escaped steam mixes away into the air with this share of `steam_life` as its
+/// time constant (smoke.comp).
+const SMOKE_FADE: f32 = 0.8;
+/// Longest step of the smoke field, s: at 1/60 s, smoke.comp's REACH (8 texels, 4 - 8 cells)
+/// holds air up to 240 cells/s, well above the steam's rise.
+const SMOKE_STEP: f32 = 1.0 / 60.0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct SmokePc {
+    dt: f32,
+    fade: f32,
+    mode: u32,
 }
 
 #[repr(C)]
@@ -631,9 +697,12 @@ struct Passes {
     elastic: Pass,
     settle: Pass,
     cell_optics: Pass,
+    light: Pass,
     optics_blur: Pass,
     glow: Pass,
-    stain: Pass,
+    film_tiles: Pass,
+    film: Pass,
+    smoke: Pass,
     particles: CapsPass,
     prep: CapsPass,
     coef: Pass,
@@ -728,10 +797,28 @@ pub struct FluidSim {
     optics_key: std::cell::Cell<Option<(u64, u64, u64, u32)>>,
     /// The glow field the renderer samples (glow.comp; half the grid's resolution).
     glow: Arc<ImageView>,
-    /// The stain map (stain.comp), and the tank and simulated time it was last updated for;
+    /// The film map (film.comp): colour (rgba8) and thickness, wetness, drying time and
+    /// mobility (rgba16f), two copies each (layers), the copy that holds it now, what drops
+    /// laid down (per texel; colour per cell), the tiles each copy holds film in; and the tank
+    /// and simulated time it was last updated for;
     /// `None`: to be cleared.
-    stain: Arc<ImageView>,
+    film_c: Arc<ImageView>,
+    film_h: Arc<ImageView>,
+    film_parity: std::cell::Cell<u32>,
+    film_in: Subbuffer<[u32]>,
+    film_col: Subbuffer<[u32]>,
+    film_tiles: Subbuffer<[u32]>,
+    film_list: Subbuffer<[u32]>,
+    film_seen: std::cell::Cell<bool>,
     stain_at: std::cell::Cell<Option<(u64, f64)>>,
+    /// The smoke field (smoke.comp; README, "Steam"): the vapour of escaped steam the renderer
+    /// samples (`smoke[0]`), and two scratch images; the tank and simulated time it was last
+    /// carried along for (`None`: to be cleared).
+    smoke: [Arc<ImageView>; 3],
+    smoke_at: std::cell::Cell<Option<(u64, f64)>>,
+    /// What the puffs laid into the smoke field since its last update, per cell, fixed point
+    /// (air.glsl).
+    smoke_in: Subbuffer<[u32]>,
     /// Times the material and optics tables were uploaded.
     tables_uploaded: u64,
     /// The tank is not isothermal (since the last reset): heat is carried and conducted.
@@ -857,8 +944,7 @@ impl FluidSim {
         // renderer samples.
         let cellopt_raw = optics_image();
         let cellopt = optics_image();
-        // The glow field (glow.comp), at half the grid's resolution, and the stain map
-        // (stain.comp), which lasts as long as the tank.
+        // The glow field (glow.comp), at half the grid's resolution.
         let plain_image = |extent: [u32; 2], usage: ImageUsage| ImageView::new_default(
             Image::new(
                 gpu.memory.clone(),
@@ -877,7 +963,54 @@ impl FluidSim {
         let half = [grid[0].div_ceil(2), grid[1].div_ceil(2)];
         let glow_a = plain_image(half, ImageUsage::empty());
         let glow_b = plain_image(half, ImageUsage::empty());
-        let stain = plain_image(grid, ImageUsage::TRANSFER_DST);
+        // The film map (film.comp), which lasts as long as the tank: two copies (layers) of
+        // each image, at `film_res` texels per cell.
+        let fres = film_res(grid);
+        let fdim = [grid[0] * fres, grid[1] * fres];
+        let film_image = |format: Format| ImageView::new_default(
+            Image::new(
+                gpu.memory.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format,
+                    extent: [fdim[0], fdim[1], 1],
+                    array_layers: 2,
+                    usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .expect("out of GPU memory"),
+        )
+        .unwrap();
+        let film_c = film_image(Format::R8G8B8A8_UNORM);
+        let film_h = film_image(Format::R16G16B16A16_SFLOAT);
+        let film_in = device_buffer::<u32>(&gpu, (fdim[0] * fdim[1]) as u64, BufferUsage::TRANSFER_DST);
+        let film_col = device_buffer::<u32>(&gpu, cells * 4, BufferUsage::TRANSFER_DST);
+        // Per tile: each copy's state there, whether drops were laid into it, whether the two
+        // copies hold the same there, and whether liquid is in its cells this frame; and the
+        // list of tiles that need work, behind the indirect dispatch over it (film_tiles.comp).
+        let film_ntiles = (fdim[0].div_ceil(16) * fdim[1].div_ceil(16)) as u64;
+        let film_tiles = device_buffer::<u32>(&gpu, 5 * film_ntiles, BufferUsage::TRANSFER_DST);
+        let film_list = device_buffer::<u32>(&gpu, 3 + film_ntiles, BufferUsage::TRANSFER_DST | BufferUsage::INDIRECT_BUFFER);
+        let smoke_dim = [grid[0] * smoke_res(grid), grid[1] * smoke_res(grid)];
+        let smoke_image = |usage: ImageUsage| ImageView::new_default(
+            Image::new(
+                gpu.memory.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: Format::R16_SFLOAT,
+                    extent: [smoke_dim[0], smoke_dim[1], 1],
+                    usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | usage,
+                    ..Default::default()
+                },
+                AllocationCreateInfo::default(),
+            )
+            .expect("out of GPU memory"),
+        )
+        .unwrap();
+        let smoke = [smoke_image(ImageUsage::TRANSFER_DST), smoke_image(ImageUsage::empty()), smoke_image(ImageUsage::TRANSFER_SRC)];
+        let smoke_in = device_buffer::<u32>(&gpu, cells, BufferUsage::TRANSFER_DST);
         // Particle stress: placeholders until an elastic material arrives (`set_elastic`).
         let pstress = device_buffer::<[f32; 4]>(&gpu, 1, none);
         // Settling: placeholders until a suspension arrives (`set_settling`).
@@ -993,6 +1126,11 @@ impl FluidSim {
         put(53, pstress.as_bytes().clone());
         put(54, estr.as_bytes().clone());
         put(57, optics_tab.as_bytes().clone());
+        put(69, smoke_in.as_bytes().clone());
+        put(72, film_in.as_bytes().clone());
+        put(73, film_col.as_bytes().clone());
+        put(74, film_tiles.as_bytes().clone());
+        put(75, film_list.as_bytes().clone());
         put(55, famocc.as_bytes().clone());
         put(56, famocc.as_bytes().clone());
         // The same bindings with the two search-direction buffers swapped.
@@ -1052,9 +1190,24 @@ impl FluidSim {
             elastic: p("elastic", spirv!("elastic.comp")),
             settle: p("settle", spirv!("settle.comp")),
             cell_optics: Pass::with_images(&gpu, "cell_optics", spirv!("cell_optics.comp"), &table, &[(58, cellopt_raw.clone())]),
+            light: Pass::with_images(&gpu, "light", spirv!("light.comp"), &table, &[(58, cellopt_raw.clone())]),
             optics_blur: Pass::with_images(&gpu, "optics_blur", spirv!("optics_blur.comp"), &table, &[(58, cellopt_raw.clone()), (60, cellopt.clone())]),
             glow: Pass::with_images(&gpu, "glow", spirv!("glow.comp"), &table, &[(58, cellopt_raw.clone()), (62, glow_a.clone()), (63, glow_b.clone())]),
-            stain: Pass::with_images(&gpu, "stain", spirv!("stain.comp"), &table, &[(58, cellopt_raw.clone()), (64, stain.clone())]),
+            film_tiles: Pass::build(&gpu, "film_tiles", gpu.shader_specialized(spirv!("film_tiles.comp"), &[(2, fres)]), &table, &[]),
+            film: Pass::build(
+                &gpu,
+                "film",
+                gpu.shader_specialized(spirv!("film.comp"), &[(2, fres)]),
+                &table,
+                &[(58, cellopt_raw.clone()), (70, film_c.clone()), (71, film_h.clone())],
+            ),
+            smoke: Pass::build(
+                &gpu,
+                "smoke",
+                gpu.shader_specialized(spirv!("smoke.comp"), &[(1, smoke_res(grid))]),
+                &table,
+                &[(66, smoke[0].clone()), (67, smoke[1].clone()), (68, smoke[2].clone())],
+            ),
             particles: CapsPass::new("particles", spirv!("particles.comp")),
             prep: CapsPass::new("grid_prep", spirv!("grid_prep.comp")),
             coef: p("grid_coef", spirv!("grid_coef.comp")),
@@ -1140,8 +1293,18 @@ impl FluidSim {
             cellopt,
             optics_key: std::cell::Cell::new(None),
             glow: glow_b,
-            stain,
+            film_c,
+            film_h,
+            film_parity: std::cell::Cell::new(0),
+            film_in,
+            film_col,
+            film_tiles,
+            film_list,
+            film_seen: std::cell::Cell::new(false),
             stain_at: std::cell::Cell::new(None),
+            smoke,
+            smoke_in,
+            smoke_at: std::cell::Cell::new(None),
             tables_uploaded: 0,
             thermal: false,
             solid_t,
@@ -1217,19 +1380,31 @@ impl FluidSim {
         let dt = match self.stain_at.get() {
             Some((tank, t)) if tank == self.resets => (now - t).clamp(0.0, 0.25) as f32,
             _ => {
-                b.clear_color_image(vulkano::command_buffer::ClearColorImageInfo::image(self.stain.image().clone())).unwrap();
+                for img in [&self.film_c, &self.film_h] {
+                    b.clear_color_image(vulkano::command_buffer::ClearColorImageInfo::image(img.image().clone())).unwrap();
+                }
+                b.fill_buffer(self.film_in.clone(), 0).unwrap();
+                b.fill_buffer(self.film_col.clone(), 0).unwrap();
+                b.fill_buffer(self.film_tiles.clone(), 0).unwrap();
                 0.0
             }
         };
         self.stain_at.set(Some((self.resets, now)));
+        self.record_smoke(b);
         let key = (self.substeps_done, self.resets, self.tables_uploaded, inv_speed.to_bits());
         if self.optics_key.replace(Some(key)) == Some(key) {
             return;
         }
         let groups = [self.grid[0].div_ceil(GRID_GROUP), self.grid[1].div_ceil(GRID_GROUP), 1];
+        // The film map's per-tile liquid flags, which cell_optics.comp sets anew.
+        let nt = self.film_tiles.len() / 5;
+        b.fill_buffer(self.film_tiles.clone().slice(4 * nt..5 * nt), 0).unwrap();
         self.pass.cell_optics.bind(b);
         self.pass.cell_optics.push(b, inv_speed);
         dispatch(b, groups);
+        // The light reaching each cell from above, one workgroup per column (light.comp).
+        self.pass.light.bind(b);
+        dispatch(b, [self.grid[0], 1, 1]);
         self.pass.optics_blur.bind(b);
         dispatch(b, groups);
         let half = [self.grid[0].div_ceil(2).div_ceil(GRID_GROUP), self.grid[1].div_ceil(2).div_ceil(GRID_GROUP), 1];
@@ -1238,14 +1413,78 @@ impl FluidSim {
             self.pass.glow.push(b, dir);
             dispatch(b, half);
         }
-        self.pass.stain.bind(b);
-        self.pass.stain.push(b, [dt, STAIN_WALL_RATE, STAIN_BACK_RATE, STAIN_WASH_RATE]);
-        dispatch(b, groups);
+        // The film map: only once a staining liquid has been in the tank (until then there
+        // is nothing to lay down, run or wash).
+        if dt > 0.0 && self.film_live() {
+            let parity = self.film_parity.get();
+            // Which tiles need work, listed behind an indirect dispatch (film_tiles.comp).
+            b.update_buffer(self.film_list.clone().slice(0..3), Box::<[u32]>::from([0, 1, 1])).unwrap();
+            self.pass.film_tiles.bind(b);
+            self.pass.film_tiles.push(b, parity);
+            dispatch(b, [(nt as u32).div_ceil(64), 1, 1]);
+            self.pass.film.bind(b);
+            self.pass.film.push(b, FilmPc {
+                dt,
+                wall_rate: STAIN_WALL_RATE,
+                back_rate: STAIN_BACK_RATE,
+                wash_rate: STAIN_WASH_RATE,
+                parity,
+                mob_scale: self.params.gravity * FILM_UNIT * FILM_UNIT / 3.0 * film_res(self.grid) as f32 / self.params.cell_size,
+            });
+            // SAFETY: film.comp reads its tile from the list for each workgroup, and the list
+            // holds at most every tile once.
+            unsafe { b.dispatch_indirect(self.film_list.clone().slice(0..3).reinterpret::<[DispatchIndirectCommand]>()) }.unwrap();
+            self.film_parity.set(1 - parity);
+        }
+    }
+
+    /// Carries the smoke field along with the air for the simulated time since the last call
+    /// (smoke.comp), and adds what the puffs laid down. Nothing while the tank has no steam.
+    fn record_smoke(&self, b: &mut Builder) {
+        let now = self.sim_time();
+        let dt = match self.smoke_at.get() {
+            Some((tank, t)) if tank == self.resets => (now - t).clamp(0.0, 0.1) as f32,
+            _ => {
+                b.clear_color_image(vulkano::command_buffer::ClearColorImageInfo::image(self.smoke[0].image().clone())).unwrap();
+                b.fill_buffer(self.smoke_in.clone(), 0).unwrap();
+                0.0
+            }
+        };
+        self.smoke_at.set(Some((self.resets, now)));
+        if dt <= 0.0 || !self.has_steam() {
+            return;
+        }
+        let res = smoke_res(self.grid);
+        let groups = [(self.grid[0] * res).div_ceil(GRID_GROUP), (self.grid[1] * res).div_ceil(GRID_GROUP), 1];
+        // A step carries the vapour at most smoke.comp's REACH texels: a long frame is split.
+        let steps = (dt / SMOKE_STEP).ceil().max(1.0) as u32;
+        self.pass.smoke.bind(b);
+        for step in 0..steps {
+            for mode in 0u32..2 {
+                self.pass.smoke.push(b, SmokePc { dt: dt / steps as f32, fade: self.params.steam_life * SMOKE_FADE, mode });
+                dispatch(b, groups);
+            }
+            b.copy_image(vulkano::command_buffer::CopyImageInfo::images(self.smoke[2].image().clone(), self.smoke[0].image().clone())).unwrap();
+            if step == 0 {
+                // What the puffs laid down goes in once.
+                b.fill_buffer(self.smoke_in.clone(), 0).unwrap();
+            }
+            if step + 1 < steps {
+                self.pass.smoke.bind(b);
+            }
+        }
+    }
+
+    /// The smoke field (smoke.comp): an R16F image at `smoke_res` texels per cell, the vapour
+    /// of escaped steam.
+    pub fn smoke_view(&self) -> &Arc<ImageView> {
+        &self.smoke[0]
     }
 
     /// Wipes every stain off the solids and the back wall (Display panel).
     pub fn clean_stains(&self) {
         self.stain_at.set(None);
+        self.film_seen.set(false);
     }
 
     /// The glow field (glow.comp): an RGBA16F image at half the grid's resolution; rgb the
@@ -1254,10 +1493,22 @@ impl FluidSim {
         &self.glow
     }
 
-    /// The stain map (stain.comp): one RGBA16F texel per cell, the colour times its cover
-    /// and the cover.
-    pub fn stain_view(&self) -> &Arc<ImageView> {
-        &self.stain
+    /// The film map (film.comp): colour (rgba8) and thickness, wetness, drying time,
+    /// mobility (rgba16f), each an array of two copies; and the copy that holds it now.
+    pub fn film_views(&self) -> (&Arc<ImageView>, &Arc<ImageView>, u32) {
+        (&self.film_c, &self.film_h, self.film_parity.get())
+    }
+
+    /// Whether the film map can hold anything: a liquid that stains (or a concentrate of
+    /// one) has been in the tank since it was last cleaned. Water alone never pays for it.
+    fn film_live(&self) -> bool {
+        if self.film_seen.get() {
+            return true;
+        }
+        let stains = |r: usize| self.params.mat[r].stain > 0.0;
+        let seen = self.tank.rows.iter().any(|&r| stains(r) || (self.params.mat[r].diluent >= 0 && stains(self.params.mat[r].diluent as usize)));
+        self.film_seen.set(seen);
+        seen
     }
 
     /// The per-cell optical fields (`record_cell_optics`): an RGBA16F array image, one texel
@@ -1333,6 +1584,7 @@ impl FluidSim {
         }
         self.next_id = particles.len() as u32;
         self.resets += 1;
+        self.film_seen.set(false);
         self.tank = Tank::default();
         self.thermal = self.solids_heated;
         self.set_elastic(false);
@@ -1411,7 +1663,7 @@ impl FluidSim {
         if rows.len() == self.tank.rows.len() && thermal == self.thermal {
             return true;
         }
-        match Tank::layout(&self.params.closure(&rows), &self.params, thermal) {
+        match Tank::layout_steam(&self.params.closure(&rows), &self.params, thermal) {
             Some(t) => {
                 self.tank = t;
                 self.thermal = thermal;
@@ -1487,6 +1739,11 @@ impl FluidSim {
         p.gravity > 0.0 && self.tank.rows.iter().any(|&r| p.mat[r].diluent >= 0 && p.mat[r].grain > 0.0)
     }
 
+    /// Whether boiling makes steam in this tank (README, "Steam"): puffs may be escaping.
+    pub fn has_steam(&self) -> bool {
+        self.caps() & CAP_STEAM != 0
+    }
+
     /// Whether heat is being simulated (the tank is not isothermal).
     pub fn thermal(&self) -> bool {
         self.thermal
@@ -1498,7 +1755,7 @@ impl FluidSim {
         if self.thermal {
             return true;
         }
-        match Tank::layout(&self.tank.rows, &self.params, true) {
+        match Tank::layout_steam(&self.tank.rows, &self.params, true) {
             Some(t) => {
                 self.tank = t;
                 self.thermal = true;
@@ -1521,7 +1778,7 @@ impl FluidSim {
                 let chan = self.tank.rows.iter().position(|&x| x == r).map_or([-1; 3], |k| self.tank.chan[k]);
                 let (sin, cos) = m.contact_angle.to_radians().sin_cos();
                 let solid = if m.density_solid > 0.0 { m.density_solid } else { m.density };
-                let cvol = m.heat_capacity_vol();
+                let cvol = p.particle_heat_vol(r);
                 let mut ln_nu = (m.viscosity / (dx * dx)).max(1e-8).ln();
                 let mut rho = m.density;
                 if !self.thermal {
@@ -1636,6 +1893,10 @@ impl FluidSim {
                 p.elastic_stress_max,
                 p.elastic_step_max,
             ],
+            steam: [p.steam_condense.clamp(0.0, 1.0), p.steam_rise / dx, p.steam_life, p.steam_boil.clamp(p.steam_condense, 1.0)],
+            steam2: [p.steam_mixing, p.steam as f32, p.steam_swirl / dx, p.steam_eddy / dx],
+            // Latent heat of vaporisation of water over the heat capacity of air (1005 J/(kg K)).
+            heat3: [p.eddy_heat.max(0.0), if p.evaporation != 0 { 2.257e6 / 1005.0 } else { 0.0 }, film_res(self.grid) as f32, 0.0],
         }
     }
 
@@ -1979,6 +2240,11 @@ impl FluidSim {
         if !self.magnets.is_empty() && self.tank.rows.iter().any(|&r| p.mat[r].susceptibility > 0.0) {
             caps |= CAP_MAGNET;
         }
+        // (Steam already in the tank is carried on when `steam` is switched off: it still
+        // condenses or escapes; only no new steam forms.)
+        if self.thermal && self.tank.rows.contains(&Material::Steam.index()) {
+            caps |= CAP_STEAM;
+        }
         caps
     }
 
@@ -2252,6 +2518,23 @@ impl FluidSim {
         out
     }
 
+    /// Times the per-frame optics passes (`record_cell_optics`: cell optics, their smoothing,
+    /// glow, stains, smoke), `reps` runs in one submission, each as after a frame of 1/60 s:
+    /// ms per run (`sprout profile`).
+    pub fn profile_optics(&self, reps: u32) -> f64 {
+        let now = self.sim_time();
+        let mut b = self.gpu.builder();
+        for _ in 0..reps {
+            self.optics_key.set(None);
+            self.stain_at.set(Some((self.resets, now - 1.0 / 60.0)));
+            self.smoke_at.set(Some((self.resets, now - 1.0 / 60.0)));
+            self.record_cell_optics(&mut b, 1.0 / 30.0);
+        }
+        let t = std::time::Instant::now();
+        submit_and_wait(&self.gpu, b);
+        t.elapsed().as_secs_f64() * 1e3 / reps as f64
+    }
+
     /// Times `n` trivial dispatches (ms each), to measure the fixed cost of a dispatch.
     pub fn dispatch_floor(&mut self, n: u32, rebind: bool, fine: bool) -> f64 {
         let mut r = Recorder::new(&self.gpu);
@@ -2460,6 +2743,7 @@ impl FluidSim {
         for r in 0..MAX_MATERIALS {
             l.boiled_count[r] = w[16 + r];
             l.residue_count[r] = w[80 + r];
+            l.steam_count[r] = w[144 + r];
         }
         l
     }
@@ -2473,7 +2757,8 @@ impl FluidSim {
         b.copy_buffer(CopyBufferInfo::buffers(self.particles.clone().slice(0..self.n_slots as u64), host.clone()))
             .unwrap();
         submit_and_wait(&self.gpu, b);
-        host.read().unwrap().iter().copied().filter(|p| p.kind != KIND_DEAD).collect()
+        // (Puffs of escaped steam are only drawn: they are no longer part of the tank.)
+        host.read().unwrap().iter().copied().filter(|p| p.material().is_some()).collect()
     }
 
     /// Debug aid (`sprout lab`): face velocities (u, v, state u, state v), rigid body labels

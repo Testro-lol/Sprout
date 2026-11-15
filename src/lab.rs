@@ -158,6 +158,50 @@ pub fn run(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], settle
         }
         return;
     }
+    if let Ok(t) = std::env::var("LAB_WATER_T") {
+        // A pool of water at T (deg C) left in the air: how it cools (README, Heat,
+        // "Evaporation"). Prints the mean temperature and the heat lost to the air.
+        let t: f32 = t.parse().unwrap_or(80.0);
+        let ps: Vec<Particle> = ps.iter().map(|p| p.at_temp(t)).collect();
+        let mut w = World::with_capacity(gpu.clone(), scene, ps, 400_000);
+        apply(&mut w.sim.params);
+        w.sim.enable_heat();
+        w.sim.step_blocking(0, ToolState::default());
+        for k in 0..=(settle / 2.0) as usize {
+            let ps = w.sim.download_particles();
+            let water: Vec<&Particle> = ps.iter().filter(|p| p.material() == Some(Material::Water)).collect();
+            let st = stats(&water, &w.sim.params);
+            let l = w.sim.download_ledger();
+            println!("t {:5.1} s  water mean {:6.2} C  max {:6.2} C  to air {:.3e} J/m", 2.0 * k as f32, st.mean_t, st.max_t, l.to_air);
+            w.sim.advance_blocking(2.0, ToolState::default());
+        }
+        return;
+    }
+    if std::env::var("LAB_BUBBLES").is_ok() {
+        // Bubbles through cool water: a pool at 20 deg C (or LAB_BUBBLES_T) boiled at its
+        // floor by the Heat brush for 0.5 s; then, frame by frame for 1.25 s, the highest
+        // steam bubble above the brush and how many there are.
+        let t0: f32 = std::env::var("LAB_BUBBLES_T").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0);
+        let ps: Vec<Particle> = ps.iter().map(|p| p.at_temp(t0)).collect();
+        let mut w = World::with_capacity(gpu.clone(), scene, ps, 400_000);
+        apply(&mut w.sim.params);
+        w.sim.enable_heat();
+        w.sim.step_blocking(0, ToolState::default());
+        let at = [0.5 * gw, crate::scene::WALL + 3.0];
+        let (mut top, mut made) = (0.0f32, 0usize);
+        for f in 0..105 {
+            let tool = if f < 30 { ToolState::heat(at, 8.0, false) } else { ToolState::default() };
+            w.sim.advance_blocking(1.0 / 60.0, tool);
+            let steam: Vec<f32> = w.sim.download_particles().iter().filter(|p| p.is(Material::Steam)).map(|p| p.pos[1] - at[1]).collect();
+            made = made.max(steam.len());
+            top = steam.iter().copied().fold(top, f32::max);
+            if f % 15 == 14 {
+                println!("t {:4.2} s  steam {:5}  highest so far {:5.1} cells above the brush", (f + 1) as f32 / 60.0, steam.len(), top);
+            }
+        }
+        println!("most steam at once {made}, highest bubble {top:.1} cells");
+        return;
+    }
     if let Ok(m) = std::env::var("LAB_DROP") {
         drop_test(gpu, apply, grid, &m);
         return;

@@ -50,6 +50,7 @@ void main() {
     float f[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);    // share of each phase group
     float rg[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);   // share * density
     vec3 bg = vec3(0.0);   // share * base density of groups 1 - 3 (gbase, common.glsl)
+    float fv = 0.0;        // share of steam
     float lg[GROUPS] = float[GROUPS](0.0, 0.0, 0.0, 0.0);   // share * ln nu
     float sigma = 0.0;
     vec2 contact = vec2(0.0);
@@ -148,7 +149,8 @@ void main() {
                 }
             }
             if ((mats[r].ib.y != 0 || mats[r].temp.w > 0.0) && share > nn.x) nn = vec4(share, float(r), s, 0.0);
-            if (share > top_share) {
+            if (r == int(ROW_STEAM)) fv = share;
+            else if (share > top_share) {
                 top_share = share;
                 top_row = r;
             }
@@ -208,7 +210,7 @@ void main() {
     }
     cell[i] = vec4(phi_f, rho, mu, level);
     comp[i] = vec4(rho, f[1], fam0, phi_t);
-    if (group_sorts(1) || group_sorts(2) || group_sorts(3)) gbase[i] = vec4(bg, 0.0);
+    if (group_sorts(1) || group_sorts(2) || group_sorts(3) || has_cap(CAP_STEAM)) gbase[i] = vec4(bg, fv);
     // Only read where phase groups meet (the drift in particles.comp, pair jumps).
     if ((P.group_mask & (P.group_mask - 1u)) != 0u) {
         aux[i] = vec4(nu_c, rho_c, f[2], f[3]);

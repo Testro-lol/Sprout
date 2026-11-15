@@ -467,8 +467,12 @@ fn physics(ui: &mut egui::Ui, _state: &mut UiState, world: &mut World) {
         param_row(ui, p, "ambient_temp", "Air", 1.0, "°C");
         param_row(ui, p, "heat_rate", "Heat rate", 1.0, "×");
         param_row(ui, p, "air_cooling", "Air cooling", 1.0, "W/m²K");
+        param_row(ui, p, "contact_heat", "Liquid contact", 1.0, "W/m²K");
+        param_row(ui, p, "eddy_heat", "Eddy mixing", 1.0, "");
+        param_row(ui, p, "evaporation", "Evaporation", 1.0, "");
         param_row(ui, p, "heat_power", "Heat brush", 1.0, "K/s");
         param_row(ui, p, "rigid_viscosity", "Sets above", 1.0, "m²/s");
+        param_row(ui, p, "steam", "Steam", 1.0, "");
     });
     section(ui, "BETWEEN LIQUIDS");
     egui::Grid::new("between").num_columns(2).show(ui, |ui| {

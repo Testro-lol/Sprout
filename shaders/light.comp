@@ -1,0 +1,77 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// The light that reaches each cell of liquid from above (README, "Look"): the key light
+// falls from the top of the tank and is absorbed on its way down by every cell of liquid it
+// passes, each by its own coefficients (cell_optics.comp layers 0 and 1: what is in that
+// cell, times its occupancy), and blocked by solids. Water above honey has already taken the
+// red out of the light that reaches the honey; a pool under a shelf lies in its shadow.
+//
+// One workgroup per column of cells, a thread per stretch of it: each sums its stretch, the
+// sums are scanned across the workgroup, then each walks its stretch top down and writes
+// exp(-LIGHT_PATH x optical depth to the cell's middle) into layer 10 yzw, for every cell (air
+// too: light reaches the liquid beside it from there). optics_blur.comp spreads it sideways
+// (the sky is broad, not a point: a droplet must not shade a line down the whole pool) and
+// writes it into layer 9 rgb, times the occupancy as every layer is.
+//
+// In a scattering liquid light diffuses rather than travelling straight: it falls off at the
+// diffusion rate (optics.glsl: attenuation). LIGHT_PATH < 1: the tank is lit
+// from the front as well as from above, so light in a deep pool falls off more slowly than
+// the colour its depth would give a beam (a sandbox choice: at 1, the floor of a deep pool
+// went black).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 58, rgba16f) uniform image2DArray raw;
+
+const float LIGHT_PATH = 0.35;
+const float CELL_TAU = 0.25;
+const int MAX_STRETCH = 32;    // cells per thread (grids up to 2048 cells tall)
+
+shared vec3 s_sum[64];
+
+// Attenuation per cell of what is in cell q (occupancy-weighted coefficients).
+vec3 alpha_at(ivec2 q) {
+    vec4 k = imageLoad(raw, ivec3(q, 0)) + imageLoad(raw, ivec3(q, 1)) + imageLoad(raw, ivec3(q, 11));
+    // (optics.glsl: attenuation)
+    vec3 a = sqrt(max(k.rgb * (k.rgb + 3.0 * k.a), 0.0));
+    // An opaque liquid stops the light within a cell; above a pool it shades as a body of
+    // CELL_TAU per cell would: diffuse light also comes around it (a droplet of blood over
+    // water cast a red line to the floor).
+    return min(a, vec3(CELL_TAU));
+}
+
+void main() {
+    int x = int(gl_WorkGroupID.x);
+    int i = int(gl_LocalInvocationID.x);
+    int H = P.grid.y;
+    int stretch = min((H + 63) / 64, MAX_STRETCH);
+    // Thread 0 takes the top stretch.
+    int top = H - 1 - i * stretch;
+    vec3 sum = vec3(0.0);
+    for (int k = 0; k < stretch; k++) {
+        int y = top - k;
+        if (y < 0) break;
+        sum += alpha_at(ivec2(x, y));
+    }
+    s_sum[i] = sum;
+    barrier();
+    // Exclusive prefix over the threads above (64 at most: a plain loop).
+    vec3 tau = vec3(0.0);
+    for (int j = 0; j < i; j++) tau += s_sum[j];
+    for (int k = 0; k < stretch; k++) {
+        int y = top - k;
+        if (y < 0) break;
+        ivec2 q = ivec2(x, y);
+        vec3 a = alpha_at(q);
+        vec4 l10 = imageLoad(raw, ivec3(q, 10));
+        // Neutral: only how much light is left, not its colour. (Coloured, the blue light
+        // under a deep pool turned syrup or blood in it green and black: each liquid's hue
+        // comes from its own absorption along the view, the depth only darkens it.)
+        float tl = dot(tau + 0.5 * a, vec3(0.3, 0.45, 0.25));
+        vec3 il = vec3(exp(-LIGHT_PATH * tl));
+        imageStore(raw, ivec3(q, 10), vec4(l10.x, il));
+        tau += a;
+    }
+}

@@ -1,0 +1,352 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "optics.glsl"
+
+// The film map (README, "Stains and runs"): what staining liquids (blood, ink, mud,
+// chocolate ...) leave on the back wall of the tank and on the faces of solids, FILM_RES
+// texels per cell, kept for as long as the tank runs. Once a frame:
+//
+//   - Liquid lays a coat where it lies against the back wall or a solid (towards a
+//     thickness of COAT x its stain, 0.3 mm for blood), and airborne drops leave spatter
+//     where they fly and where they hit a solid (particles.comp lays those into film_in /
+//     film_col, at the drop's own position and colour).
+//   - The film runs down. A film thicker than what its surface pins in place (PIN, which
+//     varies from column to column as a real wall's roughness does) drains under gravity as
+//     a thin viscous film, at the lubrication speed u = g h^2 / (3 nu) of a film h thick
+//     (Huppert 1982): a thin coat creeps, a thick run is fast, and the thick front of a run
+//     gathers into a bead that outruns the coat behind it, which is how a smear turns into
+//     drips. A run stops at the bottom of a solid's face or at the top of a solid it runs
+//     onto (the film on the back wall and on a solid's face never mix).
+//   - It dries, each liquid in its own drying time: a dry film no longer runs, and turns
+//     darker and browner (blood oxidising). Liquid that does not stain washes it off
+//     (faster where it moves), and wets it again: a dry stain under running water runs.
+//
+// Two copies of each image (layers 0, 1): this frame reads FP.parity and writes the other.
+// Each 16 x 16 tile keeps its state per copy (empty, dry, wet; ftile): a tile with nothing
+// staining near it, nothing laid down, and no film or only dry film that no liquid touches,
+// costs one read per cell, or nothing at all once both copies hold the same there. Dried
+// stains cost nothing until something reaches them again.
+//
+// film_c (rgba8):   colour of the film, sRGB; unused
+// film_h (rgba16f): thickness (FILM_UNIT, 0.1 mm), wetness 0..1, drying time (s), mobility
+//                   (texels / s per unit^2 of thickness, at wetness 1)
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(constant_id = 2) const uint FILM_RES_U = 4u;
+const int R = int(FILM_RES_U);
+
+layout(push_constant) uniform FPC {
+    float dt;         // simulated time since the last update, s
+    float wall_rate;  // 1/s: how fast liquid with stain 1 coats a solid it lies against
+    float back_rate;  // 1/s: the same against the back wall
+    float wash_rate;  // 1/s: how fast liquid that does not stain washes a film off, at rest
+    uint parity;      // the copy holding the film now
+    float mob_scale;  // g FILM_UNIT^2 / 3 / (texel size), m^2/s x texels/s per unit^2
+} FP;
+
+layout(set = 0, binding = 58, rgba16f) uniform readonly image2DArray raw;
+layout(set = 0, binding = 70, rgba8) uniform image2DArray film_c;
+layout(set = 0, binding = 71, rgba16f) uniform image2DArray film_h;
+// What drops laid down since the last update: thickness per texel (x FILM_FIX), and per
+// cell its colour sum (sRGB x thickness x FILM_FIX, then the thickness).
+layout(std430, set = 0, binding = 72) buffer FilmInBuf { uint film_in[]; };
+layout(std430, set = 0, binding = 73) buffer FilmColBuf { uint film_col[]; };
+// Per tile: for each copy, its state there (TILE_*); 1 if drops were laid into the tile since
+// the last update (particles.comp); 1 if the two copies hold the same there.
+layout(std430, set = 0, binding = 74) buffer FilmTileBuf { uint ftile[]; };
+// The tiles that need work this frame (film_tiles.comp): after the indirect dispatch's three
+// words, tile | state << 28.
+layout(std430, set = 0, binding = 75) readonly buffer FilmListBuf { uint flist[]; };
+
+const float FILM_FIX = 256.0;   // particles.comp: film_spatter
+const float COAT = 9.0;         // units of 0.1 mm: the coat liquid with stain 1 leaves on a solid
+const float BACK_COAT = 5.0;    // ... and on the back wall
+const float PIN = 6.0;          // units: thickness a surface holds without running
+const float LATERAL = 0.04;     // share exchanged sideways per update by a running film
+const float H_MAX = 40.0;       // units (4 mm): no film is thicker
+
+shared uint s_flag;
+shared ivec2 s_tile;  // this workgroup's tile (in tiles)
+
+// The tile's cells with a halo of HALO (a solid's face takes its coat from up to two cells
+// out), read once per workgroup: occupancy, stain, speed and drying time (as the cell optics
+// hold them, times occupancy); absorption and scattering (layers 0 + 1); kinematic viscosity
+// (m^2/s).
+const int CT = 16 / R;
+const int HALO = 2;
+const int SW = CT + 2 * HALO;
+shared vec4 s_a[SW * SW];
+shared vec4 s_k[SW * SW];
+shared float s_nu[SW * SW];
+
+int sidx(ivec2 q) {
+    ivec2 l = clamp(q - (s_tile * CT - HALO), ivec2(0), ivec2(SW - 1));
+    return l.y * SW + l.x;
+}
+
+const uint TILE_EMPTY = 0u, TILE_DRY = 1u, TILE_WET = 2u;
+const float STAIN_MIN = 0.15;  // stain share below which liquid lays no coat (diluted: too faint to see); cell_optics.comp
+const float WET_MIN = 0.02;    // wetness below which a film counts as dry (it no longer runs)
+
+float hash1(float x) { return fract(sin(x * 127.1 + 311.7) * 43758.5453); }
+
+// Thickness a surface pins at texel column `tx` (a smooth variation over a few texels, as
+// the roughness of a real wall: runs start where it holds least).
+float pin_at(int tx) {
+    float x = float(tx) / 2.5;
+    float i = floor(x), f = x - i;
+    f = f * f * (3.0 - 2.0 * f);
+    return PIN * (0.45 + 1.1 * mix(hash1(i), hash1(i + 1.0), f));
+}
+
+// Signed distance to the solids at a world position (cells), bilinear in the node field.
+float sdf_at(vec2 x) {
+    vec2 g = clamp(x, vec2(0.0), vec2(P.grid) - 0.001);
+    ivec2 i = ivec2(g);
+    vec2 f = g - vec2(i);
+    int w1 = P.grid.x + 1;
+    int k = i.y * w1 + i.x;
+    return mix(mix(sdf[k], sdf[k + 1], f.x), mix(sdf[k + w1], sdf[k + w1 + 1], f.x), f.y);
+}
+
+struct Film { vec3 c; float h, w, dry, mob; };
+
+Film load(ivec2 t, int layer) {
+    vec4 a = imageLoad(film_c, ivec3(t, layer));
+    vec4 b = imageLoad(film_h, ivec3(t, layer));
+    return Film(a.rgb, b.x, b.y, b.z, b.w);
+}
+
+// Share of a film that leaves a texel downwards in this update.
+float outflow(Film f, int tx) {
+    float ex = f.h - pin_at(tx);
+    if (ex <= 0.0 || f.w <= 0.0) return 0.0;
+    float u = f.mob * f.w * f.w * f.h * f.h;       // texels / s
+    return min(u * FP.dt, 0.45) * ex / f.h;
+}
+
+// The full update of texel t (in a tile that needs it): what it holds next, in copy `nxt`;
+// returns its state (TILE_*).
+uint update(ivec2 t, ivec2 dimF, int cur, int nxt) {
+    ivec2 c = t / R;
+    vec4 fx = vec4(0.0);
+    float occ = s_a[sidx(c)].x;
+    Film me = load(t, cur);
+    uint fin = film_in[t.y * dimF.x + t.x];
+    // The drops' colour, from their cell's sums (cleared at the end of the pass).
+    vec4 drop_col = vec4(0.0);
+    if (fin != 0u) {
+        uint ci = uint(cidx(c)) * 4u;
+        drop_col = vec4(film_col[ci], film_col[ci + 1u], film_col[ci + 2u], film_col[ci + 3u]);
+    }
+    vec2 x = (vec2(t) + 0.5) / float(R);
+    float sd = sdf_at(x);
+    bool solid_here = sd < 0.0;
+
+    // ---- running down -------------------------------------------------------------------
+    // Out of this texel into the one below (unless that is the other surface or the floor),
+    // in from the one above (unless it is), and a little to and from each side while wet.
+    // (Whether a neighbour lies on the same surface needs the distance field only within a
+    // texel or so of a solid's outline; each neighbour's colour only if film comes from it.)
+    float inv_r = 1.0 / float(R);
+    bool near_edge = abs(sd) < 0.75;
+    float hn = me.h;
+    vec3 cn = me.c * me.h;
+    float wn = me.w * me.h, dn = me.dry * me.h, mn = me.mob * me.h;
+    if (me.h > 0.0 && t.y > 0 && (!near_edge || (sdf_at(x - vec2(0.0, inv_r)) < 0.0) == solid_here)) {
+        float o = outflow(me, t.x) * me.h;
+        hn -= o;
+        cn -= me.c * o; wn -= me.w * o; dn -= me.dry * o; mn -= me.mob * o;
+    }
+    if (t.y + 1 < dimF.y) {
+        vec4 ub = imageLoad(film_h, ivec3(t + ivec2(0, 1), cur));
+        if (ub.x > 0.0 && (!near_edge || (sdf_at(x + vec2(0.0, inv_r)) < 0.0) == solid_here)) {
+            Film up = Film(vec3(0.0), ub.x, ub.y, ub.z, ub.w);
+            float i = outflow(up, t.x) * up.h;
+            if (i > 0.0) {
+                up.c = imageLoad(film_c, ivec3(t + ivec2(0, 1), cur)).rgb;
+                hn += i;
+                cn += up.c * i; wn += up.w * i; dn += up.dry * i; mn += up.mob * i;
+            }
+        }
+    }
+    for (int side = -1; side <= 1; side += 2) {
+        ivec2 ts = t + ivec2(side, 0);
+        if (ts.x < 0 || ts.x >= dimF.x) continue;
+        vec4 nb = imageLoad(film_h, ivec3(ts, cur));
+        // The same pairwise exchange seen from either side (conserves the film).
+        float k = LATERAL * min(me.w, nb.y) * step(PIN * 0.5, max(me.h, nb.x));
+        if (k <= 0.0 || (near_edge && (sdf_at(x + vec2(float(side) * inv_r, 0.0)) < 0.0) != solid_here)) continue;
+        float q = k * (nb.x - me.h);
+        Film src = me;
+        if (q > 0.0) src = Film(imageLoad(film_c, ivec3(ts, cur)).rgb, nb.x, nb.y, nb.z, nb.w);
+        hn += q;
+        cn += src.c * q; wn += src.w * q; dn += src.dry * q; mn += src.mob * q;
+    }
+    Film f = me;
+    f.h = max(hn, 0.0);
+    if (f.h > 1e-4) {
+        f.c = clamp(cn / hn, 0.0, 1.0);
+        f.w = clamp(wn / hn, 0.0, 1.0);
+        f.dry = max(dn / hn, 0.0);
+        f.mob = max(mn / hn, 0.0);
+    }
+
+    // ---- what the liquid against it lays down or washes off -----------------------------
+    // On the back wall: the liquid in this cell. On a solid's face (within a cell and a half
+    // of its edge): the liquid just outside it.
+    ivec2 lc = c;
+    float rate = FP.back_rate;
+    if (solid_here && sd <= -1.5) rate = 0.0;
+    else if (solid_here) {
+        vec2 g = vec2(sdf_at(x + vec2(0.25, 0.0)) - sdf_at(x - vec2(0.25, 0.0)), sdf_at(x + vec2(0.0, 0.25)) - sdf_at(x - vec2(0.0, 0.25)));
+        vec2 n = g / max(length(g), 1e-5);
+        lc = ivec2(floor(x + n * (0.7 - sd)));
+        lc = clamp(lc, ivec2(0), P.grid - 1);
+        rate = sd > -1.5 ? FP.wall_rate * (1.0 - smoothstep(0.6, 1.5, -sd)) : 0.0;
+        occ = s_a[sidx(lc)].x;
+    }
+    // The occupancy, stain and speed of the liquid there, bilinear between cell centres, so
+    // that a coat's edge is smooth and not a staircase of cells.
+    vec4 la = vec4(0.0);
+    if (rate > 0.0) {
+        vec2 at = solid_here ? vec2(lc) + 0.5 : x;
+        vec2 g = clamp(at - 0.5, vec2(0.0), vec2(P.grid) - 1.001);
+        ivec2 i0 = ivec2(g);
+        vec2 fr = g - vec2(i0);
+        for (int k = 0; k < 4; k++) {
+            float wq = ((k & 1) == 0 ? 1.0 - fr.x : fr.x) * ((k >> 1) == 0 ? 1.0 - fr.y : fr.y);
+            la += wq * s_a[sidx(min(i0 + ivec2(k & 1, k >> 1), P.grid - 1))];
+        }
+        occ = la.x;
+    }
+    if (occ > 0.02 && rate > 0.0) {
+        float sk = clamp(la.y / occ, 0.0, 1.0);
+        float o = sqrt(min(occ, 1.0));
+        if (sk > STAIN_MIN) {
+            // The coat: towards COAT x stain, in the liquid's own colour (a film of it over a
+            // pale wall) and drying time, mobile as its viscosity lets it.
+            int li = sidx(lc);
+            vec4 k = s_k[li] / max(s_a[li].x, 1e-4);
+            vec3 col = film_colour(k, 0.35);
+            float target = (solid_here ? COAT : BACK_COAT) * sk;
+            // (The back wall takes a coat from liquid resting against it, a pool, not from a
+            // stream or a splash going past: in the tank the slice stands for, those barely
+            // touch the back.)
+            float spd = la.z / occ;
+            float rest = solid_here ? 1.0 : 1.0 - smoothstep(0.04, 0.25, spd);
+            // (Liquid just leaving the pour's or jet's nozzle is slow too, but not a pool.)
+            if (P.tool_mode == 4 && distance(P.tool_pos, x) < 2.0 * P.tool_radius + 4.0) rest = 0.0;
+            float add = max(target - f.h, 0.0) * (1.0 - exp(-FP.dt * rate * sk * o * rest));
+            float dry = la.w / occ;
+            // Its mobility from the viscosity of the liquid there (lubrication speed).
+            float mob = FP.mob_scale / s_nu[li];
+            float hn2 = f.h + add;
+            if (add > 0.0) {
+                f.c = (f.c * f.h + col * add) / hn2;
+                f.mob = (f.mob * f.h + mob * add) / hn2;
+                f.dry = (f.dry * f.h + dry * add) / hn2;
+                f.h = hn2;
+            }
+            // Liquid lying on it keeps it wet.
+            f.w = max(f.w, mix(f.w, 1.0, 1.0 - exp(-FP.dt * 8.0 * o)));
+            f.c = mix(f.c, col, 1.0 - exp(-FP.dt * rate * sk * o * 0.5));
+            f.dry = max(f.dry, dry);
+        } else {
+            // Liquid that does not stain washes it off, faster where it moves, and wets it.
+            float speed = la.z / occ;
+            f.h *= exp(-FP.dt * FP.wash_rate * o * (1.0 - sk) * (0.25 + 2.0 * speed));
+            f.w = max(f.w, min(occ, 1.0) * 0.8);
+            f.dry = max(f.dry, 5.0);
+        }
+    }
+
+    // ---- drops laid down since the last update ------------------------------------------
+    if (fin != 0u) {
+        float add = float(fin) / FILM_FIX;
+        vec3 col = drop_col.w > 0.0 ? drop_col.rgb / drop_col.w : vec3(0.4, 0.02, 0.03);
+        float hn2 = f.h + add;
+        f.c = (f.c * f.h + col * add) / hn2;
+        f.w = (f.w * f.h + add) / hn2;
+        // A fresh drop is as mobile as the film it lands in, or as blood if none.
+        float mob = f.h > 0.1 ? f.mob : FP.mob_scale / 5.3e-5;
+        f.mob = (f.mob * f.h + mob * add) / hn2;
+        f.dry = (f.dry * f.h + 45.0 * add) / hn2;
+        f.h = hn2;
+        film_in[t.y * dimF.x + t.x] = 0u;
+    }
+
+    // ---- drying ----------------------------------------------------------------------------
+    f.w *= exp(-FP.dt / max(f.dry, 0.2));
+    f.h = min(f.h, H_MAX);
+    if (f.w < WET_MIN) f.w = 0.0;
+    if (f.h < 0.02) f = Film(vec3(0.0), 0.0, 0.0, 0.0, 0.0);
+    imageStore(film_c, ivec3(t, nxt), vec4(f.c, 1.0));
+    imageStore(film_h, ivec3(t, nxt), vec4(f.h, f.w, f.dry, f.mob));
+    return f.h <= 0.0 ? TILE_EMPTY : f.w > 0.0 ? TILE_WET : TILE_DRY;
+}
+
+void main() {
+    ivec2 dimF = P.grid * R;
+    int tiles_x = (dimF.x + 15) / 16;
+    uint ntiles = uint(tiles_x * ((dimF.y + 15) / 16));
+    uint entry = flist[3u + gl_WorkGroupID.x];
+    uint tile = entry & 0x0fffffffu, state = entry >> 28;
+    ivec2 tc = ivec2(int(tile) % tiles_x, int(tile) / tiles_x);
+    ivec2 t = tc * 16 + ivec2(gl_LocalInvocationID.xy);
+    int cur = int(FP.parity), nxt = 1 - cur;
+    bool inside = all(lessThan(t, dimF));
+    if (state == 2u) {
+        if (inside) {
+            imageStore(film_c, ivec3(t, nxt), imageLoad(film_c, ivec3(t, cur)));
+            imageStore(film_h, ivec3(t, nxt), imageLoad(film_h, ivec3(t, cur)));
+        }
+        return;
+    }
+    if (state == 1u) {
+        if (inside) {
+            imageStore(film_c, ivec3(t, nxt), vec4(0.0));
+            imageStore(film_h, ivec3(t, nxt), vec4(0.0));
+        }
+        return;
+    }
+    // The full update (state 3, the same for the whole workgroup: every thread reaches the
+    // barriers). The tile's cells and their halo into shared memory first.
+    if (gl_LocalInvocationIndex == 0u) {
+        s_flag = TILE_EMPTY;
+        s_tile = tc;
+    }
+    barrier();
+    for (int k = int(gl_LocalInvocationIndex); k < SW * SW; k += 256) {
+        ivec2 q = tc * CT - HALO + ivec2(k % SW, k / SW);
+        vec4 a = vec4(0.0), kk = vec4(0.0);
+        float nu = 1e-6;
+        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, P.grid))) {
+            float o4 = imageLoad(raw, ivec3(q, 4)).w;
+            if (o4 > 0.005) {
+                a = vec4(o4, imageLoad(raw, ivec3(q, 8)).x, imageLoad(raw, ivec3(q, 3)).w, imageLoad(raw, ivec3(q, 10)).x);
+                kk = imageLoad(raw, ivec3(q, 0)) + imageLoad(raw, ivec3(q, 1)) + imageLoad(raw, ivec3(q, 11));
+                vec4 cl = cell[cidx(q)];
+                nu = max(cl.z / max(cl.y, 1e-6), 1e-8) * P.misc.z * P.misc.z;
+            }
+        }
+        s_a[k] = a;
+        s_k[k] = kk;
+        s_nu[k] = nu;
+    }
+    barrier();
+    if (inside) atomicMax(s_flag, update(t, dimF, cur, nxt));
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) ftile[uint(nxt) * ntiles + tile] = s_flag;
+    // Every texel has read its cell's drop colour sums: the cell's first texel clears them
+    // (a cell's texels all lie in one tile; drops only ever land in tiles that get the full
+    // update, film_tiles.comp).
+    if (inside && all(equal(t % R, ivec2(0)))) {
+        uint ci = uint(cidx(t / R)) * 4u;
+        if (film_col[ci + 3u] != 0u) {
+            film_col[ci] = 0u; film_col[ci + 1u] = 0u; film_col[ci + 2u] = 0u; film_col[ci + 3u] = 0u;
+        }
+    }
+}

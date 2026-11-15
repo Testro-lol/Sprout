@@ -191,7 +191,6 @@ fn liquid_to_json(c: &CustomLiquid, ids: &[String]) -> Value {
     props.insert("residue".into(), row_ref(c.props.residue, ids));
     props.insert("color".into(), json!(c.props.color));
     props.insert("color_solid".into(), json!(c.props.color_solid));
-    props.insert("color_mid".into(), json!(c.props.color_mid));
     json!({ "id": c.id, "name": c.name, "base": c.base, "props": Value::Object(props) })
 }
 
@@ -273,7 +272,8 @@ pub fn parse(text: &str) -> (Vec<CustomLiquid>, Vec<String>) {
                 None => warnings.push(format!("\"{name}\": {field} missing or not three numbers")),
             }
         }
-        props.color_mid = colour(obj.and_then(|o| o.get("color_mid"))).unwrap_or([-1.0; 3]);
+        // (`color_mid`, the colour of a half-diluted concentrate, was dropped on 2026-11-14:
+        // mixtures now take their colour from absorption, and files that have it ignore it.)
         let reference = |key: &str| obj.and_then(|o| o.get(key)).and_then(Value::as_str).map(str::to_string);
         refs.push((reference("diluent"), reference("residue")));
         out.push(CustomLiquid { id, name, base, props, deleted: false });

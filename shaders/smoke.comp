@@ -1,0 +1,173 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "air.glsl"
+
+// The smoke field (README, "Steam"): the vapour of escaped steam, SMOKE_RES texels per cell,
+// carried by the air (air.glsl: air_velocity) once a frame. The puffs lay their vapour into
+// it (smoke_in); the field, not the puffs, is drawn (composite.frag), so the plume is one
+// continuous body that the eddies stretch into wisps and curl.
+//
+// Advection is MacCormack (Selle et al. 2008) with the limiter on the four texels the
+// back-traced point lies between: semi-Lagrangian alone blurs a wisp away within a second.
+//   mode 0: B = A traced back by dt
+//   mode 1: C = B + (A - B traced forward) / 2, limited; spread a little; plus what the
+//           puffs laid down, minus what condensed in liquid, was erased, or mixed away
+// The caller copies C to A and clears smoke_in.
+//
+// Cost (it is memory bound): one 16-bit channel per image; the air's velocity is worked out
+// once per cell corner into shared memory and interpolated to the texels; a workgroup with
+// no vapour within reach (most of the tank) writes nothing but zeros. The caller keeps each
+// step's displacement under REACH texels.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Texels per cell (mod.rs: smoke_res): 2, or 1 on fine grids.
+layout(constant_id = 1) const uint SMOKE_RES_U = 2u;
+const int SMOKE_RES = int(SMOKE_RES_U);
+
+layout(push_constant) uniform SPC {
+    float dt;    // simulated time of this step, s
+    float fade;  // time constant of the vapour mixing away into the air, s
+    uint mode;
+} SP;
+
+layout(set = 0, binding = 66, r16f) uniform image2D smoke_a;
+layout(set = 0, binding = 67, r16f) uniform image2D smoke_b;
+layout(set = 0, binding = 68, r16f) uniform writeonly image2D smoke_c;
+
+const float SMOKE_SPREAD = 1.5;  // cells^2 / s: how fast the vapour spreads into the air
+const int REACH = 8;             // texels: longest trace of one step (render.rs: SMOKE_STEP)
+const int TILE = 16;             // texels per workgroup side
+const int CT = TILE / SMOKE_RES; // cells per workgroup side
+const int IH = 3;                // cells: reach of the billow Gaussian (smoke_in)
+
+shared uint s_busy;     // any vapour within reach of the tile (in A)
+shared uint s_inj;      // anything laid down within reach of the tile
+shared vec2 s_vel[CT + 1][CT + 1];
+shared float s_occ[CT + 1][CT + 1];
+shared uint s_in[CT + 2 * IH][CT + 2 * IH];
+
+// Bilinear in texel space (centres at integer + 0.5), clamped to the field; the smallest and
+// largest of the four texels in `lim`.
+float fetch(bool from_b, vec2 g, out vec2 lim) {
+    ivec2 dim = P.grid * SMOKE_RES;
+    vec2 q = clamp(g - 0.5, vec2(0.0), vec2(dim) - 1.001);
+    ivec2 i = ivec2(q);
+    vec2 f = q - vec2(i);
+    float v00, v10, v01, v11;
+    if (from_b) {
+        v00 = imageLoad(smoke_b, i).r; v10 = imageLoad(smoke_b, i + ivec2(1, 0)).r;
+        v01 = imageLoad(smoke_b, i + ivec2(0, 1)).r; v11 = imageLoad(smoke_b, i + ivec2(1, 1)).r;
+    } else {
+        v00 = imageLoad(smoke_a, i).r; v10 = imageLoad(smoke_a, i + ivec2(1, 0)).r;
+        v01 = imageLoad(smoke_a, i + ivec2(0, 1)).r; v11 = imageLoad(smoke_a, i + ivec2(1, 1)).r;
+    }
+    lim = vec2(min(min(v00, v10), min(v01, v11)), max(max(v00, v10), max(v01, v11)));
+    return mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
+}
+
+void main() {
+    ivec2 dim = P.grid * SMOKE_RES;
+    ivec2 o = ivec2(gl_WorkGroupID.xy) * TILE;
+    uint li = gl_LocalInvocationIndex;
+    ivec2 c = o + ivec2(gl_LocalInvocationID.xy);
+    if (li == 0u) { s_busy = 0u; s_inj = 0u; }
+    barrier();
+
+    // Is there vapour within reach? (A over the tile and REACH texels around: 4 per thread.)
+    {
+        const int W = TILE + 2 * REACH;
+        bool any_v = false;
+        for (uint k = li; k < uint(W * W); k += 256u) {
+            ivec2 t = clamp(o - REACH + ivec2(int(k) % W, int(k) / W), ivec2(0), dim - 1);
+            any_v = any_v || imageLoad(smoke_a, t).r > 0.0;
+        }
+        if (any_v) atomicOr(s_busy, 1u);
+    }
+    // What was laid down in the cells within the billow's reach (mode 1).
+    ivec2 oc = o / SMOKE_RES - IH;
+    if (SP.mode == 1u) {
+        const int W = CT + 2 * IH;
+        for (uint k = li; k < uint(W * W); k += 256u) {
+            ivec2 l = ivec2(int(k) % W, int(k) / W);
+            ivec2 q = oc + l;
+            uint v = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, P.grid)) ? smoke_in[cidx(q)] : 0u;
+            s_in[l.y][l.x] = v;
+            if (v != 0u) atomicOr(s_inj, 1u);
+        }
+    }
+    barrier();
+    bool busy = s_busy != 0u;
+    if (busy) {
+        // The air at the cell corners of the tile.
+        ivec2 o_cell = o / SMOKE_RES;
+        if (li < uint((CT + 1) * (CT + 1))) {
+            ivec2 l = ivec2(int(li) % (CT + 1), int(li) / (CT + 1));
+            vec2 x = clamp(vec2(o_cell + l), vec2(1.0), vec2(P.grid) - 1.0);
+            float occ;
+            s_vel[l.y][l.x] = air_velocity(x, 0.0, occ);
+            s_occ[l.y][l.x] = occ;
+        }
+    }
+    barrier();
+    if (any(greaterThanEqual(c, dim))) return;
+    vec2 g = vec2(c) + 0.5;
+    vec2 x = g / float(SMOKE_RES);
+    vec2 trace = vec2(0.0);
+    float occ = 0.0;
+    if (busy) {
+        vec2 lc = x - vec2(o / SMOKE_RES);  // in the tile's cells, 0 - CT
+        ivec2 i = min(ivec2(lc), ivec2(CT - 1));
+        vec2 f = lc - vec2(i);
+        vec2 v = mix(mix(s_vel[i.y][i.x], s_vel[i.y][i.x + 1], f.x), mix(s_vel[i.y + 1][i.x], s_vel[i.y + 1][i.x + 1], f.x), f.y);
+        occ = mix(mix(s_occ[i.y][i.x], s_occ[i.y][i.x + 1], f.x), mix(s_occ[i.y + 1][i.x], s_occ[i.y + 1][i.x + 1], f.x), f.y);
+        trace = clamp(v * SP.dt * float(SMOKE_RES), vec2(-REACH), vec2(REACH));
+    }
+
+    if (SP.mode == 0u) {
+        vec2 lim;
+        imageStore(smoke_b, c, vec4(busy ? fetch(false, g - trace, lim) : 0.0));
+        return;
+    }
+
+    float d = 0.0;
+    if (busy) {
+        float pred = imageLoad(smoke_b, c).r;
+        vec2 lim, unused;
+        fetch(false, g - trace, lim);
+        float there = fetch(true, g + trace, unused);
+        float now = imageLoad(smoke_a, c).r;
+        d = clamp(pred + 0.5 * (now - there), lim.x, lim.y);
+        // The vapour spreads as it mixes into the air (turbulent diffusion below the eddies
+        // the flow resolves): wisps soften as they rise instead of staying threads.
+        float nb = imageLoad(smoke_b, clamp(c + ivec2(1, 0), ivec2(0), dim - 1)).r + imageLoad(smoke_b, clamp(c - ivec2(1, 0), ivec2(0), dim - 1)).r
+                 + imageLoad(smoke_b, clamp(c + ivec2(0, 1), ivec2(0), dim - 1)).r + imageLoad(smoke_b, clamp(c - ivec2(0, 1), ivec2(0), dim - 1)).r;
+        float kd = min(SMOKE_SPREAD * SP.dt * float(SMOKE_RES * SMOKE_RES), 0.2);
+        d += kd * (nb - 4.0 * pred);
+    }
+    if (s_inj != 0u) {
+        // What the puffs laid down in the cells around, spread over the billow's Gaussian
+        // (normalised to one per cell^2, so the texel holds vapour per cell^2).
+        ivec2 cc = ivec2(floor(x)) - oc;
+        const float inv2s2 = 0.5 / (SMOKE_PUFF * SMOKE_PUFF);
+        float add = 0.0;
+        for (int j = -IH; j <= IH; j++) {
+            for (int i = -IH; i <= IH; i++) {
+                uint in_q = s_in[cc.y + j][cc.x + i];
+                if (in_q == 0u) continue;
+                vec2 r = x - (vec2(cc + oc + ivec2(i, j)) + 0.5);
+                add += float(in_q) * exp(-dot(r, r) * inv2s2);
+            }
+        }
+        d += add / SMOKE_SCALE * inv2s2 / 3.14159265;
+        if (!busy) occ = sample_occ(x);
+    }
+    d *= exp(-SP.dt / max(SP.fade, 1e-3)) * (1.0 - smoothstep(0.3, 0.7, occ));
+    if (P.tool_mode == 2 && distance(P.tool_pos, x) < P.tool_radius) d = 0.0;
+    // None inside solids (the billow's Gaussian and the spreading reach into them).
+    vec2 unused_n;
+    if (d > 0.0 && sample_sdf(x, unused_n) < 0.0) d = 0.0;
+    // Below what any picture shows: 0, so that the tile goes quiet again.
+    imageStore(smoke_c, c, vec4(d > 1e-3 ? d : 0.0, 0.0, 0.0, 0.0));
+}

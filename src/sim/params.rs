@@ -22,6 +22,13 @@ pub const KIND_DEAD: u32 = 0;
 /// Set on particles handed to `FluidSim::spawn` until their first substep: they did not
 /// scatter to the grid yet and take no share of its heat exchange (particles.comp).
 pub const KIND_FRESH: u32 = 0x10000;
+/// A puff of steam that escaped from the liquid (particles.comp, README "Steam"): drawn,
+/// not simulated. Its low byte is 0, so it has no material and counts nowhere; `s` holds its
+/// age, s.
+pub const KIND_PUFF: u32 = 0x40000;
+/// Of steam: the table row + 1 of the liquid it boiled from, in bits 8 - 15 (particles.comp);
+/// it condenses back into that liquid, at the concentration `s` keeps.
+pub const KIND_SRC: u32 = 0xff00;
 const KIND_MAT_MASK: u32 = 0xff;
 
 /// Must match `struct Particle` in `shaders/common.glsl` (std430, 48 bytes).
@@ -89,9 +96,14 @@ pub const SPAWN_S: f32 = -1.0;
 
 impl Particle {
 
-    /// Its material, or `None` for a dead slot.
+    /// Its material, or `None` for a dead slot or a puff of steam.
     pub fn material(&self) -> Option<Material> {
-        (self.kind != KIND_DEAD).then(|| Material(((self.kind & KIND_MAT_MASK) - 1) as u8))
+        (self.kind != KIND_DEAD && self.kind & KIND_MAT_MASK != 0).then(|| Material(((self.kind & KIND_MAT_MASK) - 1) as u8))
+    }
+
+    /// A puff of escaped steam (`KIND_PUFF`): drawn, but no longer part of the tank.
+    pub fn is_puff(&self) -> bool {
+        self.kind & KIND_PUFF != 0 && self.kind & KIND_MAT_MASK == 0
     }
 
     pub fn is(&self, m: Material) -> bool {
@@ -160,8 +172,25 @@ pub struct SimParams {
     /// boundary layer of convection and boiling at the interface, far thinner than a cell,
     /// which conduction across half a cell on each side cannot see (README, "Heat").
     /// Natural convection in water 100 - 1000, film boiling 200 - 500, nucleate boiling
-    /// 10⁴ and more. 0 = conduction only.
+    /// 10⁴ and more. 0 = conduction only. The default, 3000, is for subcooled water against a
+    /// melt: water 80 K below its boiling point cannot keep a stable vapour film, which
+    /// collapses into transition boiling (10³ - 10⁴; quenching experiments on molten
+    /// material in water). Until 2026-11-14 it was 300 (stable film boiling): lava under a
+    /// pool stayed molten for minutes and the pool hardly warmed (README, "Heat").
     pub contact_heat: f32,
+    /// Sub-grid mixing of heat in moving liquid (README, "Heat"): the Smagorinsky constant
+    /// C_s of an eddy diffusivity (C_s dx)² |S| / Pr_t (Pr_t = 0.85) added to the
+    /// conductivity between cells of the same liquid, |S| the resolved strain rate between
+    /// them. Eddies smaller than a cell mix heat in stirred or convecting water orders of
+    /// magnitude faster than conduction (water: 1.4e-7 m²/s; a 1 cm cell took 12 minutes to
+    /// even out). Lilly's value 0.17; 0 = conduction only.
+    pub eddy_heat: f32,
+    /// 1: the free surface of an aqueous liquid warmer than the air loses heat by
+    /// evaporation as well as by the film coefficient, and the vapour shows as mist over it
+    /// (README, "Heat"). By the Lewis analogy the mass transfer goes with `air_cooling`:
+    /// q = h / c_p,air x L x (Y_sat(T) - Y_sat(T_air)), Y the vapour's mass fraction. At 80 °C
+    /// that is ~8 kW/m², ten times the film's 600 W/m². 0 = off.
+    pub evaporation: u32,
     /// Kinematic viscosity at which liquid stops flowing and moves as a rigid body, m²/s
     /// (README, "Solidification" and "Rheology"): the cap of the viscosity solve. Frozen
     /// liquid, glass or lava cooled past it, unyielded yield-stress liquid and jammed
@@ -179,6 +208,36 @@ pub struct SimParams {
     pub rigid_friction: f32,
     /// Heat / Cool brush: kelvin per second for water at the centre of the brush.
     pub heat_power: f32,
+    /// 1: aqueous liquid that boils turns into steam (README, "Steam"): bubbles that rise
+    /// through the liquid, condense where it is colder, and escape at the free surface as
+    /// puffs. 0: boiled liquid leaves the tank at once, wherever it is.
+    pub steam: u32,
+    /// Vapour quality (the share of its latent heat of vaporisation a parcel holds, 0 - 1) at
+    /// which boiling water becomes a bubble of steam, and below which steam condenses back
+    /// into water. Even 1 % quality is ~94 % vapour by volume at 1 atm, so a parcel past a
+    /// few per cent is a bubble; the gap between the two is a hysteresis, so a parcel does
+    /// not flip between them every substep at the boiling point.
+    pub steam_boil: f32,
+    pub steam_condense: f32,
+    /// Rate at which the particles of a cell that holds steam even out their temperatures,
+    /// 1/s (the exchange inside a cell, README "Heat"): far faster than conduction through a
+    /// parcel the size of a particle, so that bubbles condense in colder water. 30 until the
+    /// third round of 2026-11-14, when bubbles popped within a cell or two of leaving hot water
+    /// (reported); at 3 they rise about twice as far through cool water (`LAB_BUBBLES=1 sprout
+    /// lab`: 23 -> ~45 cells through water at 20 deg C) and most still condense before the
+    /// surface of a 30-cell pool (`validate thermal`). (A sandbox choice: a bubble here holds
+    /// one parcel's vapour, not its real volume.)
+    pub steam_mixing: f32,
+    /// Speed at which escaped steam rises, m/s (a warm plume: 0.2 - 1), and how long it
+    /// lasts, s: puffs lay vapour into the smoke field for this long, and the vapour mixes
+    /// away into the air with 0.8 x this as its time constant (smoke.comp).
+    pub steam_rise: f32,
+    pub steam_life: f32,
+    /// Escaped steam is drawn as tracers in the air (particles.comp: puff_air): the speed of
+    /// the eddies that twist the plume into wisps, m/s (0 = it rises straight), and their
+    /// size, m. A look setting: the air itself is not simulated.
+    pub steam_swirl: f32,
+    pub steam_eddy: f32,
     /// Diameter of the oil (or water) droplets assumed inside a cell that holds both phases,
     /// in cells: a sub-grid model parameter, so it scales with the grid. Sets how fast the
     /// phases drift apart: the droplets' terminal velocity (see particles.comp).
@@ -284,11 +343,21 @@ impl Default for SimParams {
             ambient_temp: T_REF,
             heat_rate: 1.0,
             air_cooling: 10.0,
-            contact_heat: 300.0,
+            contact_heat: 3000.0,
+            eddy_heat: 0.17,
+            evaporation: 1,
             rigid_viscosity: 1.0,
             rigid_contact: 1,
             rigid_friction: 0.6,
             heat_power: 300.0,
+            steam: 1,
+            steam_boil: 0.02,
+            steam_condense: 0.005,
+            steam_mixing: 3.0,
+            steam_rise: 0.4,
+            steam_life: 2.0,
+            steam_swirl: 0.1,
+            steam_eddy: 0.2,
             droplet_cells: 1.0,
             cfl: 4.0,
             advection_order: 2,
@@ -499,8 +568,8 @@ pub static MAT_PARAMS: &[Param] = &[
     mat_param!("susceptibility", "", [0.0, 20.0], false, |m| m.susceptibility, |m, v| m.susceptibility = v, "Magnetic volume susceptibility (SI)."),
     mat_param!("saturation", "T", [0.001, 2.0], false, |m| m.saturation, |m, v| m.saturation = v, "Saturation magnetisation (as mu0 Ms): the most a field can magnetise it."),
     mat_param!("skin", "N/m", [0.0, 2.0], false, |m| m.skin, |m, v| m.skin = v, "Strength of a surface skin: a yield stress in free-surface cells."),
-    mat_param!("opacity", "", [0.0, 1.0], false, |m| m.opacity, |m, v| m.opacity = v, "0 clear, 1 opaque."),
-    mat_param!("scatter", "", [0.0, 1.0], false, |m| m.scatter, |m, v| m.scatter = v, "0 none, 1 milky."),
+    mat_param!("opacity", "", [0.0, 1.0], false, |m| m.opacity, |m, v| m.opacity = v, "How deep its colour builds up: 0 clear (water shows its colour through 30 cells), 1 opaque (half a cell)."),
+    mat_param!("scatter", "", [0.0, 1.0], false, |m| m.scatter, |m, v| m.scatter = v, "How strongly it scatters light: 0 clear (light through it is tinted), 1 milky (it shows its own colour, lit from the front)."),
     mat_param!("metal", "", [0.0, 1.0], false, |m| m.metal, |m, v| m.metal = v, "0 dielectric, 1 mirror metal."),
     mat_param!("gloss", "", [0.0, 1.0], false, |m| m.gloss, |m, v| m.gloss = v, "Strength of the specular streak."),
     mat_param!("body", "", [0.0, 1.0], false, |m| m.body, |m, v| m.body = v, "Fullness of the surface and width of the translucent rim (thick liquids)."),
@@ -531,6 +600,10 @@ pub static PARAMS: &[Param] = &[
         "Film coefficient of the air at a free surface; radiation is added from each liquid's emissivity."),
     param!("contact_heat", World, "W/m²K", [10.0, 20000.0], Some(0.0), false, |p| p.contact_heat, |p, v| p.contact_heat = v,
         "Heat transfer coefficient where two different liquids meet (convection and boiling in a boundary layer thinner than a cell); 0 = conduction across the cells only."),
+    param!("eddy_heat", World, "", [0.05, 0.4], Some(0.0), false, |p| p.eddy_heat, |p, v| p.eddy_heat = v,
+        "Smagorinsky constant of the sub-grid heat mixing in moving liquid (eddies smaller than a cell); 0 = conduction only."),
+    param!("evaporation", World, "", [0.0, 1.0], None, true, |p| p.evaporation as f32, |p, v| p.evaporation = v as u32,
+        "1: warm water loses heat by evaporating at its surface, and steams; 0 = off."),
     param!("rigid_viscosity", World, "m²/s", [0.05, 50.0], None, false, |p| p.rigid_viscosity, |p, v| p.rigid_viscosity = v,
         "Viscosity at which liquid stops flowing and moves rigidly (frozen, set glass, unyielded sludge, jammed oobleck); the cap of the viscosity solve. Higher: more viscosity iterations."),
     param!("rigid_contact", World, "", [0.0, 1.0], None, true, |p| p.rigid_contact as f32, |p, v| p.rigid_contact = v as u32,
@@ -539,6 +612,22 @@ pub static PARAMS: &[Param] = &[
         "Coulomb friction between a rigid body and the solid it rests on (rock on rock 0.5 - 0.8); 0 = frictionless."),
     param!("heat_power", World, "K/s", [10.0, 5000.0], None, false, |p| p.heat_power, |p, v| p.heat_power = v,
         "Heat / Cool brush: kelvin per second for water at its centre."),
+    param!("steam", World, "", [0.0, 1.0], None, true, |p| p.steam as f32, |p, v| p.steam = v as u32,
+        "1: boiling water turns into steam bubbles that rise, condense in colder water and escape at the surface as puffs; 0 = boiled liquid leaves the tank at once."),
+    param!("steam_boil", World, "", [0.001, 1.0], None, false, |p| p.steam_boil, |p, v| p.steam_boil = v,
+        "Vapour quality (share of the latent heat taken up) at which boiling water becomes a steam bubble."),
+    param!("steam_condense", World, "", [0.0, 1.0], None, false, |p| p.steam_condense, |p, v| p.steam_condense = v,
+        "Vapour quality below which steam condenses back into water (below steam_boil)."),
+    param!("steam_mixing", World, "1/s", [0.1, 1000.0], None, false, |p| p.steam_mixing, |p, v| p.steam_mixing = v,
+        "How fast the particles of a cell holding steam even out their heat: how quickly bubbles condense in colder water."),
+    param!("steam_rise", World, "m/s", [0.0, 3.0], None, false, |p| p.steam_rise, |p, v| p.steam_rise = v,
+        "Speed at which escaped puffs of steam rise."),
+    param!("steam_life", World, "s", [0.1, 10.0], None, false, |p| p.steam_life, |p, v| p.steam_life = v,
+        "How long escaped steam lasts: puffs lay vapour for this long, and it mixes away into the air over 0.8 x this."),
+    param!("steam_swirl", World, "m/s", [0.0, 2.0], None, false, |p| p.steam_swirl, |p, v| p.steam_swirl = v,
+        "Speed of the eddies that twist escaped steam into wisps (0 = it rises straight up)."),
+    param!("steam_eddy", World, "m", [0.005, 0.5], None, false, |p| p.steam_eddy, |p, v| p.steam_eddy = v,
+        "Size of the eddies in the air that escaped steam rides."),
     // ---- liquids ----
     param!("tension_oil_water", Liquid, "N/m", [0.0, 0.1], None, false, |p| p.pair_tension[0][1], |p, v| { p.pair_tension[0][1] = v; p.pair_tension[1][0] = v }, "Interfacial tension between oil-like and aqueous liquids."),
     param!("tension_metal_water", Liquid, "N/m", [0.0, 0.75], None, false, |p| p.pair_tension[0][2], |p, v| { p.pair_tension[0][2] = v; p.pair_tension[2][0] = v }, "Interfacial tension between liquid metals and aqueous liquids."),
@@ -687,13 +776,20 @@ impl SimParams {
     /// water's (mirrors `thermal_of` in common.glsl).
     pub fn heat_capacity_rel(&self, m: Material, s: f32) -> f32 {
         let own = &self.mat[m.index()];
-        let c = own.heat_capacity_vol() / WATER_HEAT;
+        let c = self.particle_heat_vol(m.index()) / WATER_HEAT;
         if own.diluent >= 0 {
             let d = self.mat[own.diluent as usize].heat_capacity_vol() / WATER_HEAT;
             d + (c - d) * s
         } else {
             c
         }
+    }
+
+    /// Volumetric heat capacity a particle of table row `row` carries, J/(m³ K): its own,
+    /// except steam, which carries the water it boiled from (`material.rs: steam`).
+    pub fn particle_heat_vol(&self, row: usize) -> f32 {
+        let r = if row == Material::Steam.index() { Material::Water.index() } else { row };
+        self.mat[r].heat_capacity_vol()
     }
 
     pub fn rho(&self, m: Material) -> f32 {
@@ -723,7 +819,7 @@ impl SimParams {
             return f32::INFINITY;
         }
         let dx2 = self.cell_size * self.cell_size;
-        present.iter().map(|&i| 0.2 * dx2 * self.mat[i].heat_capacity_vol() / self.mat[i].conductivity.max(1e-6) / self.heat_rate).fold(f32::INFINITY, f32::min)
+        present.iter().map(|&i| 0.2 * dx2 * self.particle_heat_vol(i) / self.mat[i].conductivity.max(1e-6) / self.heat_rate).fold(f32::INFINITY, f32::min)
     }
 
     /// The rows a tank holding the materials `present` can contain: those, their diluents,
@@ -765,6 +861,9 @@ impl SimParams {
 
     pub fn dt_capillary(&self, present: &[usize]) -> f32 {
         let mut worst = 0.0f32;  // largest sigma / rho
+        // Steam's surface is the water around the bubble: it moves water, not vapour.
+        let present: Vec<usize> = present.iter().copied().filter(|&i| i != Material::Steam.index()).collect();
+        let present = &present[..];
         for &i in present {
             let m = &self.mat[i];
             worst = worst.max(self.tension_cells(m.tension) / (m.density / Self::WATER_DENSITY));
@@ -1054,6 +1153,15 @@ pub struct GpuParams {
     /// Per magnet: pole direction.
     pub magnet_dir: [[f32; 4]; MAX_MAGNETS],
     pub elastic: [f32; 4],
+    /// Steam: vapour quality below which it condenses; puff rise speed (cells/s); puff
+    /// lifetime (s); vapour quality at which boiling water becomes steam.
+    pub steam: [f32; 4],
+    /// Steam: rate of the exchange inside a cell that holds it (1/s); 1 if boiling makes
+    /// steam (`steam`); eddy speed of the air puffs ride (cells/s); eddy size (cells).
+    pub steam2: [f32; 4],
+    /// Heat: Smagorinsky constant of the eddy diffusivity (0 off); evaporation factor
+    /// L / c_p,air in kelvin (0 off); unused; unused.
+    pub heat3: [f32; 4],
 }
 
 /// What the tank needs from the solver, from the materials in it (`GpuParams::caps`).
@@ -1064,6 +1172,7 @@ pub const CAP_RHEO: u32 = 8;
 pub const CAP_MAGNET: u32 = 16;
 pub const CAP_ELASTIC: u32 = 32;
 pub const CAP_SETTLE: u32 = 64;
+pub const CAP_STEAM: u32 = 128;
 
 /// Volumetric heat capacity of water, J/(m³ K): the unit heat is counted in on the GPU.
 pub const WATER_HEAT: f32 = SimParams::WATER_DENSITY * 4182.0;
@@ -1071,7 +1180,8 @@ pub const WATER_HEAT: f32 = SimParams::WATER_DENSITY * 4182.0;
 pub const STEFAN_BOLTZMANN: f32 = 5.670_374e-8;
 
 const _: () = assert!(std::mem::size_of::<Particle>() == 48);
-const _: () = assert!(std::mem::size_of::<GpuParams>() == 32 + 64 + 16 + 32 + 16 * (MAX_PRESENT / 4) + 16 * MAX_PRESENT + 32 + 32 + 32 + 48 + 32 * MAX_CURRENTS + 16 + 32 * MAX_MAGNETS + 16);
+const _: () = assert!(KIND_SRC & (KIND_FRESH | KIND_REAL_T | KIND_PUFF | KIND_MAT_MASK) == 0);
+const _: () = assert!(std::mem::size_of::<GpuParams>() == 32 + 64 + 16 + 32 + 16 * (MAX_PRESENT / 4) + 16 * MAX_PRESENT + 32 + 32 + 32 + 48 + 32 * MAX_CURRENTS + 16 + 32 * MAX_MAGNETS + 16 + 48);
 
 #[cfg(test)]
 mod tests {
@@ -1135,7 +1245,8 @@ mod tests {
             assert!(p.min < p.max, "{}: empty range", p.key);
             for (row, b) in BUILTINS.iter().enumerate() {
                 let v = (p.get)(&d, row);
-                assert_eq!(p.clamp(v), v, "{} of {}: default {} outside its range", p.key, b.key, v);
+                // (The ranges are for liquids; steam, which only boiling makes, is 0.6 kg/m³.)
+                assert!(!pickable(row) || p.clamp(v) == v, "{} of {}: default {} outside its range", p.key, b.key, v);
                 let q = Param::find(&format!("{}_{}", p.key, b.key)).expect("resolves");
                 assert_eq!((q.index, q.key), (row, p.key), "{}_{}", p.key, b.key);
                 assert_eq!(Param::find(&format!("{}.{}", b.key, p.key)).map(|q| q.index), Some(row));

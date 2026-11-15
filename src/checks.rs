@@ -8,7 +8,7 @@ use crate::{
     gpu::Gpu,
     maps::fill_rect,
     scene::{Scene, Shape, WALL},
-    sim::{Material, PPC, Particle, SimParams, ToolState, heat_content},
+    sim::{KIND_SRC, Material, PPC, Particle, SimParams, ToolState, heat_content},
     validate::{Report, percentile, run},
     world::World,
 };
@@ -160,6 +160,72 @@ pub fn thermal(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.shot(&w, "ice_melts");
     let left = w.sim.download_particles().iter().filter(|q| sp.temperature(q).1 > 0.5).count();
     r.check("ice melts under the heat brush (2 s)", format!("{held} -> {left} frozen particles"), "fewer than a third left", left * 3 < held);
+
+    // ---- steam (README, "Steam") -----------------------------------------------------------
+    // A pool 30 cells deep heated from below by the brush: at 99 deg C bubbles rise through it
+    // and escape at the surface; at 20 deg C they condense on the cold water around the brush.
+    let grid = [128, 96];
+    let brush = ToolState::heat([64.0, WALL + 5.0], 12.0, false);
+    let pool = |t: f32| self::block(grid, [0.0, WALL, 128.0, WALL + 30.0], Material::Water).into_iter().map(|p| p.at_temp(t)).collect::<Vec<_>>();
+    let steam = |w: &World| w.sim.download_particles().into_iter().filter(|p| p.is(Material::Steam)).collect::<Vec<_>>();
+    let mut w = build(gpu, grid, apply, Vec::new(), pool(99.0), &|_| {});
+    let sp = w.sim.params;
+    let e0 = heat_content(&w.sim.download_particles(), &sp);
+    let mut top = 0.0f32;
+    for k in 0..120 {
+        w.sim.advance_blocking(1.0 / 60.0, brush);
+        if k % 10 == 9 {
+            top = steam(&w).iter().map(|p| p.pos[1]).fold(top, f32::max);
+        }
+    }
+    r.shot(&w, "steam_boils");
+    let l = w.sim.download_ledger();
+    let (turned, escaped) = (l.steam_count[Material::Water.index()], l.boiled_count[Material::Steam.index()]);
+    r.check(
+        "water at 99 deg C over the brush boils: bubbles rise, steam escapes",
+        format!("{turned} particles turned to steam, {escaped} escaped; highest bubble {:.0} cells above the brush", top - WALL - 5.0),
+        "some escape; bubbles reach the surface (25 cells up)",
+        escaped > 0 && top > WALL + 28.0,
+    );
+    for _ in 0..120 {
+        w.sim.advance_blocking(1.0 / 60.0, ToolState::default());
+    }
+    let rest = steam(&w);
+    let left = rest.len();
+    // (Where any is left, and at what temperature: a diagnosis when it fails.)
+    let at: Vec<String> = rest.iter().take(3).map(|p| format!("({:.1}, {:.1}) {:.1} C", p.pos[0], p.pos[1], sp.temperature(p).0)).collect();
+    r.check("...2 s after the brush is lifted the steam is gone", format!("{left} steam particles left {}", at.join(" ")), "none (escaped or condensed)", left == 0);
+    let l = w.sim.download_ledger();
+    let e1 = heat_content(&w.sim.download_particles(), &sp);
+    let miss = ((e1 - e0) - l.net_in()) / l.heated.max(1e-9);
+    r.check(
+        "...energy: content change vs brush in, air and steam out",
+        format!("{:+.4e} vs {:+.4e} J/m ({:+.3} % of the brush's heat)", e1 - e0, l.net_in(), miss * 100.0),
+        "equal within 0.5 %",
+        miss.abs() < 0.005,
+    );
+    let mut w = build(gpu, grid, apply, Vec::new(), pool(20.0), &|_| {});
+    // How far bubbles rise before they condense: the mean height above the brush of the
+    // steam present, sampled every frame of the last second.
+    let (mut rise, mut nrise) = (0.0f64, 0usize);
+    for k in 0..90 {
+        w.sim.advance_blocking(1.0 / 60.0, brush);
+        if k >= 30 {
+            for p in steam(&w) {
+                rise += (p.pos[1] - WALL - 5.0).max(0.0) as f64;
+                nrise += 1;
+            }
+        }
+    }
+    println!("  bubbles in 20 deg C water: mean height above the brush {:.1} cells", rise / nrise.max(1) as f64);
+    let l = w.sim.download_ledger();
+    let (turned, escaped) = (l.steam_count[Material::Water.index()], l.boiled_count[Material::Steam.index()]);
+    r.check(
+        "water at 20 deg C over the brush: bubbles condense before the surface",
+        format!("{turned} turned to steam, {escaped} escaped"),
+        "some turn, under 5 % of them escape",
+        turned > 0 && (escaped as f32) < 0.05 * turned as f32,
+    );
 }
 
 fn mean_y(ps: &[&Particle]) -> f32 {
@@ -357,23 +423,33 @@ pub fn suspension(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
 
     // ---- evaporating brine leaves salt ---------------------------------------------------------
     let ps = block(grid, [20.0, 0.0, 108.0, 20.0], Material::Brine);
-    let n0 = ps.len();
+    // Dissolved salt in the liquid, as volume of brine at concentration 1: in the brine, and
+    // in the bubbles of steam it boiled into (they condense back into brine).
+    let from_brine = (Material::Brine.index() as u32 + 1) << 8;
+    let dissolved = |ps: &[Particle]| {
+        ps.iter().filter(|p| p.is(Material::Brine) || (p.is(Material::Steam) && p.kind & KIND_SRC == from_brine)).map(|p| p.s as f64).sum::<f64>()
+    };
     let mut w = build(gpu, grid, apply, Vec::new(), ps, &|_| {});
+    let s0 = dissolved(&w.sim.download_particles());
     for _ in 0..240 {
         w.sim.advance_blocking(1.0 / 60.0, ToolState::heat([64.0, 8.0], 30.0, false));
     }
     let l = w.sim.download_ledger();
-    let boiled = l.boiled_count[Material::Brine.index()];
+    // What boiled leaves its salt behind, one salt particle per `residue_share` of dissolved
+    // salt; the water escapes as steam (README, "Steam") or condenses and rejoins the brine.
+    let escaped = l.boiled_count[Material::Steam.index()] + l.boiled_count[Material::Brine.index()] - l.residue_count[Material::Salt.index()];
     let salt = l.residue_count[Material::Salt.index()];
-    let live_salt = w.sim.download_particles().iter().filter(|p| p.is(Material::Salt)).count();
-    let share = w.sim.params.mat[Material::Brine.index()].residue_share;
-    let ratio = salt as f32 / (boiled + salt).max(1) as f32;
+    let ps = w.sim.download_particles();
+    let live_salt = ps.iter().filter(|p| p.is(Material::Salt)).count();
+    let share = w.sim.params.mat[Material::Brine.index()].residue_share as f64;
+    let lost = s0 - dissolved(&ps);
+    let ratio = salt as f64 / (share * lost).max(1e-9);
     r.shot(&w, "brine_boils");
     r.check(
         "boiling brine: water lost, salt left",
-        format!("{boiled} of {n0} boiled away (reported as lost), {salt} salt ({live_salt} in the tank), {:.1} %", ratio * 100.0),
-        &format!("some boiled; salt share {:.1} % (+/- 4)", share * 100.0),
-        boiled > 0 && (ratio - share).abs() < 0.04 && live_salt as u32 == salt,
+        format!("{escaped} particles escaped as steam; {lost:.0} of {s0:.0} parts of dissolved salt boiled out, {salt} salt particles ({live_salt} in the tank): {:.2} x expected", ratio),
+        &format!("some escaped; salt = residue share ({:.1} %) x what boiled out, +/- 15 %", share * 100.0),
+        escaped > 0 && (ratio - 1.0).abs() < 0.15 && live_salt as u32 == salt,
     );
 }
 
@@ -426,6 +502,29 @@ pub fn elastic(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         None => r.check("period of the shear mode", "no oscillation".into(), &format!("{t_theory:.2} s"), false),
     }
     r.check("decay rate (relaxation)", format!("{decay:.3} /s ({:+.1} %)", (decay / gamma - 1.0) * 100.0), &format!("{gamma:.3} /s = (1/lambda + nu k^2) / 2 (+/- 20 %)"), (decay / gamma - 1.0).abs() < 0.2);
+
+    // ---- a block of slime dropped into a cup with a peg (gallery `slime`) ---------------------
+    // It splashes, but holds together: with a 1 Pa s solvent it flung its impact back out as
+    // sheets that tore into hundreds of droplets (README, "Viscoelasticity").
+    let grid = [512, 288];
+    let wall = |x: f32| (Shape::Box { c: [x, 40.0], half: [4.0, 38.0], angle: 0.0 }, None);
+    let peg = (Shape::Circle { c: [236.0, 20.0], r: 8.0 }, None);
+    let ps = block(grid, [226.0, 40.0, 296.0, 90.0], Material::Slime);
+    let n0 = ps.len();
+    let mut w = build(gpu, grid, apply, vec![wall(176.0), wall(336.0), peg], ps, &|_| {});
+    let mut worst = 0;
+    for _ in 0..8 {
+        run(&mut w, 0.4);
+        worst = worst.max(crate::headless::blob_stats(&w.sim.download_particles(), grid).2);
+    }
+    r.shot(&w, "slime_drop");
+    let (pieces, _, dropped) = crate::headless::blob_stats(&w.sim.download_particles(), grid);
+    r.check(
+        "slime dropped into a cup holds together",
+        format!("after 3.2 s {pieces} pieces, {dropped} particles in droplets (most at any time {worst}) of {n0}"),
+        "droplets under 0.5 % after 3.2 s, under 2 % at any time",
+        (dropped as f32) < 0.005 * n0 as f32 && (worst as f32) < 0.02 * n0 as f32,
+    );
 }
 
 /// Liquid metals and magnetism: layering by density with mercury at 13.5 times water's
