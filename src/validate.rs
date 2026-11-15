@@ -240,15 +240,31 @@ fn ritter(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
 /// Three layers stacked upside down must overturn into oil / water / syrup.
 fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     println!("\nRayleigh-Taylor overturn (oil under water under syrup, 40 s)");
-    let mut w = world(
-        gpu,
-        apply,
-        &[
-            ([0.0, 0.0, 512.0, 60.0], Material::Oil),
-            ([0.0, 60.0, 512.0, 120.0], Material::Water),
-            ([0.0, 120.0, 512.0, 180.0], Material::Syrup),
-        ],
-    );
+    let seed: f32 = std::env::var("LAYERS_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let mut w = if seed > 0.0 {
+        let scene = Scene::new(GRID);
+        let mut ps = Vec::new();
+        fill_rect(&scene, [0.0, 0.0, 512.0, 180.0], Material::Water, &mut ps);
+        for p in &mut ps {
+            let bump = seed * (p.pos[0] * std::f32::consts::TAU / 64.0).sin();
+            if p.pos[1] < 60.0 + bump {
+                *p = Particle::new(Material::Oil, p.pos, [0.0, 0.0]);
+            } else if p.pos[1] >= 120.0 - bump {
+                *p = Particle::new(Material::Syrup, p.pos, [0.0, 0.0]);
+            }
+        }
+        world_from(gpu, GRID, apply, ps)
+    } else {
+        world(
+            gpu,
+            apply,
+            &[
+                ([0.0, 0.0, 512.0, 60.0], Material::Oil),
+                ([0.0, 60.0, 512.0, 120.0], Material::Water),
+                ([0.0, 120.0, 512.0, 180.0], Material::Syrup),
+            ],
+        )
+    };
     let before = w.sim.download_particles();
     let syrup0: f64 = before.iter().map(|p| syrup_in(p) as f64).sum();
     let area0 = occupied_area(&before);

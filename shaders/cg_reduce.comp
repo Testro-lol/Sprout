@@ -15,6 +15,7 @@
 //   mode 7  viscosity end    statistics
 //   mode 8  pressure start of the second solve, after the viscosity (rhs_visc.comp): as
 //           mode 0, but the density-correction potential counts as solved already
+//   mode 9  pressure end of the second solve    statistics (its own iteration count)
 // When a solve has converged, its entries in the indirect argument buffer are zeroed so
 // the iterations recorded after that point do no work.
 
@@ -110,10 +111,15 @@ void main() {
             K.p_done = done;
         }
         publish_pressure();
-    } else if (mode == 3u) {
+    } else if (mode == 3u || mode == 9u) {
         if (t == 0u) {
-            K.p_it_max = max(K.p_it_max, max(K.p_iters.x, K.p_iters.y));
-            if (K.p_done.x == 0u) K.p_unconv += 1u;
+            if (mode == 3u) {
+                K.p_it_max = max(K.p_it_max, max(K.p_iters.x, K.p_iters.y));
+                if (K.p_done.x == 0u) K.p_unconv += 1u;
+            } else {
+                K.p2_it_max = max(K.p2_it_max, K.p_iters.x);
+                if (K.p_done.x == 0u) K.p2_unconv += 1u;
+            }
             float rel = K.p_bb.x > 0.0 ? sqrt(K.p_rr.x / K.p_bb.x) : 0.0;
             K.p_res_max = max(K.p_res_max, rel);
         }

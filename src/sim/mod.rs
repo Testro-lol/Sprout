@@ -103,7 +103,7 @@ const TAIL_CELLS: u32 = 1500;
 const MG_OMEGA: f32 = 1.8;
 /// Words of `StepBuf` and `SolveBuf`.
 const STEP_WORDS: u64 = 12;
-const SOLVE_WORDS: u64 = 28;
+const SOLVE_WORDS: u64 = 30;
 /// First word of the statistics in `SolveBuf`, cleared by the CPU after each read-back.
 const SOLVE_STATS: u64 = 21;
 /// Host read-back slots in flight.
@@ -142,8 +142,9 @@ impl Stats {
 /// Per-particle viscoelastic stress and the target the periodic sort moves it into.
 type StressBuffers = (Subbuffer<[[f32; 4]]>, Subbuffer<[[f32; 4]]>);
 /// What a recorded substep depends on (`substep_buffer`): particle groups, first-step flag,
-/// pressure and viscosity iterations, accumulator stride, CAP_* bits.
-type SubstepKey = (u32, bool, u32, u32, u32, u32);
+/// pressure and viscosity iterations, accumulator stride, CAP_* bits (and bit 31
+/// `viscous_projection`), iterations of the second pressure solve.
+type SubstepKey = (u32, bool, u32, u32, u32, u32, u32);
 
 /// What crossed the boundary of the simulation since the last reset. Energies in J per metre
 /// of depth (the simulation is a slice; `SimParams::cell_heat`).
@@ -792,6 +793,9 @@ pub struct FluidSim {
     substep_cost: f32,
     /// Iterations recorded per substep for each solve, adapted to what recent solves used.
     pressure_rec: u32,
+    /// The same for the second pressure solve, after the viscosity (`viscous_projection`):
+    /// it usually needs far fewer than the first.
+    pressure2_rec: u32,
     viscosity_rec: u32,
     /// Fastest speed newly spawned particles start with, cells/s (feeds the CFL limit).
     spawn_speed: f32,
@@ -1322,6 +1326,7 @@ impl FluidSim {
             dt_estimate: NOMINAL_DT,
             substep_cost: 0.0,
             pressure_rec: 24,
+            pressure2_rec: 24,
             viscosity_rec: 24,
             spawn_speed: 0.0,
             currents: Vec::new(),
@@ -1985,7 +1990,7 @@ impl FluidSim {
     }
 
     fn reduce(&self, b: &mut Recorder, mode: u32) {
-        let pressure = mode < 4 || mode == 8;
+        let pressure = mode < 4 || mode >= 8;
         let n_entries = self.entries();
         let (first, last) = if pressure { (0, n_entries - 2) } else { (n_entries - 2, n_entries) };
         self.pass.cg_reduce.bind_raw(b);
@@ -2068,6 +2073,7 @@ impl FluidSim {
             // scene from no idea how many viscosity iterations it needs: record the most
             // until read-backs say otherwise.
             self.pressure_rec = self.params.pressure_max_iters;
+            self.pressure2_rec = self.params.pressure_max_iters;
             self.viscosity_rec = self.params.viscosity_max_iters;
         }
 
@@ -2163,6 +2169,7 @@ impl FluidSim {
             if viscous == Viscosity::Implicit { quant(self.viscosity_rec) } else { viscous as u32 },
             self.tank.stride.max(ACC_MIN),
             self.caps() | (self.params.viscous_projection.min(1) << 31),
+            quant(self.pressure2_rec),
         );
         if let Some(cb) = self.substep_cache.get(&key) {
             return cb.clone();
@@ -2172,7 +2179,7 @@ impl FluidSim {
         }
         self.ensure_caps_passes();
         let mut r = Recorder::new(&self.gpu);
-        self.record_substep(&mut r, gather, particle_groups, key.2, key.3, viscous);
+        self.record_substep(&mut r, gather, particle_groups, [key.2, key.6], key.3, viscous);
         let cb = r.finish();
         self.substep_cache.insert(key, cb.clone());
         cb
@@ -2190,7 +2197,7 @@ impl FluidSim {
         r: &mut Recorder,
         gather: bool,
         particle_groups: u32,
-        p_iters: u32,
+        p_iters: [u32; 2],
         v_iters: u32,
         viscous: Viscosity,
     ) {
@@ -2249,6 +2256,7 @@ impl FluidSim {
         // back the whole pull of gravity and the pressure pushed that layer up: every
         // resting viscous pool circulated along its walls (README, Viscosity).
         let twice = viscous == Viscosity::Implicit && self.params.viscous_projection != 0;
+        debug_assert_eq!(twice, self.twice_projected());
         if !twice {
             viscosity(r);
         }
@@ -2256,14 +2264,14 @@ impl FluidSim {
         r.fill(&self.ptile.clone().slice(0..self.nwg as u64), 0);
         ps.rhs.bind_raw(r);
         r.dispatch(grid_groups);
-        self.record_pressure(r, p_iters, false);
+        self.record_pressure(r, p_iters[0], false);
         ps.project.bind_raw(r);
         r.dispatch(grid_groups);
         if twice {
             viscosity(r);
             ps.rhs_visc.bind_raw(r);
             r.dispatch(grid_groups);
-            self.record_pressure(r, p_iters, true);
+            self.record_pressure(r, p_iters[1], true);
             ps.project_visc.bind_raw(r);
             r.dispatch(grid_groups);
         }
@@ -2274,6 +2282,11 @@ impl FluidSim {
                 r.dispatch(grid_groups);
             }
         }
+    }
+
+    /// Whether the substep has a second pressure solve after the viscosity.
+    fn twice_projected(&self) -> bool {
+        self.viscosity_mode() == Viscosity::Implicit && self.params.viscous_projection != 0
     }
 
     /// Which optional parts of the solver the tank needs (`CAP_*`): each costs dispatches
@@ -2441,7 +2454,7 @@ impl FluidSim {
             b.dispatch(fine);
             self.record_vcycle(b, false);
             self.reduce(b, 8);
-            self.record_cg(b, iters);
+            self.record_cg(b, iters, 9);
             return;
         }
         for l in 1..=lv.tail {
@@ -2462,11 +2475,11 @@ impl FluidSim {
         b.dispatch(fine);
         self.record_vcycle(b, false);
         self.reduce(b, 0);
-        self.record_cg(b, iters);
+        self.record_cg(b, iters, 3);
     }
 
     /// The iterations of a pressure solve and its closing statistics.
-    fn record_cg(&self, b: &mut Recorder, iters: u32) {
+    fn record_cg(&self, b: &mut Recorder, iters: u32, end: u32) {
         let ps = &self.pass;
         let lv = &self.levels;
         let half = self.nwg;
@@ -2484,7 +2497,7 @@ impl FluidSim {
             self.record_vcycle(b, true);
             self.reduce(b, 2);
         }
-        self.reduce(b, 3);
+        self.reduce(b, end);
     }
 
     fn request_readback(&mut self, b: &mut Builder, target: f32, substeps: u32) {
@@ -2557,9 +2570,11 @@ impl FluidSim {
             let v_it = words[s + 22];
             let p_un = words[s + 23] as u64;
             let v_un = words[s + 24] as u64;
-            st.pressure_iters_max = st.pressure_iters_max.max(p_it);
+            let p2_it = words[s + 28];
+            let p2_un = words[s + 29] as u64;
+            st.pressure_iters_max = st.pressure_iters_max.max(p_it).max(p2_it);
             st.viscosity_iters_max = st.viscosity_iters_max.max(v_it);
-            st.pressure_unconverged += p_un;
+            st.pressure_unconverged += p_un + p2_un;
             st.viscosity_unconverged += v_un;
             st.pressure_residual_max = st.pressure_residual_max.max(f(s + 26));
             st.viscosity_residual_max = st.viscosity_residual_max.max(f(s + 27));
@@ -2573,6 +2588,12 @@ impl FluidSim {
                 *rec = if unconverged > 0 { (*rec + *rec / 2 + 2).min(max) } else { (used + used / 2 + 2).clamp(2, max) };
             };
             adapt(&mut self.pressure_rec, p_it, p_un, self.params.pressure_max_iters);
+            if self.twice_projected() {
+                adapt(&mut self.pressure2_rec, p2_it, p2_un, self.params.pressure_max_iters);
+            } else {
+                // Not running: ready for a viscous liquid with what the first solve needs.
+                self.pressure2_rec = self.pressure_rec;
+            }
             adapt(&mut self.viscosity_rec, v_it, v_un, self.params.viscosity_max_iters);
         }
     }
@@ -2585,7 +2606,7 @@ impl FluidSim {
         self.ensure_caps_passes();
         let mut r = Recorder::new(&self.gpu).with_timing(&self.gpu, 4096);
         let groups = self.n_slots.div_ceil(PARTICLE_GROUP).max(1);
-        self.record_substep(&mut r, true, groups, quant(self.pressure_rec), quant(self.viscosity_rec), viscous);
+        self.record_substep(&mut r, true, groups, [quant(self.pressure_rec), quant(self.pressure2_rec)], quant(self.viscosity_rec), viscous);
         let (pool, labels) = r.timing().unwrap();
         let cb = r.finish();
         let mut b = self.gpu.builder();

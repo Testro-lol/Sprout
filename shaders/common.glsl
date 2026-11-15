@@ -139,6 +139,7 @@ layout(std430, set = 0, binding = 17) buffer SolveBuf {
     float v_beta; float v_r0; float v_rr; uint v_done;
     uint v_iters; uint p_it_max; uint v_it_max; uint p_unconv;   // stats from here on are
     uint v_unconv; uint solves; float p_res_max; float v_res_max; // cleared by the CPU
+    uint p2_it_max; uint p2_unconv;   // the second pressure solve (rhs_visc.comp)
 } K;
 
 // Indirect dispatch arguments, 3 uints each: the live set first, then the nominal set it is
