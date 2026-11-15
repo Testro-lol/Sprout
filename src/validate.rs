@@ -239,14 +239,18 @@ fn ritter(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
 
 /// Three layers stacked upside down must overturn into oil / water / syrup.
 fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
-    println!("\nRayleigh-Taylor overturn (oil under water under syrup, 40 s)");
-    let seed: f32 = std::env::var("LAYERS_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let mut w = if seed > 0.0 {
+    println!("\nRayleigh-Taylor overturn (oil under water under syrup, 48 s)");
+    // Both interfaces carry a one-cell sine bump (wavelength 64 cells), as Rayleigh-Taylor
+    // set-ups do: a perfectly flat interface has no defined onset, and grows only from the
+    // particle noise. Until 2026-11-15 the layers were flat and the overturn was seeded by
+    // a spurious circulation along the walls, which also kept stirring the tank (README,
+    // Validation, "Wall circulation"); 48 s instead of 40 s for the same reason.
+    let mut w = {
         let scene = Scene::new(GRID);
         let mut ps = Vec::new();
         fill_rect(&scene, [0.0, 0.0, 512.0, 180.0], Material::Water, &mut ps);
         for p in &mut ps {
-            let bump = seed * (p.pos[0] * std::f32::consts::TAU / 64.0).sin();
+            let bump = (p.pos[0] * std::f32::consts::TAU / 64.0).sin();
             if p.pos[1] < 60.0 + bump {
                 *p = Particle::new(Material::Oil, p.pos, [0.0, 0.0]);
             } else if p.pos[1] >= 120.0 - bump {
@@ -254,16 +258,6 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
             }
         }
         world_from(gpu, GRID, apply, ps)
-    } else {
-        world(
-            gpu,
-            apply,
-            &[
-                ([0.0, 0.0, 512.0, 60.0], Material::Oil),
-                ([0.0, 60.0, 512.0, 120.0], Material::Water),
-                ([0.0, 120.0, 512.0, 180.0], Material::Syrup),
-            ],
-        )
     };
     let before = w.sim.download_particles();
     let syrup0: f64 = before.iter().map(|p| syrup_in(p) as f64).sum();
@@ -289,7 +283,7 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
         above as f32 / ps.iter().filter(|p| !is_oil(p)).count().max(1) as f32
     };
     let mut trend = Vec::new();
-    for k in 0..20 {
+    for k in 0..24 {
         run(&mut w, 2.0);
         ps = w.sim.download_particles();
         if k % 4 == 3 {
@@ -315,7 +309,7 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
     // Oil should end as one clean layer: almost all of it above almost all the rest.
     let below = trapped(&ps);
     println!(
-        "  water/syrup above the oil layer's floor at 8, 16, 24, 32, 40 s: {}",
+        "  water/syrup above the oil layer's floor at 8, 16, 24, 32, 40, 48 s: {}",
         trend.iter().map(|t| format!("{:.2} %", t * 100.0)).collect::<Vec<_>>().join(", ")
     );
     r.check("water/syrup left above the oil layer's floor", format!("{:.2} %", below * 100.0), "< 3 %", below < 0.03);
@@ -342,7 +336,7 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
         worst_rise < 0.01 * released,
     );
     r.check(
-        "kinetic energy left after 40 s",
+        "kinetic energy left after 48 s",
         format!("{:.2} % of released (peak {:.0} %)", ke1 / released * 100.0, ke_peak / released * 100.0),
         "< 1 %",
         ke1 < 0.01 * released,

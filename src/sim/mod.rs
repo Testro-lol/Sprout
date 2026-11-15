@@ -1990,7 +1990,8 @@ impl FluidSim {
     }
 
     fn reduce(&self, b: &mut Recorder, mode: u32) {
-        let pressure = mode < 4 || mode >= 8;
+        // Pressure: modes 0 - 3, 8, 9; viscosity: 4 - 7.
+        let pressure = !(4..8).contains(&mode);
         let n_entries = self.entries();
         let (first, last) = if pressure { (0, n_entries - 2) } else { (n_entries - 2, n_entries) };
         self.pass.cg_reduce.bind_raw(b);
@@ -2244,21 +2245,23 @@ impl FluidSim {
             ps.heat.bind_raw(r);
             r.dispatch(grid_groups);
         }
-        let viscosity = |r: &mut Recorder| match viscous {
-            Viscosity::None => {}
-            Viscosity::Explicit => self.record_viscosity_explicit(r, grid_groups),
-            Viscosity::Implicit => self.record_viscosity(r, grid_groups, v_iters),
-        };
-        // Viscosity between two pressure solves (`viscous_projection`): the first takes out
-        // what the liquid cannot follow (the pull of gravity on a resting pool), so the
-        // viscosity's no-slip walls see only real motion; the second projects out the
-        // divergence the viscosity left. With one solve after the viscosity, the walls held
-        // back the whole pull of gravity and the pressure pushed that layer up: every
-        // resting viscous pool circulated along its walls (README, Viscosity).
+        // Implicit viscosity between two pressure solves (`viscous_projection`): the first
+        // takes out what the liquid cannot follow (the pull of gravity on a resting pool),
+        // so the viscosity's no-slip walls see only real motion; the second projects out
+        // the divergence the viscosity left. With one solve after the viscosity, the walls
+        // held back the whole pull of gravity and the pressure pushed that layer up: every
+        // resting viscous pool circulated along its walls (README, Viscosity). Tiles too
+        // weakly viscous for the implicit solve take their explicit step before the first
+        // solve either way, as a tank of water alone does: there the effect is
+        // `nu dt / dx²` of `g dt`, and a tank with no implicit tile then has nothing for
+        // the second solve to do.
         let twice = viscous == Viscosity::Implicit && self.params.viscous_projection != 0;
         debug_assert_eq!(twice, self.twice_projected());
-        if !twice {
-            viscosity(r);
+        match viscous {
+            Viscosity::None => {}
+            Viscosity::Explicit => self.record_viscosity_explicit(r, grid_groups),
+            Viscosity::Implicit if twice => self.record_viscosity_split(r, grid_groups),
+            Viscosity::Implicit => self.record_viscosity(r, grid_groups, v_iters),
         }
         // rhs.comp marks the tiles that hold pressure unknowns.
         r.fill(&self.ptile.clone().slice(0..self.nwg as u64), 0);
@@ -2268,7 +2271,7 @@ impl FluidSim {
         ps.project.bind_raw(r);
         r.dispatch(grid_groups);
         if twice {
-            viscosity(r);
+            self.record_viscosity_solve(r, grid_groups, v_iters, true);
             ps.rhs_visc.bind_raw(r);
             r.dispatch(grid_groups);
             self.record_pressure(r, p_iters[1], true);
@@ -2379,10 +2382,15 @@ impl FluidSim {
     }
 
     fn record_viscosity(&self, b: &mut Recorder, grid_groups: [u32; 3], iters: u32) {
+        self.record_viscosity_split(b, grid_groups);
+        self.record_viscosity_solve(b, grid_groups, iters, false);
+    }
+
+    /// Weights and active tiles, the strain of u* everywhere, and the explicit step in tiles
+    /// too weakly viscous to need the implicit solve (which then leaves them out).
+    fn record_viscosity_split(&self, b: &mut Recorder, grid_groups: [u32; 3]) {
         let ps = &self.pass;
         let vpc = |mode| ViscPc { mode, half_off: self.nwg };
-        // Weights and active tiles, the strain of u* everywhere, the explicit step in tiles
-        // too weakly viscous to need the implicit solve, then the solve on the rest.
         b.fill(&self.tiles, 0);
         ps.visc_setup.bind_raw(b);
         b.dispatch(grid_groups);
@@ -2391,6 +2399,21 @@ impl FluidSim {
         b.dispatch(grid_groups);
         for pass in [&ps.visc_split, &ps.visc_clear, &ps.visc_diag] {
             pass.bind_raw(b);
+            b.dispatch(grid_groups);
+        }
+    }
+
+    /// The implicit solve on the active tiles. `restrain`: the velocity changed since
+    /// `record_viscosity_split` (the first pressure solve ran in between), so the strain of
+    /// u* is taken again, and cleared again in the inactive tiles.
+    fn record_viscosity_solve(&self, b: &mut Recorder, grid_groups: [u32; 3], iters: u32, restrain: bool) {
+        let ps = &self.pass;
+        let vpc = |mode| ViscPc { mode, half_off: self.nwg };
+        if restrain {
+            ps.visc_strain.bind_raw(b);
+            ps.visc_strain.push_raw(b, vpc(0));
+            b.dispatch(grid_groups);
+            ps.visc_clear.bind_raw(b);
             b.dispatch(grid_groups);
         }
         ps.visc_apply.bind_raw(b);
