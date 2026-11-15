@@ -1168,7 +1168,9 @@ low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each 
    particle 752 cells/s, now 11), was drawn as white water, and launched itself when nudged.
 3. Surface tension: curvature of smoothed liquid and oil indicators, turned into pressure
    jumps at liquid–air and oil–aqueous interfaces (below).
-4. Pressure: the velocity field is made divergence-free with a variable-density, cut-cell,
+4. Viscosity, full stress tensor (below): the explicit step, in tiles too weakly viscous
+   to need the implicit solve (all of a tank of water).
+5. Pressure: the velocity field is made divergence-free with a variable-density, cut-cell,
    ghost-fluid Poisson solve, by conjugate gradients preconditioned with an aggregation
    multigrid V-cycle (red–black Gauss–Seidel smoothing, Galerkin coarse operators,
    coarse-correction weight 1.8). It stops at a relative residual of 1e-4, so its accuracy
@@ -1176,8 +1178,8 @@ low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each 
    break 8 to 12.
    A second potential, solved alongside with the same matrix, corrects density errors by
    nudging particle positions only; it never adds momentum.
-5. Viscosity, full stress tensor (below), where it is implicit followed by a second
-   pressure solve on the same matrix (below).
+6. Viscosity, implicit, in the other tiles, then a second pressure solve on the same
+   matrix for the divergence it left (below).
 
 Both solves need a free surface somewhere in every connected body of liquid: a region
 sealed off by solids on all sides has a singular system. Where two shapes touch (the two
@@ -1280,9 +1282,14 @@ along every wall and the pressure pushed that layer up: every resting viscous po
 circulated along its walls at about 6 cells/s. Gravity added after the viscosity instead
 stops that but lets gravity-driven flows slip by `g dt` per substep at the walls (the
 sludge slump never stopped); the viscosity after a single projection leaves a divergent
-velocity (slump 65 cells against 47). The explicit step for water is not affected: it
-moves a wall face by `nu dt / dx²` of `g dt`, and a resting water pool shows no wall flow
-with either order.
+velocity (slump 65 cells against 47). Only the implicit tiles run between the two solves:
+tiles too weakly viscous for the implicit solve take their explicit step before the first,
+as a tank of water alone always has. There the step moves a wall face by `nu dt / dx²` of
+`g dt`, so a resting water pool shows no wall flow, and a tank with no implicit tile (water
+in a heated tank, which counts as implicit only because it could freeze) leaves the second
+solve nothing to do. Explicit tiles stepped after the first solve slowed the end of the
+three-liquid overturn (water/syrup above the oil floor at 40 s 1.9 – 6.8 % instead of
+0.01 – 0.09 %) and let more steam bubbles escape (103 of 1928 instead of 87 – 95).
 
 **Surface tension** uses the ghost-fluid method (Kang, Fedkiw & Liu 2000) for both kinds of
 interface, so the jump is as sharp as the free surface and is balanced exactly by the
@@ -1809,6 +1816,49 @@ those slow swings of ±0.5 cells/s by seconds. `validate`: all 240 checks pass (
 check that failed last round passes since `steam_mixing` 1); `--selftest`, `cargo test` (42)
 and clippy pass.
 
+### Wall circulation (2026-11-15)
+
+Every resting pool of a viscous liquid circulated along the walls (Physics, Viscosity): the
+viscosity solve held the wall layer back against the whole pull of gravity, and the
+pressure pushed it up. The implicit viscosity now runs between two pressure solves. A
+wall-to-wall layer at rest, 2 s after 8 s of settling (`LAB_LAVA_JITTER=1 LAB_FULL=1
+LAB_BARE=1 LAB_NOHEAT=1 LAB_WALL=1 sprout lab`, `LAB_JITTER_MAT=syrup` for syrup):
+
+| | Lava: rise next to the left wall in 2 s | Lava: mean particle speed | Syrup: rise | Syrup: speed | Water: speed |
+|---|---|---|---|---|---|
+| before | 11.63 cells | 0.415 cells/s | 11.68 cells | 0.407 cells/s | 0.634 cells/s |
+| after | 0.02 | 0.066 | 0.02 | 0.063 | 0.634 (unchanged) |
+| after, `correction_max=0` | 0.00 | 0.001 | | | |
+| before, `correction_max=0` | 11.52 | 0.446 | | | |
+
+What is left, 0.04 – 0.07 cells/s, sits in the top cells (`LAB_MAP=1`; below them under
+0.01 cells/s) and is the density correction at the free surface (Limitations).
+
+**Test change: the three-liquid overturn starts from a seeded interface and is judged at
+48 s** (`validate layers`). It used to start from flat layers and pass at 40 s, but the
+overturn was started by the spurious wall flow: on Upside Down at 1.5 s the syrup already
+slid down both side walls, while with the fix the interfaces stay flat and a Rayleigh-Taylor
+instability can grow only from particle noise. From flat layers the fixed solver left
+11.4 % of the water/syrup above the oil floor at 40 s (81 / 71 / 47 / 27 / 11 % at 8 – 40 s,
+before: 68.5 / 41 / 13.6 / 0.26 / 0.34 %). Both interfaces now carry a one-cell sine bump
+of wavelength 64 cells, as Rayleigh-Taylor set-ups do, and the check reads 48 s (6 × 8 s).
+Share above the oil floor at 8, 16, 24, 32, 40, 48 s, with oil viscosity at its default and
+±0.1 %:
+
+| | default | `viscosity_oil` 6.006e-5 | 5.994e-5 |
+|---|---|---|---|
+| before (`viscous_projection=0`) | 76.8 / 61.7 / 22.7 / 3.72 / 0.78 / 0.44 % | 76.1 / 58.7 / 13.9 / 5.47 / 0.38 / 0.30 % | 76.7 / 65.8 / 25.0 / 5.97 / 3.78 / 0.65 % |
+| after | 75.3 / 62.6 / 30.0 / 0.87 / 0.09 / 0.03 % | 75.6 / 61.5 / 20.1 / 0.34 / 0.01 / 0.03 % | 75.1 / 60.0 / 11.6 / 0.26 / 0.01 / 0.00 % |
+
+Seeded, both orders overturn at the same pace; the fixed one finishes separating sooner and
+more reliably (before, one of three runs was above 3 % at 40 s).
+
+Other checks the order touches, before → after: sludge slump run-out 53.4 cells (theory 47.4)
+unchanged; Bingham slot 4.3 % L2; Stefan front +2.0 %; rigid ice at rest (fastest frozen
+particle 0.00 cells/s); steam bubbles escaping from 20 °C water 87 → 95 of 1928 (limit 5 %,
+96); viscosity solves left unconverged in 4 s of Playground at 1024 × 576 92 → 44.
+`validate`: all 240 checks pass; `--selftest`, `cargo test` (42) and clippy pass.
+
 ## Performance
 
 Hardware: AMD Ryzen 5 3600, NVIDIA RTX 3060 Ti 8 GB, Fedora 45, Wayland. All three versions
@@ -2096,25 +2146,44 @@ Kitchen draws only glints) but the size of the shader: returning early from eith
 carried noise or the carried seams alone brings Kitchen back to 0.95 ms, while removing the
 3D noise, the strain taps or the unrolling does not. Not resolved this round.
 
+### Wall circulation (2026-11-15)
+
+The build before (`main`, 3e9964c) and after, same commands interleaved, two rounds each
+(`--no-vsync --frames 1500`, first 300 frames skipped, `SPROUT_FRAMES_CSV`); the GPU was
+otherwise idle. The two rounds agreed to 0.1 ms; round 1:
+
+| Scene | Build | p5 / p50 / p75 / p90 / p99 frame (ms) | simulated / wall |
+|---|---|---|---|
+| Playground | before | 0.80 / 0.85 / 1.02 / 5.11 / 8.25 | 0.94× |
+| | after | 0.79 / 0.85 / 1.00 / 6.17 / 10.51 | 0.91× |
+| Lava Meets Water | before | 0.98 / 1.05 / 1.43 / 5.17 / 5.56 | 0.93× |
+| | after | 0.97 / 1.07 / 6.44 / 7.03 / 11.31 | 0.94× |
+| Kitchen | before | 0.96 / 1.16 / 5.28 / 5.55 / 8.05 | 0.95× |
+| | after | 0.95 / 1.09 / 7.13 / 11.48 / 12.04 | 0.96× |
+| Upside Down | before | 1.06 / 1.33 / 7.51 / 8.04 / 13.87 | 0.96× |
+| | after | 1.10 / 7.47 / 9.49 / 10.49 / 10.86 | 0.97× |
+
+GPU time of one substep (`sprout profile --map N`, default grid, best of two): Kitchen
+4.75 → 5.02 ms (+6 %), Playground 3.87 → 4.96 ms (+28 %), Lava Meets Water 4.03 → 5.46 ms
+(+36 %), Upside Down 6.69 → 8.05 ms (+20 %). Head-less, 6 simulated seconds at 1024 × 576
+(`sprout probe --map N --grid 1024x576 --at 6`, wall time, two runs each): Playground
+12.5 → 16.1 s (+29 %), Upside Down 11.4 → 12.1 s (+6 %). Nearly all of it is the second
+pressure solve, which in flowing liquid needs almost as many iterations as the first
+(Lava Meets Water: 7.2 against 8.7 per substep; Playground 6.2 against 8.6; viscosity
+iterations unchanged): the viscosity changes the divergence of a moving flow far more than
+the tolerance. It has its own adaptive iteration count, so where it has nothing to do
+(rest, a tank whose viscosity is all explicit) it records few. Frame times grew where
+simulation frames were already the slow ones (p75 – p99); the simulated / wall ratio stays
+within 3 %, Playground 0.94 → 0.91×. `viscous_projection=0` restores the old cost and order.
+
 ## Limitations
 
-- **A resting pool of a viscous liquid circulates along the walls** (found 2026-11-15,
-  `LAB_LAVA_JITTER=1 LAB_FULL=1 LAB_BARE=1 LAB_NOHEAT=1 LAB_WALL=1 sprout lab`). Gravity is
-  added before the viscosity solve and the pressure after it, so the solve takes the whole
-  pull `g dt` of a pool at rest for a motion and holds the liquid along every no-slip wall
-  against it; the pressure then pushes that liquid up. A wall-to-wall layer of lava or
-  syrup at rest rises along each wall at about 6 cells/s (11.6 cells in 2 s next to it,
-  whatever its viscosity) and sinks a few cells out, 0.41 cells/s on average; water, barely
-  viscous, does not. Tried and set aside: gravity added after the viscosity (0.006 cells/s
-  at rest, but flows that gravity drives against a wall slipped: the sludge slump never
-  stopped, the Bingham slot was 95 % off); last substep's pressure gradient taken off before
-  the viscosity and given back (frozen bodies drifted at 157 cells/s); the same capped to
-  the upward push of gravity (the slump ran out to 81 cells); the viscosity after the
-  pressure (slump 65 cells against 47 ± 20 %). In progress (branch
-  `solver/wall-circulation`, `docs/wip/wall-circulation.md`): a second pressure solve after
-  the viscosity (`viscous_projection`) removes the wall flow (wall particles 0.02 cells in
-  2 s; what is left, 0.04 – 0.07 cells/s at the free surface, is the density correction),
-  but `validate` still fails the layers overturn and two steam checks.
+- **A resting viscous pool still moves a little at its free surface** (2026-11-15). Its
+  wall circulation is gone (Physics, Viscosity; Validation, "Wall circulation"): a
+  wall-to-wall layer of lava at rest moves 0.02 cells in 2 s next to the walls (was 11.6)
+  and under 0.01 cells/s below its top cells. What is left, 0.04 – 0.07 cells/s mean
+  particle speed, sits in the top cells and is the density correction (with
+  `correction_max=0` the pool is at 0.001 cells/s), as in the water pool below.
 - **A still pool of water open to the air slowly gains motion** (found 2026-11-15): wall to
   wall, its mean speed grows from 0.44 to 1.7 cells/s in 24 s, in a circulation that
   converges at the surface. The density correction drives it (with `correction_max=0` it
