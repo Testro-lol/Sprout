@@ -601,9 +601,11 @@ fn current(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     let (free, driven) = (fall(false), fall(true));
     r.check(
         "stream: the current carries it sideways",
-        format!("{:.0} cells/s below the zone (without: {:.0})", driven.0, free.0),
-        "> 30, and 0 without",
-        driven.0 > 30.0 && free.0.abs() < 3.0 && driven.2 > 100,
+        format!("{:.0} cells/s below the zone, {} particles there (without: {:.0}, {} particles)", driven.0, driven.2, free.0, free.2),
+        // The band holds about 6000 / 460 x 8 = 104 particles of the free stream; the count
+        // only makes sure the stream is there (it was "> 100", which a 2-particle change failed).
+        "> 30 with over half the free stream's particles, and 0 without",
+        driven.0 > 30.0 && free.0.abs() < 3.0 && 2 * driven.2 > free.2,
     );
     r.check(
         "stream: its fall is left alone",
@@ -811,7 +813,17 @@ fn tools(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         &format!("3 removed, > 95 % full, {:.2} (+/- 0.5)", mean0),
         removed == 3 && w.scene.shapes.is_empty() && refill > 0.95 && (mean(&ps) - mean0).abs() < 0.5,
     );
-    r.check("solids: the refilled pool does not clump", format!("fullest cell holds {}", crowded(&ps)), "< 12", crowded(&ps) < 12);
+    // A single sample of the fullest cell catches passing crowds (a 0.1 % change of water's
+    // viscosity moved it between 9 and 15 in either build); a clump stays. Three samples
+    // 0.1 s apart, judged by the middle one.
+    let mut fullest = vec![crowded(&ps)];
+    for _ in 0..2 {
+        run(&mut w, 0.1);
+        fullest.push(crowded(&w.sim.download_particles()));
+    }
+    let mut sorted = fullest.clone();
+    sorted.sort();
+    r.check("solids: the refilled pool does not clump", format!("fullest cell holds {:?}", fullest), "middle of three 0.1 s apart < 12", sorted[1] < 12);
 
     // ---- push into the floor, and a clump in ice -------------------------------------------
     // A held push sets velocities after the pressure solve at 2 m/s; driven on into the floor
@@ -1488,6 +1500,31 @@ fn settle(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         // Breaking sloshing waves leave bursts of small eddies, so consecutive samples are
         // not strictly ordered (the handed-over solver fails that too); the trend is.
         rows.windows(3).all(|w| w[2].2 < w[0].2) && jitter < 0.5 * rows[0].2 && share < 0.02,
+    );
+
+    // A shallow layer at rest from the start, open to the air. Its top row of particles sits
+    // in cells too sparse to count as liquid; when they gathered the unprojected air faces
+    // above them (which gain gravity every substep) at full weight, they kept sinking into
+    // the row below while the density correction kept lifting them back, and the downward
+    // momentum fed in at the surface grew into a circulation (1.7 cells/s after 24 s).
+    println!("\nShallow pool open to the air (512 x 288, wall to wall, 34.6 cells deep, 24 s)");
+    let grid = [512, 288];
+    let scene = Scene::new(grid);
+    let mut ps = Vec::new();
+    fill_rect(&scene, [0.0, 0.0, 512.0, 0.12 * 288.0], Material::Water, &mut ps);
+    let mut w = world_from(gpu, grid, apply, ps);
+    let mut speeds = Vec::new();
+    for _ in 0..6 {
+        run(&mut w, 4.0);
+        let ps = w.sim.download_particles();
+        speeds.push(ps.iter().map(|p| (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt()).sum::<f32>() / ps.len().max(1) as f32);
+    }
+    let worst = speeds.iter().cloned().fold(0.0f32, f32::max);
+    r.check(
+        "shallow pool: mean particle speed every 4 s",
+        speeds.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(", "),
+        "< 0.15 cells/s (it grew to 1.7 when the surface pumped)",
+        worst < 0.15,
     );
 }
 

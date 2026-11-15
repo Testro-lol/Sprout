@@ -1166,6 +1166,11 @@ low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each 
    each piled up in the velocity it gathered from the air faces around it, which its own
    scatter kept feeding: it sat on the surface at the speed cap (sludge at rest: fastest
    particle 752 cells/s, now 11), was drawn as white water, and launched itself when nudged.
+   The gather sums the faces the projection acted on and the ballistic ones (air only: the
+   momentum of the particles around them plus gravity) apart, and counts the ballistic
+   ones with their own share of the particle's weights, so spray far from the liquid
+   gathers them in full and a particle at the surface hardly at all (2026-11-15; Validation,
+   "Still water surface").
 3. Surface tension: curvature of smoothed liquid and oil indicators, turned into pressure
    jumps at liquid–air and oil–aqueous interfaces (below).
 4. Viscosity, full stress tensor (below).
@@ -1338,7 +1343,9 @@ its real viscosity, and it changes almost nothing at this scale (see Validation)
   concentrate or a diluent: water's families blend by their exchange instead.
 
 **Liquid and air.** Air is not simulated. A cell is liquid when it holds at least half its
-rest density; sparser spray flies ballistically until it lands.
+rest density; sparser spray flies ballistically until it lands. The top particles of a pool
+often sit in such sparse cells too; they move with the liquid below them because the
+ballistic faces above them count only with their share of the gather (Method, step 2).
 
 **Numerical stabilisation.** Every device below exists for a stated reason, is a named
 parameter in [src/sim/params.rs](src/sim/params.rs) with a value that switches it off
