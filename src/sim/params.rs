@@ -287,6 +287,19 @@ pub struct SimParams {
     /// 1 starts the implicit viscosity solve from u* plus last substep's change of the
     /// velocity (rescaled), instead of from u*; it stops at the same residual either way.
     pub viscosity_warm: u32,
+    /// Preconditioner of the viscosity solve: 1 multigrid (a V-cycle per iteration, vmg.glsl;
+    /// a fifth to a tenth of the iterations, each about twice the dispatches), 0 Jacobi (the
+    /// diagonal; cheap iterations, but their count grows with the square root of the viscous
+    /// diffusion number). Both stop at the same residual (README, Performance).
+    pub viscosity_precond: u32,
+    /// Levels below the grid in the viscosity V-cycle (`viscosity_precond` 1). The mass term
+    /// makes coarse levels easy: one does nearly as well as a full hierarchy (5.5 against 5.3
+    /// iterations in Lava Meets Water), and each further one costs two dispatches an iteration.
+    pub viscosity_mg_levels: u32,
+    /// Gauss-Seidel sweeps per visit of each level of the viscosity V-cycle, 1 or 2. Two take
+    /// a third fewer iterations than one for the same dispatches (the kernels recompute a
+    /// wider ring of cells around each tile).
+    pub viscosity_mg_sweeps: u32,
 
     // ---- stabilisation (README, "Numerical stabilisation"); see `PARAMS` for "off" -------
     /// Spray in free flight (less than half the rest density around it) may travel this many
@@ -398,6 +411,9 @@ impl Default for SimParams {
             viscous_projection: 1,
             viscous_warm: 1,
             viscosity_warm: 1,
+            viscosity_precond: 1,
+            viscosity_mg_levels: 1,
+            viscosity_mg_sweeps: 2,
             correction_step_max: 0.5,
             crowd_jitter: 0.5,
             tool_crowd_max: 2.0,
@@ -687,6 +703,12 @@ pub static PARAMS: &[Param] = &[
         "With viscous_projection: 1 starts each pressure solve from its own part of last substep's pressure; 0 = both from the whole."),
     param!("viscosity_warm", Accuracy, "", [0.0, 1.0], None, true, |p| p.viscosity_warm as f32, |p, v| p.viscosity_warm = v as u32,
         "1 starts the implicit viscosity solve from last substep's change of the velocity; 0 = from the velocity before it."),
+    param!("viscosity_precond", Accuracy, "", [0.0, 1.0], None, true, |p| p.viscosity_precond as f32, |p, v| p.viscosity_precond = v as u32,
+        "Preconditioner of the viscosity solve: 1 multigrid (far fewer iterations), 0 Jacobi; the same tolerance either way."),
+    param!("viscosity_mg_levels", Accuracy, "", [1.0, 6.0], None, true, |p| p.viscosity_mg_levels as f32, |p, v| p.viscosity_mg_levels = v as u32,
+        "Levels below the grid in the viscosity V-cycle (viscosity_precond 1)."),
+    param!("viscosity_mg_sweeps", Accuracy, "", [1.0, 2.0], None, true, |p| p.viscosity_mg_sweeps as f32, |p, v| p.viscosity_mg_sweeps = v as u32,
+        "Gauss-Seidel sweeps per visit of each level of the viscosity V-cycle (viscosity_precond 1)."),
     // ---- stabilisation ----
     param!("speed_cap", Stabilisation, "× √(2gH)", [1.0, 4.0], Some(0.0), false, |p| p.speed_cap, |p, v| p.speed_cap = v,
         "Particle speed cap as a multiple of the free-fall speed over the tank height; 0 = off."),

@@ -144,6 +144,7 @@ layout(std430, set = 0, binding = 17) buffer SolveBuf {
     uint v_unconv; uint solves; float p_res_max; float v_res_max; // cleared by the CPU
     uint p2_it_max; uint p2_unconv;   // the second pressure solve (rhs_visc.comp)
     uint arrive;      // work groups of the current dispatch done with their partial sums (reduce_tail.glsl)
+    float v_pq;       // viscosity with the multigrid preconditioner: p.q of the last iteration
 } K;
 
 // Indirect dispatch arguments, 3 uints each: the live set first, then the nominal set it is
@@ -178,6 +179,29 @@ layout(std430, set = 0, binding = 30) buffer SurfBuf { vec4 surf[]; };
 layout(std430, set = 0, binding = 31) buffer JumpBuf { vec2 pjump[]; };
 // One word per 16 x 16 tile: non-zero where the implicit viscosity solve has work to do.
 layout(std430, set = 0, binding = 32) buffer TileBuf { uint tiles[]; };
+
+// Multigrid preconditioner of the viscosity solve (`viscosity_precond` 1, vmg.glsl): every
+// level at the offsets of the pressure hierarchy (LevBuf). Per cell, the matrix: couplings
+// u-u to the left and below, v-v to the left and below (vma), u of the cell to v of the
+// cells at (0, 0), (-1, 0), (0, 1), (-1, 1) (vmb), the diagonal of u and v (vmd, 0 where
+// that face is no unknown); then the right-hand side of the coarse levels (vmr; level 0's is
+// vr), the values after pre-smoothing (vmx) and the finished values of each level (vmz;
+// level 0's is the preconditioned residual z of conjugate gradients).
+layout(std430, set = 0, binding = 79) buffer VmABuf { vec4 vma[]; };
+layout(std430, set = 0, binding = 80) buffer VmBBuf { vec4 vmb[]; };
+layout(std430, set = 0, binding = 81) buffer VmDBuf { vec2 vmd[]; };
+layout(std430, set = 0, binding = 82) buffer VmRBuf { vec2 vmr[]; };
+layout(std430, set = 0, binding = 83) buffer VmXBuf { vec2 vmx[]; };
+layout(std430, set = 0, binding = 84) buffer VmZBuf { vec2 vmz[]; };
+// Tile flags of the coarse viscosity levels, at the tile offsets of LevBuf (level 0 uses
+// TileBuf).
+layout(std430, set = 0, binding = 85) buffer VmTileBuf { uint vtile[]; };
+// The multigrid-preconditioned iteration (visc_mgu.comp) writes the new residual and A p to
+// these, and they swap bindings with vr and vq every iteration; A z of the last V-cycle
+// (visc_mgz.comp).
+layout(std430, set = 0, binding = 86) buffer VisR2Buf { vec2 vr2[]; };
+layout(std430, set = 0, binding = 87) buffer VisQ2Buf { vec2 vq2[]; };
+layout(std430, set = 0, binding = 88) buffer VisAzBuf { vec2 vaz[]; };
 
 // Multigrid level table: offset into the level buffers, width, height, and the offset of the
 // level's tile flags in PTileBuf.

@@ -13,8 +13,9 @@
 // (zero traction there). At a solid the wall-normal face is closed (velocity 0) and a
 // tangential face inside the solid mirrors its fluid partner (-u), which puts the no-slip
 // wall half a cell from the first velocity sample, where the wall is. The system
-// A = M + G^T W G is symmetric positive definite and solved with Jacobi-preconditioned
-// conjugate gradients; every step of it can only remove kinetic energy.
+// A = M + G^T W G is symmetric positive definite and solved with conjugate gradients,
+// preconditioned by a multigrid V-cycle (vmg.glsl, `viscosity_precond` 1) or the diagonal
+// (Jacobi, 0); every step of it can only remove kinetic energy.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 

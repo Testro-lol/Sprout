@@ -10,6 +10,7 @@
 //!   grid_coef.comp   variable-density face coefficients, ghost-fluid free surface
 //!   surf_*.comp      curvature; surface tension as interface pressure jumps and forces
 //!   visc_*.comp      implicit viscosity, full stress tensor, conjugate gradients
+//!   vmg*.comp        its multigrid preconditioner (vmg.glsl)
 //!   rhs.comp         pressure matrix, divergence + density correction
 //!   mg_*.comp, cg_*  pressure: multigrid-preconditioned conjugate gradients to a tolerance
 //!   project.comp     subtract the pressure gradient
@@ -112,7 +113,7 @@ const _: () = assert!(TAIL_SHARED * 12 + TAIL_SHARED_COARSE * 8 + 32 * 16 <= 48 
 const MG_OMEGA: f32 = 1.8;
 /// Words of `StepBuf` and `SolveBuf`.
 const STEP_WORDS: u64 = 12;
-const SOLVE_WORDS: u64 = 31;
+const SOLVE_WORDS: u64 = 32;
 /// First word of the statistics in `SolveBuf`, cleared by the CPU after each read-back.
 const SOLVE_STATS: u64 = 21;
 /// Host read-back slots in flight.
@@ -450,6 +451,14 @@ struct ViscPc {
     half_off: u32,
 }
 
+/// Push constants of the viscosity multigrid kernels (vmg.glsl).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct VmPc {
+    level: u32,
+    mode: u32,
+}
+
 struct Pass {
     name: &'static str,
     pipeline: Arc<ComputePipeline>,
@@ -751,6 +760,15 @@ struct Passes {
     visc_iter: [Pass; 2],
     visc_update_odd: Pass,
     visc_warm: Pass,
+    /// The iteration with the multigrid preconditioner (`viscosity_precond` 1, vmg.glsl): the
+    /// update with the way down on level 0, and the way up on level 0 with A z; by sweeps per
+    /// visit (1, 2) and the parity of the iteration (r and q swap buffers).
+    visc_mgu: [[Pass; 2]; 2],
+    visc_mgz: [[Pass; 2]; 2],
+    vmg_build: Pass,
+    /// By sweeps per visit, 1 and 2 (specialisation constant NU, vmg.glsl).
+    vmg_down: [Pass; 2],
+    vmg_up: [Pass; 2],
     rhs: Pass,
     rhs_visc: Pass,
     mg_build: Pass,
@@ -946,7 +964,7 @@ impl FluidSim {
         let levels = Levels::new(grid);
         let mg = levels.total as u64;
         let nwg = grid[0].div_ceil(GRID_GROUP) * grid[1].div_ceil(GRID_GROUP);
-        let entries = levels.dims.len() as u64 + 4;
+        let entries = levels.dims.len() as u64 + 4 + levels.tail as u64;
 
         let particles = device_buffer::<Particle>(&gpu, capacity as u64, none);
         let sorted = device_buffer::<Particle>(&gpu, capacity as u64, none);
@@ -1117,6 +1135,17 @@ impl FluidSim {
         let surf = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let pjump = device_buffer::<[f32; 2]>(&gpu, cells, none);
         let tiles = device_buffer::<u32>(&gpu, nwg as u64, none);
+        // Viscosity multigrid (vmg.glsl): every level, at the offsets of the pressure hierarchy.
+        let vma = device_buffer::<[f32; 4]>(&gpu, mg, none);
+        let vmb = device_buffer::<[f32; 4]>(&gpu, mg, none);
+        let vmd = device_buffer::<[f32; 2]>(&gpu, mg, none);
+        let vmr = device_buffer::<[f32; 2]>(&gpu, mg, none);
+        let vmx = device_buffer::<[f32; 2]>(&gpu, mg, none);
+        let vmz = device_buffer::<[f32; 2]>(&gpu, mg, none);
+        let vtile = device_buffer::<u32>(&gpu, levels.tiles as u64, none);
+        let vr2 = device_buffer::<[f32; 2]>(&gpu, cells, none);
+        let vq2 = device_buffer::<[f32; 2]>(&gpu, cells, none);
+        let vaz = device_buffer::<[f32; 2]>(&gpu, cells, none);
         let params_buf = Buffer::new_sized::<GpuParams>(
             gpu.memory.clone(),
             BufferCreateInfo {
@@ -1161,6 +1190,16 @@ impl FluidSim {
         put(76, vp2.as_bytes().clone());
         put(77, p2keep.as_bytes().clone());
         put(78, vd.as_bytes().clone());
+        put(79, vma.as_bytes().clone());
+        put(80, vmb.as_bytes().clone());
+        put(81, vmd.as_bytes().clone());
+        put(82, vmr.as_bytes().clone());
+        put(83, vmx.as_bytes().clone());
+        put(84, vmz.as_bytes().clone());
+        put(85, vtile.as_bytes().clone());
+        put(86, vr2.as_bytes().clone());
+        put(87, vq2.as_bytes().clone());
+        put(88, vaz.as_bytes().clone());
         put(27, vq.as_bytes().clone());
         put(28, vw.as_bytes().clone());
         put(29, vs.as_bytes().clone());
@@ -1206,6 +1245,12 @@ impl FluidSim {
         swapped.insert(34, cgp.as_bytes().clone());
         swapped.insert(26, vp2.as_bytes().clone());
         swapped.insert(76, vp.as_bytes().clone());
+        // For the multigrid-preconditioned viscosity iteration: residual and A p swapped.
+        let mut mg_swapped = table.clone();
+        mg_swapped.insert(25, vr2.as_bytes().clone());
+        mg_swapped.insert(86, vr.as_bytes().clone());
+        mg_swapped.insert(27, vq2.as_bytes().clone());
+        mg_swapped.insert(87, vq.as_bytes().clone());
 
         let (cell_field, comp_field) = (cell.clone(), comp.clone());
         let fields = vec![
@@ -1237,6 +1282,16 @@ impl FluidSim {
             vp2.reinterpret::<[u32]>(),
             p2keep.clone().reinterpret::<[u32]>(),
             vd.clone().reinterpret::<[u32]>(),
+            vma.reinterpret::<[u32]>(),
+            vmb.reinterpret::<[u32]>(),
+            vmd.reinterpret::<[u32]>(),
+            vmr.reinterpret::<[u32]>(),
+            vmx.reinterpret::<[u32]>(),
+            vmz.reinterpret::<[u32]>(),
+            vtile,
+            vr2.reinterpret::<[u32]>(),
+            vq2.reinterpret::<[u32]>(),
+            vaz.reinterpret::<[u32]>(),
             vq.reinterpret::<[u32]>(),
             vw.reinterpret::<[u32]>(),
             vs.reinterpret::<[u32]>(),
@@ -1296,6 +1351,11 @@ impl FluidSim {
             visc_iter: [p("visc_iter", spirv!("visc_iter.comp")), Pass::new(&gpu, "visc_iter", spirv!("visc_iter.comp"), &swapped)],
             visc_update_odd: Pass::new(&gpu, "visc_update", spirv!("visc_update.comp"), &swapped),
             visc_warm: Pass::build(&gpu, "visc_warm", gpu.shader_specialized(spirv!("visc_iter.comp"), &[(1, 1)]), &table, &[]),
+            visc_mgu: [1, 2].map(|nu| [&table, &mg_swapped].map(|t| Pass::build(&gpu, "visc_mgu", gpu.shader_specialized(spirv!("visc_mgu.comp"), &[(3, nu)]), t, &[]))),
+            visc_mgz: [1, 2].map(|nu| [&table, &mg_swapped].map(|t| Pass::build(&gpu, "visc_mgz", gpu.shader_specialized(spirv!("visc_mgz.comp"), &[(3, nu), (4, 1)]), t, &[]))),
+            vmg_build: p("vmg_build", spirv!("vmg_build.comp")),
+            vmg_down: [1, 2].map(|nu| Pass::build(&gpu, "vmg_down", gpu.shader_specialized(spirv!("vmg_down.comp"), &[(3, nu)]), &table, &[])),
+            vmg_up: [1, 2].map(|nu| Pass::build(&gpu, "vmg_up", gpu.shader_specialized(spirv!("vmg_up.comp"), &[(3, nu)]), &table, &[])),
             rhs: p("rhs", spirv!("rhs.comp")),
             rhs_visc: p("rhs_visc", spirv!("rhs_visc.comp")),
             mg_build: p("mg_build", spirv!("mg_build.comp")),
@@ -2006,7 +2066,7 @@ impl FluidSim {
             steam2: [p.steam_mixing, p.steam as f32, p.steam_swirl / dx, p.steam_eddy / dx],
             // Latent heat of vaporisation of water over the heat capacity of air (1005 J/(kg K)).
             heat3: [p.eddy_heat.max(0.0), if p.evaporation != 0 { 2.257e6 / 1005.0 } else { 0.0 }, film_res(self.grid) as f32, 0.0],
-            solve: [self.entries(), 0, 0, 0],
+            solve: [self.entries(), self.visc_entry() as u32, 0, 0],
         }
     }
 
@@ -2026,9 +2086,30 @@ impl FluidSim {
     }
 
     /// Indirect entries: one per level, the coarse solve and the scalar reductions of the
-    /// pressure solve; then the viscosity grid and its reductions.
+    /// pressure solve; then the viscosity grid, its reductions and the coarse levels of its
+    /// multigrid (`visc_level_entry`).
     fn entries(&self) -> u32 {
-        self.levels.dims.len() as u32 + 4
+        self.levels.dims.len() as u32 + 4 + self.visc_mg_max() as u32
+    }
+
+    /// Most levels below the grid the viscosity V-cycle can have: those with tile flags.
+    fn visc_mg_max(&self) -> usize {
+        self.levels.tail
+    }
+
+    /// Levels below the grid in this substep's viscosity V-cycle.
+    fn visc_mg_levels(&self) -> usize {
+        (self.params.viscosity_mg_levels.max(1) as usize).min(self.visc_mg_max())
+    }
+
+    /// Sweeps per visit of each level of the viscosity V-cycle (1 or 2).
+    fn visc_mg_sweeps(&self) -> usize {
+        self.params.viscosity_mg_sweeps.clamp(1, 2) as usize
+    }
+
+    /// Indirect entry of level `l` of the viscosity multigrid (0: the viscosity grid).
+    fn visc_level_entry(&self, l: usize) -> usize {
+        if l == 0 { self.visc_entry() } else { self.levels.dims.len() + 3 + l }
     }
 
     fn coarse_entry(&self) -> usize {
@@ -2046,7 +2127,8 @@ impl FluidSim {
         debug_assert!(matches!(mode, 3 | 7 | 9));
         let pressure = !(4..8).contains(&mode);
         let n_entries = self.entries();
-        let (first, last) = if pressure { (0, n_entries - 2) } else { (n_entries - 2, n_entries) };
+        let v = self.visc_entry() as u32;
+        let (first, last) = if pressure { (0, v) } else { (v, n_entries) };
         self.pass.cg_reduce.bind_raw(b);
         self.pass.cg_reduce.push_raw(
             b,
@@ -2079,6 +2161,11 @@ impl FluidSim {
             let [x, y, z] = self.levels.groups(0);
             cmds.push(DispatchIndirectCommand { x, y, z });
             cmds.push(DispatchIndirectCommand { x: 1, y: 1, z: 1 });
+            for l in 1..=self.visc_mg_max() {
+                let [x, y, z] = self.levels.groups(l);
+                cmds.push(DispatchIndirectCommand { x, y, z });
+            }
+            debug_assert_eq!(cmds.len() as u32, self.entries());
             let both: Vec<_> = cmds.iter().chain(cmds.iter()).copied().collect();
             b.copy_buffer(CopyBufferInfo::buffers(staging(&gpu, &both), self.ind.clone())).unwrap();
             let lv = &self.levels;
@@ -2211,7 +2298,7 @@ impl FluidSim {
         let viscous = self.viscosity_mode();
         // Round the counts up so that small changes reuse a cached buffer.
         let quant = |n: u32| n.div_ceil(2) * 2;
-        let quant_v = |n: u32| n.div_ceil(4) * 4;
+        let quant_v = |n: u32| self.quant_visc(n);
         let particle_groups = self.n_slots.div_ceil(PARTICLE_GROUP).max(1);
         let key = (
             particle_groups,
@@ -2219,7 +2306,13 @@ impl FluidSim {
             quant(self.pressure_rec),
             if viscous == Viscosity::Implicit { quant_v(self.viscosity_rec) } else { viscous as u32 },
             self.tank.stride.max(ACC_MIN),
-            self.caps() | (self.params.viscous_projection.min(1) << 31) | (self.params.viscous_warm.min(1) << 30) | (self.params.viscosity_warm.min(1) << 29),
+            self.caps()
+                | (self.params.viscous_projection.min(1) << 31)
+                | (self.params.viscous_warm.min(1) << 30)
+                | (self.params.viscosity_warm.min(1) << 29)
+                | (self.params.viscosity_precond.min(1) << 28)
+                | ((self.visc_mg_levels() as u32) << 24)
+                | ((self.visc_mg_sweeps() as u32) << 22),
             quant(self.pressure2_rec),
         );
         if let Some(cb) = self.substep_cache.get(&key) {
@@ -2234,6 +2327,13 @@ impl FluidSim {
         let cb = r.finish();
         self.substep_cache.insert(key, cb.clone());
         cb
+    }
+
+    /// Recorded viscosity iterations rounded up, so that small changes reuse a cached
+    /// substep: to 4 with Jacobi, to 2 with the multigrid (whose iterations cost more).
+    fn quant_visc(&self, n: u32) -> u32 {
+        let q = if self.params.viscosity_precond != 0 { 2 } else { 4 };
+        n.div_ceil(q) * q
     }
 
     /// Builds the variants of the capability-specialised passes the tank needs now.
@@ -2447,8 +2547,46 @@ impl FluidSim {
             b.dispatch(grid_groups);
         }
         ps.visc_diag.bind_raw(b);
-        ps.visc_diag.push_raw(b, ViscPc { mode: self.params.viscosity_warm.min(1), half_off: self.nwg });
+        let mg = self.params.viscosity_precond != 0;
+        ps.visc_diag.push_raw(b, ViscPc { mode: self.params.viscosity_warm.min(1) | (mg as u32) << 1, half_off: self.nwg });
         b.dispatch(grid_groups);
+        if mg {
+            // visc_diag wrote level 0 of the multigrid; the coarser ones are Galerkin products.
+            for l in 1..=self.visc_mg_levels() {
+                ps.vmg_build.bind_raw(b);
+                ps.vmg_build.push_raw(b, VmPc { level: l as u32, mode: 0 });
+                b.dispatch(self.levels.groups(l));
+            }
+        }
+    }
+
+    /// The coarse levels of a viscosity V-cycle (vmg.glsl), down and up, skipped once the solve
+    /// has converged. Level 0 is the way down in visc_mgu.comp (or vmg_down at the start) and
+    /// the way up in visc_mgz.comp.
+    fn record_visc_coarse(&self, b: &mut Recorder) {
+        let ps = &self.pass;
+        let n = self.visc_mg_levels();
+        for l in 1..=n {
+            let down = &ps.vmg_down[self.visc_mg_sweeps() - 1];
+            down.bind_raw(b);
+            down.push_raw(b, VmPc { level: l as u32, mode: (l == n) as u32 });
+            b.dispatch_indirect(&self.ind_slice(self.visc_level_entry(l)));
+        }
+        for l in (1..=n).rev() {
+            let up = &ps.vmg_up[self.visc_mg_sweeps() - 1];
+            up.bind_raw(b);
+            up.push_raw(b, VmPc { level: l as u32, mode: (l == n) as u32 });
+            b.dispatch_indirect(&self.ind_slice(self.visc_level_entry(l)));
+        }
+    }
+
+    /// The way up on level 0 (visc_mgz.comp) of iteration `k`'s parity; its last work group
+    /// runs cg_reduce `reduce` (11 start, 13 iteration).
+    fn record_visc_up0(&self, b: &mut Recorder, parity: usize, reduce: u32) {
+        let z = &self.pass.visc_mgz[self.visc_mg_sweeps() - 1][parity];
+        z.bind_raw(b);
+        z.push_raw(b, VmPc { level: 0, mode: reduce << 4 });
+        b.dispatch_indirect(&self.ind_slice(self.visc_entry()));
     }
 
     /// The implicit solve on the active tiles. `restrain`: the velocity changed since
@@ -2474,6 +2612,28 @@ impl FluidSim {
             b.dispatch(grid_groups);
         }
         let e = self.visc_entry();
+        if self.params.viscosity_precond != 0 {
+            // Multigrid: z of the starting residual (in vr, which the odd parity of visc_mgz
+            // reads as its vr2) and the first step length (cg_reduce mode 11); then per
+            // iteration the update with the way down on level 0, the coarse levels, and the way
+            // up with A z and both step lengths (vmg.glsl).
+            let down = &ps.vmg_down[self.visc_mg_sweeps() - 1];
+            down.bind_raw(b);
+            down.push_raw(b, VmPc { level: 0, mode: 0 });
+            b.dispatch_indirect(&self.ind_slice(e));
+            self.record_visc_coarse(b);
+            self.record_visc_up0(b, 1, 11);
+            for k in 0..iters as usize {
+                let u = &ps.visc_mgu[self.visc_mg_sweeps() - 1][k % 2];
+                u.bind_raw(b);
+                u.push_raw(b, VmPc { level: 0, mode: 0 });
+                b.dispatch_indirect(&self.ind_slice(e));
+                self.record_visc_coarse(b);
+                self.record_visc_up0(b, k % 2, 13);
+            }
+            self.reduce(b, 7);
+            return;
+        }
         // Two passes per iteration: the direction, its strain and A p (visc_iter.comp, alpha
         // in its last work group), then the update (beta). The direction buffers swap with
         // the iteration's parity.
@@ -2688,11 +2848,10 @@ impl FluidSim {
     pub fn profile_passes(&mut self) -> Vec<(&'static str, f64)> {
         let viscous = self.viscosity_mode();
         let quant = |n: u32| n.div_ceil(2) * 2;
-        let quant_v = |n: u32| n.div_ceil(4) * 4;
         self.ensure_caps_passes();
         let mut r = Recorder::new(&self.gpu).with_timing(&self.gpu, 4096);
         let groups = self.n_slots.div_ceil(PARTICLE_GROUP).max(1);
-        self.record_substep(&mut r, true, groups, [quant(self.pressure_rec), quant(self.pressure2_rec)], quant_v(self.viscosity_rec), viscous);
+        self.record_substep(&mut r, true, groups, [quant(self.pressure_rec), quant(self.pressure2_rec)], self.quant_visc(self.viscosity_rec), viscous);
         let (pool, labels) = r.timing().unwrap();
         let cb = r.finish();
         let mut b = self.gpu.builder();

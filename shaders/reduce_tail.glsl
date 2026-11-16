@@ -13,6 +13,12 @@
 //           mode 0, but the density-correction potential counts as solved already
 //   mode 9  pressure end of the second solve    statistics (its own iteration count)
 //   mode 10 viscosity after the warm start (visc_iter.comp, WARM): rz, rr from part[0..n).xy
+// With the multigrid preconditioner (`viscosity_precond` 1) z comes from the V-cycle after the
+// update (vmg.glsl), which also forms A z, so both step lengths come from one reduction
+// (p.q = z.Az + 2 beta z.q + beta^2 p_old.q_old, A symmetric):
+//   mode 11 viscosity start, preconditioned (visc_mgz.comp): r.z, z.Az from part[0..n).xy
+//   mode 12 viscosity update (visc_mgu.comp): r.r, p.q from part[0..n).yz; convergence
+//   mode 13 viscosity iteration (visc_mgz.comp): r.z, z.Az, z.q from part[0..n).xyz
 // When a solve has converged, its entries in the indirect argument buffer are zeroed so
 // the iterations recorded after that point do no work.
 
@@ -147,6 +153,36 @@ void reduce_scalars(uint mode, uint n, uint n_entries, uint first_entry, uint la
             K.v_done = done ? 1u : 0u;
         }
         publish(t == 0u ? K.v_done == 0u : false, n_entries, first_entry, last_entry);
+    } else if (mode == 11u) {
+        vec4 a = total(0u, n);
+        if (t == 0u) {
+            K.v_rz = a.x;
+            K.v_beta = 0.0;
+            K.v_pq = a.y;
+            K.v_alpha = a.y > 0.0 ? a.x / a.y : 0.0;
+            if (a.x <= 0.0 || a.y <= 0.0) K.v_done = 1u;
+        }
+        publish(t == 0u ? K.v_done == 0u : false, n_entries, first_entry, last_entry);
+    } else if (mode == 12u) {
+        vec4 a = total(0u, n);
+        if (t == 0u) {
+            uint was = K.v_done;
+            K.v_iters += 1u - was;
+            bool now = a.y <= P.tol.z * P.tol.z * K.v_r0;
+            if (was == 0u) K.v_rr = a.y;
+            K.v_pq = a.z;
+            K.v_done = max(was, uint(now));
+        }
+        publish(t == 0u ? K.v_done == 0u : false, n_entries, first_entry, last_entry);
+    } else if (mode == 13u) {
+        vec4 a = total(0u, n);
+        if (t == 0u) {
+            float beta = (K.v_done == 0u && K.v_rz > 0.0) ? a.x / K.v_rz : 0.0;
+            float pq = a.y + 2.0 * beta * a.z + beta * beta * K.v_pq;
+            K.v_beta = beta;
+            K.v_alpha = (K.v_done == 0u && pq > 0.0) ? a.x / pq : 0.0;
+            K.v_rz = a.x;
+        }
     } else if (mode == 7u) {
         if (t == 0u) {
             K.v_it_max = max(K.v_it_max, K.v_iters);
@@ -157,11 +193,12 @@ void reduce_scalars(uint mode, uint n, uint n_entries, uint first_entry, uint la
     }
 }
 
-// The indirect entries a solve owns: pressure [0, n - 2), viscosity [n - 2, n).
+// The indirect entries a solve owns: pressure [0, v), viscosity [v, n), v = P.solve.y (the
+// viscosity grid, its reduction and its coarse multigrid levels).
 void reduce_entries(uint mode, uint n_entries, out uint first_entry, out uint last_entry) {
-    bool pressure = !((mode >= 4u && mode < 8u) || mode == 10u);
-    first_entry = pressure ? 0u : n_entries - 2u;
-    last_entry = pressure ? n_entries - 2u : n_entries;
+    bool pressure = !((mode >= 4u && mode < 8u) || mode >= 10u);
+    first_entry = pressure ? 0u : P.solve.y;
+    last_entry = pressure ? P.solve.y : n_entries;
 }
 
 // Called by every invocation of a 256-invocation work group of a kernel that has just

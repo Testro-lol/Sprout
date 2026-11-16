@@ -1,0 +1,55 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// The way up of a viscosity V-cycle on level 0 (vmg.glsl; specialised with EXTRA 1), in one
+// pass over the active tiles: the coarse-grid correction, post-smoothing black then red, on
+// one ring of cells more than the tile needs, so that A z of the tile follows in shared
+// memory. Writes z (vmz) and A z (vaz), with the partial sums of r.z, z.A z and z.q (q = A p
+// of this iteration); the last work group runs cg_reduce mode VM.mode >> 4: 11 at the start
+// of a solve (alpha from r.z and z.A z), 13 in the iterations (beta, and alpha from
+// p.q = z.A z + 2 beta z.q + beta^2 p_old.q_old). r is the new residual in vr2 (bindings swap
+// with the iteration's parity, mod.rs).
+
+vec2 rhs_new(int i) { return vr2[i]; }
+#define RHS_OF rhs_new
+#include "vmg.glsl"
+#include "reduce.glsl"
+#include "reduce_tail.glsl"
+
+void main() {
+    LV = lev[0];
+    uint slot = group_slot();
+    uint mode = (VM.mode >> 4) & 15u;
+    if (tiles[slot] == 0u) {
+        if (gl_LocalInvocationIndex == 0u) part[slot] = vec4(0.0);
+        finish_group(mode);
+        return;
+    }
+    O = ivec2(gl_WorkGroupID.xy) * 16;
+    uint t = gl_LocalInvocationIndex;
+    load_region(t);
+    ivec4 LC = lev[1];
+    for (int k = int(t); k < RW * RW; k += 256) {
+        ivec2 c = region_cell(k);
+        vec2 x = vec2(0.0);
+        if (inside_l(LV, c)) x = vmx[at_l(LV, c)] + vmz[at_l(LC, c >> 1)];
+        sx[k] = x * unknowns(sd[k]);
+    }
+    barrier();
+    for (int h = 1; h <= HALO; h++) half_sweep(t, (h & 1) == 0, h);   // black first, red last
+    uvec2 lc = gl_LocalInvocationID.xy;
+    ivec2 c = O + ivec2(lc);
+    int k = tile_slot(lc);
+    vec4 acc4 = vec4(0.0);
+    if (inside_l(LV, c)) {
+        int i = at_l(LV, c);
+        vec2 z = sx[k];
+        vec2 az = sd[k] * z + offd(k);
+        vmz[i] = z;
+        vaz[i] = az;
+        acc4 = vec4(dot(sr[k], z), dot(z, az), dot(z, vq2[i]), 0.0);
+    }
+    group_sum(acc4, slot);
+    finish_group(mode);
+}

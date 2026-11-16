@@ -1,0 +1,65 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// One multigrid-preconditioned conjugate-gradient iteration of the viscosity solve up to
+// the preconditioner (`viscosity_precond` 1; vmg.glsl), in one pass over the active tiles:
+//
+//   p = z + beta p          z: the preconditioned residual (vmz), beta and alpha from the
+//   q = A z + beta q        last work group of visc_mgz.comp; A z from it too (vaz), so
+//   x += alpha p            A p needs no pass of its own: A p = A z + beta A p_old
+//   r -= alpha q
+//
+// with the partial sums of r.r and p.q (the last work group tests convergence, cg_reduce mode
+// 12, and keeps p.q for the next step length), then the way down of the V-cycle on level 0
+// from the new residual. That needs r two sweeps' worth of cells around the tile, which this
+// work group computes again from r and q of the last iteration: r and q are written to a
+// second buffer (vr2, vq2), and the two swap bindings every iteration (mod.rs).
+
+// The new residual at cell i, from last iteration's r and q.
+vec2 new_q(int i) { float b = K.v_beta; vec2 s = vaz[i]; return b == 0.0 ? s : s + b * vq[i]; }
+vec2 new_r(int i) { return vr[i] - K.v_alpha * new_q(i); }
+#define RHS_OF new_r
+#define VMG_DOWN
+#include "vmg.glsl"
+#include "reduce.glsl"
+#include "reduce_tail.glsl"
+
+void main() {
+    LV = lev[0];
+    uint slot = group_slot();
+    if (tiles[slot] == 0u) {
+        if (gl_LocalInvocationIndex == 0u) part[slot] = vec4(0.0);
+        finish_group(12u);
+        return;
+    }
+    O = ivec2(gl_WorkGroupID.xy) * 16;
+    uint t = gl_LocalInvocationIndex;
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    vec4 acc4 = vec4(0.0);
+    if (all(lessThan(c, P.grid))) {
+        int i = cidx(c);
+        // Zero wherever a face is no unknown: so are z, A z, q and r there.
+        float a = K.v_alpha, b = K.v_beta;
+        vec2 z = vmz[i];
+        vec2 p = b == 0.0 ? z : z + b * vp[i];
+        vec2 q = new_q(i);
+        vec2 r = vr[i] - a * q;
+        if (all(greaterThanEqual(c, ivec2(1))) && all(lessThan(c, P.grid - 1))) {
+            vec4 v = vel[i];
+            if (face_live(v.z)) v.x += a * p.x;
+            if (face_live(v.w)) v.y += a * p.y;
+            vel[i] = v;
+            vd[i] += a * p;   // the change x - u*, for the next substep's warm start
+        }
+        vp[i] = p;
+        vq2[i] = q;
+        vr2[i] = r;
+        acc4 = vec4(0.0, dot(r, r), dot(p, q), 0.0);
+    }
+    load_region(t);   // the new residual, through new_r
+    barrier();
+    way_down(t);
+    group_sum(acc4, slot);
+    finish_group(12u);   // converged? (reduce_tail.glsl)
+}

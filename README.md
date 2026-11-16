@@ -224,7 +224,7 @@ Defaults are unchanged from before this overhaul.
 |---|---|---|
 | World | Physics panel | `gravity` (m/s²), `cell_size` (m; the panel shows mm and the tank size) |
 | Liquids | the liquid editor (per liquid); pair tensions and heat in the Physics panel | every material property as `<property>_<liquid>` or `<liquid>.<property>` (see [Liquids](#liquids); old names such as `density_oil`, `nu_syrup` still work), the six `tension_<group>_<group>` pair tensions, `droplet_cells`; heat: `ambient_temp`, `heat_rate`, `air_cooling`, `contact_heat`, `eddy_heat`, `evaporation`, `heat_power`, `rigid_viscosity`; steam: `steam` (on/off, in the panel), `steam_boil`, `steam_condense`, `steam_mixing`, `steam_rise`, `steam_life`, `steam_swirl`, `steam_eddy` |
-| Time step and accuracy | `cfl`, `pressure_tol`, `viscosity_tol` in the Solver panel; the rest `--set` only | `cfl`, `advection_order`, `dt_max`, `fixed_hz`, `pressure_tol`, `pressure_max_iters`, `iters_margin`, `correction_tol`, `viscosity_tol`, `viscosity_max_iters`, `implicit_viscosity_min`, `viscous_projection`, `viscous_warm`, `viscosity_warm` |
+| Time step and accuracy | `cfl`, `pressure_tol`, `viscosity_tol` in the Solver panel; the rest `--set` only | `cfl`, `advection_order`, `dt_max`, `fixed_hz`, `pressure_tol`, `pressure_max_iters`, `iters_margin`, `correction_tol`, `viscosity_tol`, `viscosity_max_iters`, `implicit_viscosity_min`, `viscous_projection`, `viscous_warm`, `viscosity_warm`, `viscosity_precond`, `viscosity_mg_levels`, `viscosity_mg_sweeps` |
 | Stabilisation | `speed_cap` in the Solver panel (with an off box); the rest `--set` only | see [Numerical stabilisation](#physics) |
 
 The Physics panel's *Restore defaults* resets world and liquids and returns the cell size to
@@ -1269,9 +1269,13 @@ the new velocities minimise kinetic energy change plus `dt * mu * D:D`, D the st
 That is `div(mu (grad u + grad u^T))`, not `mu lap(u)`: it is consistent across viscosity
 jumps (water next to syrup), gives traction-free free surfaces and does not slow a rigid
 rotation. Solid walls are no-slip, with the wall where it is (half a cell from the first
-tangential sample). The system is symmetric positive definite, solved by Jacobi-
-preconditioned conjugate gradients to a relative residual of 1e-3, so no viscosity is too
-large for the time step. Where the viscous diffusion number `nu dt / dx²` is below 1e-3
+tangential sample). The system is symmetric positive definite, solved by conjugate
+gradients to a relative residual of 1e-3, so no viscosity is too large for the time step.
+The preconditioner is a multigrid V-cycle (`viscosity_precond` 1, `vmg.glsl`; Performance,
+"Viscosity multigrid"): aggregation of 2 × 2 cells per velocity component with Galerkin
+coarse matrices, which keep the u–v coupling of the stress, and red-black Gauss-Seidel
+with each cell's two faces together. `viscosity_precond` 0 is the plain diagonal (Jacobi),
+which needs 5 – 10 times the iterations. Where the viscous diffusion number `nu dt / dx²` is below 1e-3
 (water: about 1e-5 on 1 cm cells) the same operator is applied explicitly instead, which is
 stable to about 0.12; in a water-only tank that is the whole tank, in mixed tanks the
 implicit solve runs only on 16 × 16 tiles near more viscous fluid.
@@ -2411,6 +2415,141 @@ the defaults and 7 with water's viscosity 0.1 % lower). That is a jump no margin
 the margin: in a build earlier in this round 0.25 and 0.5 gave identical results there and
 1.0 brought 16 down to 6. Kitchen: 2 of 438. Open (Limitations).
 
+### Viscosity multigrid (2026-11-15)
+
+The implicit viscosity solve was preconditioned with its diagonal (Jacobi): 25 – 40
+iterations per substep in viscous scenes with the warm start, up to the 200-iteration cap in
+the Bingham slot. It now takes a multigrid V-cycle (`viscosity_precond` 1, `vmg.glsl`), to
+the same tolerance `|r| <= viscosity_tol |r0(u*)|`; `viscosity_precond` 0 is the Jacobi
+solve as before (bit-identical in Upside Down; Lava Meets Water is not deterministic run to
+run in either build).
+
+**The preconditioner.** The unknowns are the u and v faces of each cell, coupled through the
+`D_xy` term of the stress. `visc_diag` writes the matrix out per cell: u–u and v–v
+couplings to the left and below, the cell's u to the v of the cells at (0, 0), (−1, 0),
+(0, 1), (−1, 1), and the diagonal (checked against the operator the iterations apply: equal
+to 1e-7 relative). Coarse levels aggregate 2 × 2 cells per component, with Galerkin matrices
+`P^T A P` (`vmg_build`), which keep that stencil shape exactly, so the u–v coupling is
+coarsened rather than dropped. The smoother is red-black Gauss-Seidel over cells with the
+two faces of a cell updated together, red then black on the way down, black then red on the
+way up, so the cycle is symmetric; the u–v coupling within one colour stays well inside the
+diagonal (checked on a CPU model of the operator up to `nu dt / dx²` = 1000: the V-cycle is
+symmetric to round-off and its smallest eigenvalue positive). Only active tiles take part,
+as before.
+
+**What decides the cost is dispatches, not arithmetic.** A pass costs at least ~4 – 6 µs
+however little it does (barrier plus launch), and the viscous region of Lava Meets Water is
+a few dozen tiles, so a Jacobi iteration there is 14 µs and a straightforward V-cycle of
+three coarse levels (eight passes) 40 µs. That first version cut iterations 5 – 3× and was
+still slower in Lava Meets Water (viscosity 0.55 → 0.83 ms per substep). What made it pay:
+
+1. **Two sweeps per visit in one pass.** Each kernel holds its tile plus a ring of
+   `2 × sweeps` cells in shared memory and recomputes that ring itself, every half-sweep one
+   cell narrower, so a second sweep costs arithmetic, not dispatches (`viscosity_mg_sweeps`).
+   Iterations, Lava Meets Water (`probe --at 2`, mean per 0.075 s): 9.1 → 6.1 at one coarse
+   level.
+2. **One coarse level is enough** (`viscosity_mg_levels`): the mass term makes the coarse
+   problems easy. Lava Meets Water 5.5 iterations with one, 5.3 with two, 5.5 with three;
+   each level costs two passes per iteration. Head-less at 1024 × 576 two levels are no
+   faster (Upside Down 29.35 against 29.29 ms) and Lava Meets Water slower (23.0 against
+   22.6 ms).
+3. **Four passes an iteration.** Conjugate gradients in the form that needs one reduction
+   per iteration (Chronopoulos–Gear): the way up on level 0 (`visc_mgz`) smooths one more
+   ring and forms `A z` of its tile too, so `A p = A z + beta A p_old` needs no pass of its
+   own, and both step lengths come from one reduction (`p.q` from `z.Az`, `z.q` and last
+   iteration's exact `p.q`). The update (`visc_mgu`) then does `x`, `r` and the way down on
+   level 0 in one pass, recomputing the new residual of the ring around its tile from last
+   iteration's `r` and `q` (which therefore swap buffers every iteration). An iteration is
+   update, coarse down, coarse up, way up: 4 passes against Jacobi's 2.
+4. **The convergence test runs in the update**, so a converged solve skips its last V-cycle;
+   the level-0 matrix is cleared once when a tile goes inactive instead of every substep.
+
+Recorded iterations (`sprout profile`, 512 × 288; pressure, second pressure, viscosity) and
+the viscosity passes per substep (`SPROUT_PROFILE_REPS=8`, best of 8 per pass; setup =
+`visc_diag` + `vmg_build`, iterations = the CG and multigrid passes):
+
+| Scene | Jacobi: recorded | viscosity passes (setup / iterations, ms) | multigrid: recorded | viscosity passes (ms) | whole substep (sum of passes, ms) |
+|---|---|---|---|---|---|
+| Playground | 10 / 8 / 24 | 0.044 / 0.543 | 12 / 7 / 8 | 0.064 / 0.389 | 3.37 → 3.27 |
+| Lava Meets Water | 10 / 7 / 33 | 0.047 / 0.507 | 12 / 8 / 11 | 0.057 / 0.336 | 3.06 → 2.90 |
+| Upside Down | 7 / 5 / 30 | 0.040 / 1.385 | 7 / 7 / 8 | 0.070 / 0.707 | 4.64 → 4.06 |
+| Kitchen | 12 / 8 / 41 | 0.046 / 0.679 | 10 / 8 / 12 | 0.062 / 0.498 | 3.84 → 3.40 |
+
+Iterations actually run are fewer than recorded (the rest are empty dispatches once
+converged): `sprout probe` means over 2 s of Lava Meets Water ~30 (Jacobi) against 5.5;
+Upside Down at 4 s 24 – 25 against 2 – 5. One multigrid iteration costs 25 – 35 µs where a
+Jacobi one costs 14 (Lava Meets Water, a few dozen active tiles) and 80 against 44 µs
+(Upside Down, the whole pool active).
+
+Head-less (`sprout bench --grid G --map N`: ms of wall time per 1/60 s simulated, median of
+3 runs interleaved with the other build; p50 / p95 and sim speed of the median run):
+
+| Scene, grid | Jacobi | multigrid | change |
+|---|---|---|---|
+| Playground 512 × 288 | 6.86 (6.92 / 7.61, 2.43×) | **6.65** (6.54 / 7.58, 2.51×) | −3 % |
+| Lava Meets Water 512 × 288 | 6.58 (6.52 / 7.12, 2.53×) | **6.12** (6.09 / 6.63, 2.72×) | −7 % |
+| Upside Down 512 × 288 | 12.23 (12.22 / 13.49, 1.36×) | **10.76** (10.66 / 11.80, 1.55×) | −12 % |
+| Kitchen 512 × 288 | 8.37 (8.19 / 9.61, 1.99×) | **8.23** (7.71 / 11.66, 2.02×) | −2 % |
+| Playground 1024 × 576 | 26.10 (25.95 / 34.41, 0.63×) | **24.32** (24.84 / 31.37, 0.68×) | −7 % |
+| Lava Meets Water 1024 × 576 | 23.80 (23.14 / 29.47, 0.70×) | **22.08** (22.41 / 25.78, 0.75×) | −7 % |
+| Upside Down 1024 × 576 | 33.52 (33.34 / 36.41, 0.50×) | **28.75** (28.42 / 32.00, 0.58×) | −14 % |
+| Kitchen 1024 × 576 | 33.59 (31.98 / 40.57, 0.50×) | **30.69** (29.80 / 38.71, 0.54×) | −9 % |
+
+Kitchen 512 × 288's p95 is worse (9.61 → 11.66 ms) although its mean and median are better:
+its viscous patches (chocolate, blood) are small and come and go, where an iteration of
+four passes costs twice a Jacobi one and the recorded spare iterations weigh most.
+
+Window, 1600 × 900 (`--map N [--quality ultra] --no-vsync --frames 2400`,
+`SPROUT_FRAMES_CSV`, the 1920 frames after warm-up; ms; sim speed = simulated / wall seconds
+after warm-up). At the default grid the simulation keeps real time and most frames only
+render, so frame times move less; at `--quality ultra` (1024 × 576) it cannot:
+
+| Scene | Build | mean | p50 | p90 | p99 | max | sim speed |
+|---|---|---|---|---|---|---|---|
+| Playground | Jacobi | 1.39 | 0.76 | 4.60 | 5.26 | 5.77 | 0.97× |
+| | multigrid | 1.47 | 0.76 | 4.52 | 5.35 | 8.68 | 0.97× |
+| Lava Meets Water | Jacobi | 1.80 | 1.02 | 4.77 | 7.06 | 8.68 | 0.99× |
+| | multigrid | **1.70** | 1.02 | 4.59 | 5.25 | 5.67 | 0.99× |
+| Upside Down | Jacobi | 1.54 | 1.02 | 4.32 | 5.85 | 7.21 | 1.00× |
+| | multigrid | **1.47** | 1.02 | 4.02 | 5.08 | 6.27 | 1.00× |
+| Kitchen | Jacobi | 2.73 | 1.10 | 5.62 | 9.26 | 15.15 | 0.99× |
+| | multigrid | **2.67** | 1.03 | 5.53 | 9.54 | 10.19 | 0.98× |
+| Playground, ultra | Jacobi | 11.10 | 11.08 | 11.85 | 12.67 | 15.80 | 0.64× |
+| | multigrid | **10.40** | 10.67 | 11.46 | 12.07 | 15.33 | 0.65× |
+| Lava Meets Water, ultra | Jacobi | 11.88 | 11.84 | 13.37 | 14.32 | 21.34 | 0.69× |
+| | multigrid | **10.33** | 10.43 | 11.44 | 12.21 | 14.20 | 0.75× |
+| Upside Down, ultra | Jacobi | 19.04 | 19.31 | 21.45 | 22.74 | 28.92 | 0.53× |
+| | multigrid | **17.20** | 17.23 | 18.97 | 20.35 | 28.42 | 0.59× |
+| Kitchen, ultra | Jacobi | 12.47 | 12.46 | 13.35 | 14.10 | 22.99 | 0.48× |
+| | multigrid | **11.98** | 11.94 | 12.80 | 13.37 | 22.57 | 0.49× |
+
+The worst single frame varies from run to run in both builds (Lava Meets Water at the default
+grid, six runs each: 6 – 15 ms Jacobi, 6 – 13 ms multigrid; frames over 8 ms: 27 against 4).
+
+Tried and not kept:
+- Three coarse levels, one sweep per visit (the first version): 7 – 8 iterations in Upside
+  Down and 8 – 10 in Lava Meets Water, but eight passes per V-cycle; slower than Jacobi in
+  Lava Meets Water (see above).
+- Block-Jacobi over tiles with a tile-local V-cycle (no coarse level across tiles, would
+  have fit in the update's pass): on the CPU model 9 – 17 iterations, no better than two
+  plain symmetric Gauss-Seidel sweeps, against 4 – 7 with a coarse level.
+- Recording a quarter more viscosity iterations than recent solves needed (as the pressure
+  does): the counts are small and jump (5 → 10 when lava reaches new tiles). To 5 s,
+  Playground ran 1 solve out of iterations (0 with half) and Kitchen's worst unconverged
+  residual was 4.7e-3 (2.2e-3 with half), for ≤ 4 % head-less. The viscosity keeps half,
+  rounded to 2 instead of 4.
+
+Checks: `validate` all 241 pass (twice: before and after the margin above), `--selftest`,
+`cargo test` (42) and clippy pass. The checks that flip under tiny parameter changes:
+`rheology` "slot flows: viscosity solves converged" 0 unconverged at gravity 9.80999,
+9.81, 9.81001 and 9.8102 (Bingham slot L2 error 5.4 % at all four; Jacobi 6.2 %); `metals`
+ferrofluid acceleration 1456 (as every build with the hierarchy split unchanged) and the
+water puddle drift 17.1 cells; `liquids` "Milk: settles" passes. Solves that ran out of
+recorded iterations to 5 s (`sprout probe --map N --at 5`), Jacobi → multigrid: Lava Meets
+Water 6 → 2 (worst residual 4.6e-3 → 1.3e-3), Kitchen 18 → 13 (3.7e-3 → 2.2e-3), Playground
+and Upside Down 0 → 0. Kitchen's are jumps in the iteration count no margin covers, as with
+the pressure (Limitations).
+
 ## Limitations
 
 - **Some pressure solves run out of recorded iterations in Lava Meets Water** (found
@@ -2480,9 +2619,11 @@ the margin: in a build earlier in this round 0.25 and 0.5 gave identical results
   heavy splash (mercury) leaves columns of particles with gaps that show.
 - **Frozen bodies weld**: touching frozen cells join one rigid body, and a rigid body cannot
   break, only melt. Bodies are found per substep; more than 4096 at once leave the rest liquid.
-- **Viscosity solves get expensive above ν dt / dx² ≈ 100** (glass and lava near the cap; 1 mm
-  cells): Jacobi-preconditioned CG needs up to the 200-iteration limit. Above the cap liquid
-  is rigid instead.
+- **Viscosity solves get more expensive above ν dt / dx² ≈ 100** (glass and lava near the cap;
+  1 mm cells): the multigrid needs about twice the iterations it needs at 10 (CPU model of
+  the operator: 5 → 8 → 9 – 11 at 10, 100, 1000; Jacobi 27 → 47 → 60 – 77), and the Bingham
+  slot of `validate rheology` reached the 200-iteration limit with Jacobi. Above the cap
+  liquid is rigid instead.
 - **Viscoelastic stress does not see wall shear** (the particles' velocity gradient omits it):
   slime is held to walls by its viscosity only.
 - **Slime's modulus is low** (100 Pa; PVA-borax gels: 1 – 3 kPa). At 2 kPa it holds together
@@ -2545,7 +2686,7 @@ the margin: in a build earlier in this round 0.25 and 0.5 gave identical results
 | [src/world.rs](src/world.rs) | The sandbox world: solids plus the simulations living in it. New simulations plug in here. |
 | [src/scene.rs](src/scene.rs) | Shapes and their rasterisation into the fields the solver and renderer use |
 | [src/sim/](src/sim/mod.rs) | The fluid solver: buffers, pipelines, the substep; [params.rs](src/sim/params.rs) holds every parameter and the `PARAMS` table of names, units and ranges; [raw.rs](src/sim/raw.rs) the hand-synchronised substep command buffers |
-| [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer; `reduce_tail.glsl` the scalar steps of the Krylov solves (run in the last work group of the kernel before them), `visc_iter.comp` one viscosity iteration (and, specialised, its warm start). |
+| [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer; `reduce_tail.glsl` the scalar steps of the Krylov solves (run in the last work group of the kernel before them), `visc_iter.comp` one Jacobi-preconditioned viscosity iteration (and, specialised, its warm start), `vmg.glsl` the viscosity multigrid and its iteration (`visc_mgu.comp`, `visc_mgz.comp`, `vmg_*.comp`). |
 | [src/render.rs](src/render.rs), [src/gui.rs](src/gui.rs) | The renderer (see [Look](#look)): splatting, the wide field, the wet map, shading; a small egui painter |
 | `shaders/splat.*`, `down.frag`, `blur.frag`, `wet.frag`, `composite.frag` | The render passes; `composite.frag` holds the whole look |
 | [src/app.rs](src/app.rs), [src/ui.rs](src/ui.rs), [src/camera.rs](src/camera.rs), [src/pacing.rs](src/pacing.rs) | Window and input; panel and canvas overlays; eased camera; substep pacing |

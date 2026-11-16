@@ -1,0 +1,71 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "vmg.glsl"
+
+// Builds level l = VM.level of the viscosity multigrid (vmg.glsl) from level l - 1: each
+// coarse u (v) is the sum of the u (v) faces of its 2 x 2 child cells, and its matrix the
+// Galerkin product P^T A P. Couplings inside an aggregate move to the diagonal (twice, once
+// for each direction); the others add up in the slot of the coarse neighbour they reach.
+// Tile flags as in mg_build.comp: a coarse tile is active when one of its four children is;
+// one that has just gone inactive has its matrix cleared once, so no active tile ever reads
+// a stale coefficient next to it.
+
+shared uint s_state;   // bit 0: tile active now, bit 1: it was active in the last build
+
+const ivec2 UV_OFF[4] = ivec2[4](ivec2(0, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(-1, 1));
+
+void main() {
+    uint l = VM.level;
+    ivec4 F = lev[l - 1u];
+    ivec4 C = lev[l];
+    if (gl_LocalInvocationIndex == 0u) {
+        ivec2 T = ivec2(gl_WorkGroupID.xy);
+        ivec2 tf = (F.yz + 15) >> 4;
+        uint on = 0u;
+        for (int k = 0; k < 4; k++) {
+            ivec2 tc = 2 * T + ivec2(k & 1, k >> 1);
+            if (tc.x < tf.x && tc.y < tf.y) on |= tile_flag(l - 1u, uint(tc.y * tf.x + tc.x));
+        }
+        uint s = uint(C.w) + gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        uint was = vtile[s];
+        vtile[s] = on != 0u ? 1u : 0u;
+        s_state = (on != 0u ? 1u : 0u) | (was != 0u ? 2u : 0u);
+    }
+    barrier();
+    uint state = s_state;
+    if (state == 0u) return;
+    ivec2 cc = ivec2(gl_GlobalInvocationID.xy);
+    if (!inside_l(C, cc)) return;
+    int o = at_l(C, cc);
+    if ((state & 1u) == 0u) {
+        vma[o] = vec4(0.0);
+        vmb[o] = vec4(0.0);
+        vmd[o] = vec2(0.0);
+        return;
+    }
+    vec2 D = vec2(0.0);
+    vec4 A = vec4(0.0), B = vec4(0.0);
+    for (int k = 0; k < 4; k++) {
+        ivec2 ab = ivec2(k & 1, k >> 1);
+        ivec2 c = 2 * cc + ab;
+        if (!inside_l(F, c)) continue;
+        int i = at_l(F, c);
+        vec4 a = vma[i], b = vmb[i];
+        D += vmd[i];
+        // u-u and v-v to the left (x, z) and below (y, w): inside the aggregate for the
+        // second column / row of children.
+        if (ab.x == 1) D += 2.0 * a.xz; else { A.x += a.x; A.z += a.z; }
+        if (ab.y == 1) D += 2.0 * a.yw; else { A.y += a.y; A.w += a.w; }
+        // u of this child to the v of four cells: the coarse cell that v lands in.
+        for (int m = 0; m < 4; m++) {
+            ivec2 rel = ((c + UV_OFF[m]) >> 1) - cc;   // one of the UV_OFF offsets again
+            int s = (rel.x == 0 ? 0 : 1) + (rel.y == 0 ? 0 : 2);
+            float bm = m == 0 ? b.x : m == 1 ? b.y : m == 2 ? b.z : b.w;
+            if (s == 0) B.x += bm; else if (s == 1) B.y += bm; else if (s == 2) B.z += bm; else B.w += bm;
+        }
+    }
+    vma[o] = A;
+    vmb[o] = B;
+    vmd[o] = max(D, vec2(0.0));
+}

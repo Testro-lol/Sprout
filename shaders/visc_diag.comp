@@ -3,13 +3,64 @@
 #include "common.glsl"
 #include "visc.glsl"
 
-// Diagonal of A for the Jacobi preconditioner (zw of vw).
+// Diagonal of A for the Jacobi preconditioner (zw of vw). With the multigrid preconditioner
+// (V.mode bit 1, `viscosity_precond` 1) also the whole matrix of level 0 in the form
+// vmg.glsl keeps it.
 
 // Strain weights as the implicit system sees them: none in an inactive tile (it took the
 // explicit step in visc_split and is cleared here).
 vec2 wts(ivec2 c, int i) { return tiles[tile_of(c)] != 0u ? vw[i].xy : vec2(0.0); }
 
+// Faces that are unknowns of the implicit system: live, of an interior cell of an active tile.
+bool unk_u(ivec2 c) { return interior(c) && tiles[tile_of(c)] != 0u && live_u(cidx(c)); }
+bool unk_v(ivec2 c) { return interior(c) && tiles[tile_of(c)] != 0u && live_v(cidx(c)); }
+
+// The couplings of A at cell c (interior, active tile) as vmg.glsl stores them. D_xx and
+// D_yy (weight wc) couple u with its left neighbour and v with the one below; D_xy at a node
+// (weight wn) is wn g g^T with g = (u_a, -u_b, v_a, -v_b) / 2 over the faces around it,
+// where a closed face that mirrors its live partner doubles the partner's entry (as in
+// strain_of_vel, visc.glsl).
+void couplings(ivec2 c, int i, out vec4 a, out vec4 b) {
+    int W = P.grid.x;
+    ivec2 L = c - ivec2(1, 0), D = c - ivec2(0, 1), U = c + ivec2(0, 1);
+    bool u = unk_u(c), v = unk_v(c);
+    a = vec4(0.0);
+    b = vec4(0.0);
+    if (u && unk_u(L)) a.x = -wts(L, i - 1).x;
+    if (v && unk_v(D)) a.w = -wts(D, i - W).x;
+    // Node c: u_a = u(c), u_b = u(c - (0, 1)), v_a = v(c), v_b = v(c - (1, 0)).
+    float wn = wts(c, i).y;
+    if (wn > 0.0) {
+        float ua = u ? (closed_u(i - W) ? 1.0 : 0.5) : 0.0;
+        float ub = unk_u(D) ? -(closed_u(i) ? 1.0 : 0.5) : 0.0;
+        float va = v ? (closed_v(i - 1) ? 1.0 : 0.5) : 0.0;
+        float vb = unk_v(L) ? -(closed_v(i) ? 1.0 : 0.5) : 0.0;
+        a.y = wn * ua * ub;
+        a.z = wn * va * vb;
+        b.x = wn * ua * va;
+        b.y = wn * ua * vb;
+    }
+    // Node c + (0, 1), where u(c) is u_b: its v_a = v(c + (0, 1)), v_b = v(c + (-1, 1)).
+    float wu = wts(U, i + W).y;
+    if (wu > 0.0 && u) {
+        float ub = -(closed_u(i + W) ? 1.0 : 0.5);
+        float va = unk_v(U) ? (closed_v(i + W - 1) ? 1.0 : 0.5) : 0.0;
+        float vb = unk_v(U - ivec2(1, 0)) ? -(closed_v(i + W) ? 1.0 : 0.5) : 0.0;
+        b.z = wu * ub * va;
+        b.w = wu * ub * vb;
+    }
+}
+
+shared uint s_was;   // the tile was active in the last substep (multigrid, vtile of level 0)
+
 void main() {
+    bool mg = (V.mode & 2u) != 0u;
+    uint slot = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (mg) {
+        if (gl_LocalInvocationIndex == 0u) s_was = vtile[slot];
+        barrier();
+        if (gl_LocalInvocationIndex == 0u) vtile[slot] = tiles[slot];
+    }
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (!in_grid(c)) return;
     int i = cidx(c);
@@ -33,7 +84,7 @@ void main() {
     // Last substep's change x - u* becomes this one's warm start (V.mode 1, visc_iter.comp
     // WARM): rescaled to this substep's length, on the faces that are live now.
     vec2 dv = vec2(0.0);
-    if (V.mode != 0u && on && interior(c)) dv = vd[i] * (S.dt / S.dt_prev) * vec2(live_u(i) ? 1.0 : 0.0, live_v(i) ? 1.0 : 0.0);
+    if ((V.mode & 1u) != 0u && on && interior(c)) dv = vd[i] * (S.dt / S.dt_prev) * vec2(live_u(i) ? 1.0 : 0.0, live_v(i) ? 1.0 : 0.0);
     vd[i] = dv;
     if (!on) {
         // Remove the inactive tile from the implicit system (once a pass of its own).
@@ -45,4 +96,24 @@ void main() {
         vq[i] = vec2(0.0);
     }
     vw[i] = o;
+    // The multigrid's matrix of level 0. A tile going inactive has its matrix and vectors
+    // cleared once (they are read next to active tiles); nothing writes them while it stays
+    // inactive.
+    if (mg && (on || s_was != 0u)) {
+        vec4 a = vec4(0.0), b = vec4(0.0);
+        vec2 dm = vec2(0.0);
+        if (on && interior(c)) {
+            couplings(c, i, a, b);
+            dm = d * vec2(live_u(i) ? 1.0 : 0.0, live_v(i) ? 1.0 : 0.0);
+        }
+        if (!on) {
+            vmz[i] = vec2(0.0);
+            vaz[i] = vec2(0.0);
+            vr2[i] = vec2(0.0);
+            vq2[i] = vec2(0.0);
+        }
+        vma[i] = a;
+        vmb[i] = b;
+        vmd[i] = dm;
+    }
 }

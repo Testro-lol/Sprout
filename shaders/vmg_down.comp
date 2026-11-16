@@ -1,0 +1,18 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#define VMG_DOWN
+#include "vmg.glsl"
+
+// The way down of a viscosity V-cycle on one level (vmg.glsl: way_down), in one pass over its
+// cells. Level 0 takes this pass only at the start of a solve; in the iterations it runs
+// inside the update (visc_mgu.comp).
+
+void main() {
+    LV = lev[VM.level];
+    uint slot = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (tile_flag(VM.level, slot) == 0u) return;
+    O = ivec2(gl_WorkGroupID.xy) * 16;
+    load_region(gl_LocalInvocationIndex);
+    way_down(gl_LocalInvocationIndex);
+}

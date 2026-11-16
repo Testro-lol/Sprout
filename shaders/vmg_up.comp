@@ -1,0 +1,32 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "vmg.glsl"
+
+// The way up of a viscosity V-cycle on a coarse level (vmg.glsl), in one pass over its cells:
+// the coarse-grid correction x + P z_coarse (none on the coarsest level of the cycle), then
+// post-smoothing, NU sweeps black then red (the mirror image of the way down), the finished
+// values written to vmz. Level 0 takes its way up in visc_mgz.comp.
+
+void main() {
+    LV = lev[VM.level];
+    uint slot = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (tile_flag(VM.level, slot) == 0u) return;
+    O = ivec2(gl_WorkGroupID.xy) * 16;
+    uint t = gl_LocalInvocationIndex;
+    load_region(t);
+    ivec4 LC = lev[min(VM.level + 1u, uint(lev.length()) - 1u)];
+    for (int k = int(t); k < RW * RW; k += 256) {
+        ivec2 c = region_cell(k);
+        vec2 x = vec2(0.0);
+        if (inside_l(LV, c)) {
+            x = vmx[at_l(LV, c)];
+            if (!coarsest()) x += vmz[at_l(LC, c >> 1)];
+        }
+        sx[k] = x * unknowns(sd[k]);
+    }
+    barrier();
+    for (int h = 1; h <= HALO; h++) half_sweep(t, (h & 1) == 0, h);   // black first, red last
+    ivec2 c = O + ivec2(gl_LocalInvocationID.xy);
+    if (inside_l(LV, c)) vmz[at_l(LV, c)] = sx[tile_slot(gl_LocalInvocationID.xy)];
+}
