@@ -1363,7 +1363,13 @@ its real viscosity, and it changes almost nothing at this scale (see Validation)
   concentrate or a diluent: water's families blend by their exchange instead.
 
 **Liquid and air.** Air is not simulated. A cell is liquid when it holds at least half its
-rest density; sparser spray flies ballistically until it lands.
+rest density; sparser spray flies ballistically until it lands. Two kinds of sparse cell
+still count as liquid: a thin cell squeezed between two liquid ones (a stretched stream),
+and a cell lying on liquid that holds at least a quarter of its rest density (the top of a
+pool whose level falls inside a row of cells; not for non-Newtonian liquids, whose plug
+holds the sparse top of a pile). As air, that top row's particles gathered the air faces
+above them, which gain gravity every substep with no pressure to answer it: a resting pool
+then pumped itself into motion (Validation, "Still water surface").
 
 **Numerical stabilisation.** Every device below exists for a stated reason, is a named
 parameter in [src/sim/params.rs](src/sim/params.rs) with a value that switches it off
@@ -1859,6 +1865,67 @@ particle 0.00 cells/s); steam bubbles escaping from 20 °C water 87 → 95 of 19
 96); viscosity solves left unconverged in 4 s of Playground at 1024 × 576 92 → 44.
 `validate`: all 240 checks pass; `--selftest`, `cargo test` (42) and clippy pass.
 
+### Still water surface (2026-11-15)
+
+A wall-to-wall layer of water at rest under air sped up from 0.44 to 1.7 cells/s mean
+particle speed in 24 s, in a circulation converging at the surface (up to 8 cells/s there).
+Turning the density correction off kept it at 0.1 cells/s, and under oil the same water stayed
+still, but the correction was not the cause. When the pool's level falls inside a row of
+cells, that row is too sparse to count as liquid (under half its rest density), so it is air.
+Its particles gathered the air faces above them. No projection acts on those faces, and they
+gain gravity every substep. The particles sank into the row below at a steady 0.54 cells/s,
+which made that row over-full, and the density correction lifted them back at 1.2 cells/s.
+That cycle fed downward momentum in at the surface, and the momentum grew into the
+circulation. Now a sparse cell lying on packed liquid stays liquid when it holds at least a
+quarter of its rest density (`grid_prep.comp`, `RESTING_LEVEL`), so the pressure supports
+its particles.
+
+Mean water particle speed (cells/s) after 24 s, wall to wall under air
+(`LAB_LAVA_JITTER=1 LAB_FULL=1 LAB_BARE=1 LAB_JITTER_MAT=water LAB_NOHEAT=1 LAB_SETTLE=24
+sprout lab`, depth by `LAB_LAVA_DEPTH` as a share of the 288-cell height; `LAB_PUMP=1`
+prints the per-row diagnosis):
+
+| Depth (cells) | 21.6 | 23.0 | 24.5 | 28.8 | 34.6 | 43.2 | 57.6 | 86.4 |
+|---|---|---|---|---|---|---|---|---|
+| before | 3.06 | 0.077 | 2.31 | 0.075 | 1.78 | 0.052 | 1.40 | 0.51 |
+| after | 0.013 | 0.077 | 0.013 | 0.075 | 0.013 | 0.052 | 0.013 | 0.013 |
+
+The depths that end on a full row of particles (23.0, 28.8, 43.2) never form such a cell
+and are unchanged; their slow rise from about 0.04 is the same in both builds. At 34.6
+cells: water viscosity +0.1 % gives 0.013 (before 1.66); the correction off gives 0.012
+(before 0.1). Water under oil 0.032 → 0.032; a bare syrup pool 0.41 → 0.39 (its wall
+circulation, Limitations).
+
+Tried before this and set aside:
+- Correction settings: `correction_deadband=0` 0.90, `correction_time=0.05` 1.0,
+  `correction_tol=1e-4` 1.67; `correction_step_max=0` had no effect.
+- In `rhs.comp`: no correction in surface cells, 0.95; the same with no deadband, 0.97.
+- The midpoint without the correction displacement: 2.0.
+- In the gather, the air faces weighted by their own share of the weights: 0.11. It no
+  longer conserves momentum, though: the mercury puddle drifted 23 cells (limit 20), and a
+  slot-flow viscosity solve failed to converge.
+- The same for gravity only: 0.41 and rising.
+
+New and changed checks:
+- `validate settle`, "shallow pool: mean particle speed every 4 s": the 34.6-cell layer,
+  < 0.15. Before: 0.49 → 1.78, fails. After: 0.010 – 0.013.
+- `validate current`, "stream: the current carries it sideways": its guard on the number of
+  particles in the band was "> 100". The free stream holds 104 there, and 99 – 102 in either
+  build with the current, so it now asks for over half the free stream's count.
+- `validate tools`, "solids: the refilled pool does not clump": a single sample of the
+  fullest cell caught passing crowds. A 0.1 % change of water's viscosity moved it between
+  9 and 15 in either build. It is now the middle of three samples 0.1 s apart (before [11,
+  11, 10], after [9, 10, 8]).
+
+Fragile in both builds and left as they are:
+- The steam check "2 s after the brush is lifted": 1 – 2 particles left for some 0.1 %
+  viscosity changes, before and after.
+- The mercury puddle's drift: 20.5 / 37.4 cells before and 60.8 / 9.3 after, for mercury
+  density −0.04 % / +0.04 %. It sloshes for seconds with nothing to hold it in place. Both
+  pass at the defaults (4.5 before, 14.2 after).
+
+`validate`: all 241 checks pass; `--selftest`, `cargo test` (42) and clippy pass.
+
 ## Performance
 
 Hardware: AMD Ryzen 5 3600, NVIDIA RTX 3060 Ti 8 GB, Fedora 45, Wayland. All three versions
@@ -2176,6 +2243,28 @@ the tolerance. It has its own adaptive iteration count, so where it has nothing 
 simulation frames were already the slow ones (p75 – p99); the simulated / wall ratio stays
 within 3 %, Playground 0.94 → 0.91×. `viscous_projection=0` restores the old cost and order.
 
+### Still water surface (2026-11-15)
+
+Measured while another sprout session was loading the same GPU, so the absolute frame times
+are several times the ones above. The builds before (main 3e9964c's shader) and after ran the
+same commands interleaved, two rounds each (`--map NAME --no-vsync --frames 1500`, first
+300 frames skipped, `SPROUT_FRAMES_CSV`):
+
+| Scene | Build | p5 / p50 / p90 / p99 frame (ms) | simulated / wall |
+|---|---|---|---|
+| Dam Break | before | 0.60 / 1.83 / 10.77 / 11.15, 0.60 / 1.87 / 10.68 / 11.28 | 0.95×, 0.95× |
+| | after | 0.60 / 1.85 / 10.83 / 15.14, 0.61 / 1.83 / 10.85 / 15.80 | 0.94×, 0.95× |
+| Playground | before | 0.81 / 10.86 / 11.15 / 18.31, 0.78 / 10.84 / 11.22 / 19.79 | 0.85×, 0.80× |
+| | after | 0.79 / 4.94 / 11.16 / 17.84, 0.82 / 10.81 / 11.12 / 17.97 | 0.72×, 0.87× |
+| Kitchen | before | 8.47 / 13.20 / 15.09 / 15.50, 0.96 / 12.53 / 13.67 / 20.60 | 0.69×, 0.73× |
+| | after | 0.95 / 12.68 / 13.56 / 19.95, 6.85 / 13.14 / 15.13 / 15.69 | 0.70×, 0.67× |
+
+The spread is the other load. The rounds disagree with each other more than the builds do.
+The one pass that changed, `grid_prep`, is a few extra operations per cell. By GPU
+timestamps (`sprout profile --grid 1600x900 --map 1`, interleaved) it took 0.480 / 0.473 ms
+per substep before and 0.466 / 0.466 ms after. The substeps per frame are unchanged (6.8 /
+6.8 before, 6.7 / 6.7 after).
+
 ## Limitations
 
 - **A resting viscous pool still moves a little at its free surface** (2026-11-15). Its
@@ -2183,11 +2272,13 @@ within 3 %, Playground 0.94 → 0.91×. `viscous_projection=0` restores the old 
   wall-to-wall layer of lava at rest moves 0.02 cells in 2 s next to the walls (was 11.6)
   and under 0.01 cells/s below its top cells. What is left, 0.04 – 0.07 cells/s mean
   particle speed, sits in the top cells and is the density correction (with
-  `correction_max=0` the pool is at 0.001 cells/s), as in the water pool below.
-- **A still pool of water open to the air slowly gains motion** (found 2026-11-15): wall to
-  wall, its mean speed grows from 0.44 to 1.7 cells/s in 24 s, in a circulation that
-  converges at the surface. The density correction drives it (with `correction_max=0` it
-  stays at 0.1 cells/s); under oil the same water stays still.
+  `correction_max=0` the pool is at 0.001 cells/s).
+- **Oil resting on water, open to the air, slowly gains motion** (found 2026-11-15): wall to
+  wall, a layer of oil over still water speeds up from 0.14 to 0.48 cells/s in 24 s, while
+  the water under it stays at 0.03. It is not the density correction (with
+  `correction_max=0` the oil moves more, 0.54) and not the pump that the still water surface
+  had (fixed, Validation "Still water surface"); measured before the wall-circulation fix
+  (Validation, "Wall circulation") was merged with it.
 
 - **Liquids of one phase group share one temperature per cell.** Different groups keep their
   own; oil and wax in one cell do not, so hot wax stirred into cold oil meets it at the mean

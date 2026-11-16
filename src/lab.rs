@@ -751,6 +751,41 @@ fn lava_jitter(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2]) {
         let o: Vec<f32> = ps.iter().filter(|p| p.material() == Some(Material::Oil)).map(|p| (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt()).collect();
         let m = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
         println!("t {t:5.1} s  {:?} speed {:.3}  oil {:.3} cells/s", what, m(&l), m(&o));
+        if std::env::var("LAB_PUMP").is_ok() {
+            // Diagnostic: centre of mass height of the liquid, and per depth (rows below the
+            // highest liquid row) the mean occupancy and correction displacement (vel.w).
+            let ys: Vec<f32> = ps.iter().filter(|p| p.material() == Some(what)).map(|p| p.pos[1]).collect();
+            let g = w.sim.download_grid();
+            let gx = grid[0] as usize;
+            let mut line = format!("   com y {:.4}  rows(phi, corr_y):", m(&ys));
+            for y in (25..40).rev() {
+                let (mut ph, mut cw, mut n) = (0.0f32, 0.0f32, 0.0f32);
+                for x in 2..gx - 2 {
+                    let q = g.vel[y * gx + x][3];
+                    if q.abs() < 1e29 {
+                        ph += g.cell[y * gx + x][0];
+                        cw += q;
+                        n += 1.0;
+                    }
+                }
+                line += &format!(" y{y}:{:.3},{:+.4}", ph / n, cw / n);
+            }
+            println!("{line}");
+            // Mean particle vy and count per row.
+            let mut row = [[0.0f32; 2]; 40];
+            for p in ps.iter().filter(|p| p.material() == Some(what)) {
+                let y = p.pos[1] as usize;
+                if (25..40).contains(&y) {
+                    row[y][0] += p.vel[1];
+                    row[y][1] += 1.0;
+                }
+            }
+            let mut line = "   particle vy:".to_string();
+            for y in (25..37).rev() {
+                line += &format!(" y{y}:{:+.3}({:.0})", row[y][0] / row[y][1].max(1.0), row[y][1]);
+            }
+            println!("{line}");
+        }
     }
     let (gx, gy) = (grid[0] as usize, grid[1] as usize);
     // Cells deep in the lava, from the particles.
