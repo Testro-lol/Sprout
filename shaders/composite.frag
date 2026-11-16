@@ -71,8 +71,18 @@ layout(push_constant) uniform PC {
 
 layout(location = 0) out vec4 f_color;
 
-// 0 compiles the vapour field out (render.rs: composite_dry, for a tank without steam).
+// 0 compiles the vapour field out (render.rs: composite variants, for a tank without steam).
 layout(constant_id = 0) const uint HAS_VAPOUR = 1u;
+// What else the tank can show (render.rs: `Features`): bit 0 the carried patterns (lava's
+// crackle, oil's iridescence, the sparkle of a liquid that glints above 0.5, as honey),
+// bit 1 stains (the film map). A variant
+// without one compiles its code out: the code alone cost about 0.1 ms a 1600 x 900 frame
+// where it never ran. Leaving a bit out is exact where no liquid in the tank has the effect:
+// its weight is then zero in every cell, and the film map is empty until a staining liquid
+// has been in the tank.
+layout(constant_id = 1) const uint FX = 3u;
+const bool FX_PATTERNS = (FX & 1u) != 0u;
+const bool FX_FILM = (FX & 2u) != 0u;
 
 // Light comes from the upper left; world space, +y up.
 const vec2 LIGHT = vec2(-0.45, 0.893);
@@ -529,7 +539,7 @@ vec3 draw_film(vec3 under, vec2 x, float zoom) {
     // (The map ends at the grid: beyond it the sampler would repeat its edge texels, and a
     // run on the tank's floor was drawn as a curtain of streaks down to the bottom of the
     // window.)
-    if (pc.stain_k <= 0.0 || any(lessThan(x, vec2(0.0))) || any(greaterThan(x, vec2(pc.grid)))) return under;
+    if (!FX_FILM || pc.stain_k <= 0.0 || any(lessThan(x, vec2(0.0))) || any(greaterThan(x, vec2(pc.grid)))) return under;
     // (One bilinear tap first: most of the screen has no film within reach.)
     vec2 uv = x / vec2(pc.grid);
     vec2 ts = 1.0 / vec2(textureSize(film_h, 0).xy);
@@ -689,7 +699,7 @@ void main() {
     float fast = em.w;
     // The effects (optics table `fx`), and how far the liquid has carried their patterns.
     vec4 fxv = co.fx / wo;
-    float glint = fxv.y, irid = fxv.z, crackle = fxv.w;
+    float glint = fxv.y, irid = FX_PATTERNS ? fxv.z : 0.0, crackle = FX_PATTERNS ? fxv.w : 0.0;
     Carry ks = carry(world, false, false), kl = carry(world, true, false);
     // The key light that reaches the liquid here through the liquid above it, and the
     // quenched skin of a melt.
@@ -953,7 +963,7 @@ void main() {
             // A liquid that glistens (honey: `glint`) breaks its highlight into a few brighter
             // points, carried by its flow, and holds a broad soft gloss around it: a viscous
             // surface is never quite smooth. Only inside the highlight, never over the body.
-            if (glint > 0.5 && nh > 0.6) {
+            if (FX_PATTERNS && glint > 0.5 && nh > 0.6) {
                 float gf = detail(1.2, zoom);
                 float sp = carried_noise(world, ks, 1.2, 5.0, 0.0);  // (moving with the liquid; still on still honey)
                 float sparkle = smoothstep(0.62, 0.8, sp) * gf;

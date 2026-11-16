@@ -3,7 +3,8 @@
 #include "common.glsl"
 #include "visc.glsl"
 
-// Weights of the strain samples: cell (i, j) and node (i, j). Also marks the tiles that need
+// Weights of the strain samples: cell (i, j) and node (i, j), and the strain of the current
+// velocities with them (visc.glsl: strain_of_vel). Also marks the tiles that need
 // the implicit solve: those within one cell of a cell whose diffusion number reaches
 // P.corr.w (params.rs: implicit_viscosity_min; the tile buffer is cleared before this pass).
 
@@ -41,6 +42,9 @@ void main() {
     vec4 o = vw[i];
     o.xy = vec2(wc, wn);
     vw[i] = o;
+    // The strain of u* with these weights (for visc_split's explicit step and the start of
+    // the implicit solve).
+    vs[i] = strain_of_vel(i, o.xy);
     vec4 me = cell[i];
     if (me.w > 0.0 && S.dt * me.z / max(me.y, 0.05) >= P.corr.w) {
         for (int b = -1; b <= 1; b++) {

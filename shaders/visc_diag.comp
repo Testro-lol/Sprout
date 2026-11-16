@@ -5,24 +5,44 @@
 
 // Diagonal of A for the Jacobi preconditioner (zw of vw).
 
+// Strain weights as the implicit system sees them: none in an inactive tile (it took the
+// explicit step in visc_split and is cleared here).
+vec2 wts(ivec2 c, int i) { return tiles[tile_of(c)] != 0u ? vw[i].xy : vec2(0.0); }
+
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (!in_grid(c)) return;
     int i = cidx(c);
     int W = P.grid.x;
+    bool on = tile_active();
     vec2 d = vec2(1.0);
     if (interior(c)) {
         vec4 cf = coef[i];
+        vec2 me = wts(c, i);
         if (live_u(i)) {
             float c1 = closed_u(i - W) ? 1.0 : 0.5, c2 = closed_u(i + W) ? 1.0 : 0.5;
-            d.x = cf.z + vw[i - 1].x + vw[i].x + vw[i].y * c1 * c1 + vw[i + W].y * c2 * c2;
+            d.x = cf.z + wts(c - ivec2(1, 0), i - 1).x + me.x + me.y * c1 * c1 + wts(c + ivec2(0, 1), i + W).y * c2 * c2;
         }
         if (live_v(i)) {
             float d1 = closed_v(i - 1) ? 1.0 : 0.5, d2 = closed_v(i + 1) ? 1.0 : 0.5;
-            d.y = cf.w + vw[i - W].x + vw[i].x + vw[i].y * d1 * d1 + vw[i + 1].y * d2 * d2;
+            d.y = cf.w + wts(c - ivec2(0, 1), i - W).x + me.x + me.y * d1 * d1 + wts(c + ivec2(1, 0), i + 1).y * d2 * d2;
         }
     }
     vec4 o = vw[i];
     o.zw = d;
+    // Last substep's change x - u* becomes this one's warm start (V.mode 1, visc_iter.comp
+    // WARM): rescaled to this substep's length, on the faces that are live now.
+    vec2 dv = vec2(0.0);
+    if (V.mode != 0u && on && interior(c)) dv = vd[i] * (S.dt / S.dt_prev) * vec2(live_u(i) ? 1.0 : 0.0, live_v(i) ? 1.0 : 0.0);
+    vd[i] = dv;
+    if (!on) {
+        // Remove the inactive tile from the implicit system (once a pass of its own).
+        o.xy = vec2(0.0);
+        vs[i] = vec4(0.0);
+        vr[i] = vec2(0.0);
+        vp[i] = vec2(0.0);
+        vp2[i] = vec2(0.0);
+        vq[i] = vec2(0.0);
+    }
     vw[i] = o;
 }

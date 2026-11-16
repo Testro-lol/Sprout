@@ -310,8 +310,8 @@ pub fn probe(gpu: Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), map:
     }
     let st = world.sim.solver;
     println!(
-        "substeps {}  unconverged pressure {} viscosity {}  worst residual pressure {:.1e} viscosity {:.1e}",
-        st.substeps, st.pressure_unconverged, st.viscosity_unconverged, worst.0, worst.1
+        "substeps {}  unconverged pressure {} viscosity {}  worst residual pressure {:.1e} viscosity {:.1e}  recording {:?}",
+        st.substeps, st.pressure_unconverged, st.viscosity_unconverged, worst.0, worst.1, world.sim.recorded_iters()
     );
     if let Some(path) = out {
         let size = [1280, 720];
@@ -440,6 +440,7 @@ pub fn profile(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], ma
         exec += (t2 - t1).as_secs_f64();
     }
     let substeps = (world.sim.solver.substeps - s0) as f64;
+    println!("recorded iterations (pressure, second pressure, viscosity): {:?}", world.sim.recorded_iters());
     for (rebind, fine) in [(true, false), (false, false), (true, true), (false, true)] {
         let ms = world.sim.dispatch_floor(2000, rebind, fine);
         println!("dispatch floor: {:.2} us per {} dispatch{}", ms * 1e3, if fine { "full-grid cg_scale" } else { "single-group" }, if rebind { " (rebinding each time)" } else { "" });
@@ -447,7 +448,84 @@ pub fn profile(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2], ma
     for _ in 0..2 {
         println!("per-frame optics passes: {:.3} ms per frame", world.sim.profile_optics(300));
     }
-    let passes = world.sim.profile_passes();
+    for _ in 0..2 {
+        println!("pressure V-cycle: {:.1} us each", world.sim.vcycle_floor(500) * 1e3);
+    }
+    // Rendering: `n` frames recorded into one submission (GPU time per frame), and the CPU
+    // time to record one. Window-sized target (`--size`, default 1600 x 900).
+    {
+        use vulkano::{command_buffer::PrimaryCommandBufferAbstract, sync::GpuFuture};
+        let size = std::env::var("SPROUT_PROFILE_SIZE").ok().and_then(|s| crate::parse_pair(&s)).unwrap_or([1600, 900]);
+        let mut off = Offscreen::new(gpu.clone(), size);
+        let view = View::fit(grid, size);
+        off.draw(&world.sim, view);
+        for _ in 0..2 {
+            let n = 100;
+            let t0 = Instant::now();
+            let mut b = gpu.builder();
+            for _ in 0..n {
+                off.renderer.render(&mut b, off.view.clone(), &world.sim, view, |_| {});
+            }
+            let cb = b.build().unwrap();
+            let t1 = Instant::now();
+            cb.execute(gpu.queue.clone()).unwrap().then_signal_fence_and_flush().unwrap().wait(None).unwrap();
+            let t2 = Instant::now();
+            println!(
+                "render {}x{}: GPU {:.3} ms per frame, recording {:.3} ms per frame",
+                size[0], size[1], (t2 - t1).as_secs_f64() * 1e3 / n as f64, (t1 - t0).as_secs_f64() * 1e3 / n as f64
+            );
+        }
+        // One frame with a timestamp after each pass.
+        use vulkano::query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType};
+        let pool = QueryPool::new(gpu.device.clone(), QueryPoolCreateInfo { query_count: 6, ..QueryPoolCreateInfo::query_type(QueryType::Timestamp) }).unwrap();
+        let mut best = [f64::MAX; 5];
+        let mut full_best = f64::MAX;
+        for rep in 0..40 {
+            let full = rep % 2 == 1;
+            let mut b = gpu.builder();
+            unsafe { b.reset_query_pool(pool.clone(), 0..6) }.unwrap();
+            off.renderer.timing = Some(pool.clone());
+            off.renderer.full_composite = full;
+            off.renderer.render(&mut b, off.view.clone(), &world.sim, view, |_| {});
+            off.renderer.full_composite = false;
+            off.renderer.timing = None;
+            crate::sim::submit_and_wait(&gpu, b);
+            let mut ticks = [0u64; 6];
+            pool.get_results(0..6, &mut ticks, QueryResultFlags::WAIT).unwrap();
+            let period = gpu.device.physical_device().properties().timestamp_period as f64 * 1e-6;
+            if full {
+                full_best = full_best.min(ticks[5].saturating_sub(ticks[4]) as f64 * period);
+                continue;
+            }
+            for k in 0..5 {
+                best[k] = best[k].min(ticks[k + 1].saturating_sub(ticks[k]) as f64 * period);
+            }
+        }
+        println!("composite with every effect compiled in: {full_best:.3} ms");
+        println!("render passes, ms (best of 20, the variant this tank gets): optics {:.3}, splat {:.3}, vapour {:.3}, wide field {:.3}, composite {:.3}", best[0], best[1], best[2], best[3], best[4]);
+        // The composite variant this tank gets against the full shader, on the same state.
+        let mine = off.capture(&world.sim, view);
+        off.renderer.full_composite = true;
+        let full = off.capture(&world.sim, view);
+        off.renderer.full_composite = false;
+        let (mut differ, mut most) = (0usize, 0u8);
+        for (a, b) in mine.iter().zip(&full) {
+            let d = a.abs_diff(*b);
+            if d > 0 {
+                differ += 1;
+                most = most.max(d);
+            }
+        }
+        println!("composite variant {:?} against the full shader: {differ} channel values differ, by at most {most}", world.sim.render_features());
+    }
+    // Best of several runs per pass: one timed substep alone is at the mercy of the clocks.
+    let reps = std::env::var("SPROUT_PROFILE_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(1u32).max(1);
+    let mut passes = world.sim.profile_passes();
+    for _ in 1..reps {
+        for (best, now) in passes.iter_mut().zip(world.sim.profile_passes()) {
+            best.1 = best.1.min(now.1);
+        }
+    }
     let line: Vec<String> = passes.iter().map(|(n, ms)| format!("{n} {ms:.3}")).collect();
     println!("one substep, GPU ms by pass: {}", line.join(", "));
     println!(

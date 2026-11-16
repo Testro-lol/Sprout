@@ -6,7 +6,8 @@
 // Second projection, after the viscosity (see rhs_visc.comp): subtracts the gradient of
 // P2 = P - P1, the part of the pressure the second solve added. Air takes P2 = 0 (the
 // interface jumps belong to the first solve). The density-correction gradient (vel.zw)
-// stays as project.comp left it. Reports the fastest live face again for the CFL limit.
+// stays as project.comp left it. Keeps P2 for the next substep's warm starts. Reports the
+// fastest live face again for the CFL limit.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -24,6 +25,7 @@ void main() {
         return;
     }
     int i = cidx(c);
+    p2keep[i] = p2(i);   // the next substep's warm starts (cg_scale.comp, rhs_visc.comp)
     vec4 cf = coef[i];
     vec4 me = vel[i];
     bool lu = face_live(me.z) && cf.x != 0.0, lv = face_live(me.w) && cf.y != 0.0;

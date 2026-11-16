@@ -81,6 +81,7 @@ layout(std140, set = 0, binding = 0) uniform Params {
     vec4 steam;           // vapour quality below which steam condenses; puff rise speed (cells / s); puff lifetime (s); quality at which boiling water becomes steam
     vec4 steam2;          // rate of the exchange inside a cell that holds steam (1 / s); 1: boiling aqueous liquid turns into steam (0: it leaves at once); eddy speed of the air puffs ride (cells / s); eddy size (cells)
     vec4 heat3;           // Smagorinsky constant of the sub-grid heat mixing (0 off); evaporation: L_vap / c_p,air (K, 0 off); unused; unused
+    uvec4 solve;          // indirect entries per set (reduce_tail.glsl); unused x3
 } P;
 
 layout(std430, set = 0, binding = 1) buffer ParticleBuf { Particle particles[]; };
@@ -103,6 +104,8 @@ layout(std430, set = 0, binding = 7) buffer CoefBuf { vec4 coef[]; };   // g_u, 
 // couplings to the left, right, bottom, top neighbour. Diagonals are in MgD.
 layout(std430, set = 0, binding = 8) buffer MgABuf { vec4 mga[]; };
 layout(std430, set = 0, binding = 9) buffer RhsBuf { vec4 prhs[]; };    // rhs (pressure), rhs (correction)
+// The viscous part P2 of last substep's pressure (project_visc.comp), to warm-start both solves.
+layout(std430, set = 0, binding = 77) buffer P2Buf { float p2keep[]; };
 // Two potentials solved side by side with the same matrix (both warm-started):
 //   x: pressure * dt, which makes the velocity field divergence-free
 //   y: density-correction potential, whose gradient only ever moves particle positions
@@ -140,13 +143,15 @@ layout(std430, set = 0, binding = 17) buffer SolveBuf {
     uint v_iters; uint p_it_max; uint v_it_max; uint p_unconv;   // stats from here on are
     uint v_unconv; uint solves; float p_res_max; float v_res_max; // cleared by the CPU
     uint p2_it_max; uint p2_unconv;   // the second pressure solve (rhs_visc.comp)
+    uint arrive;      // work groups of the current dispatch done with their partial sums (reduce_tail.glsl)
 } K;
 
 // Indirect dispatch arguments, 3 uints each: the live set first, then the nominal set it is
 // restored from. A converged solve zeroes its live entries so its remaining iterations cost
 // only an empty dispatch.
 layout(std430, set = 0, binding = 18) buffer IndBuf { uint ind[]; };
-layout(std430, set = 0, binding = 19) buffer PartBuf { vec4 part[]; };   // per-workgroup partial sums
+// Coherent: the last work group of a dispatch sums what the others wrote (reduce_tail.glsl).
+layout(std430, set = 0, binding = 19) coherent buffer PartBuf { vec4 part[]; };   // per-workgroup partial sums
 layout(std430, set = 0, binding = 20) buffer MgDBuf { float mgd[]; };    // multigrid diagonals
 layout(std430, set = 0, binding = 21) buffer MgXBuf { vec2 mgx[]; };     // multigrid: z after pre-smoothing
 layout(std430, set = 0, binding = 36) buffer MgZBuf { vec2 mgz[]; };     // multigrid: finished z of each level
@@ -158,6 +163,11 @@ layout(std430, set = 0, binding = 34) buffer CgP2Buf { vec2 cgp2[]; };
 layout(std430, set = 0, binding = 24) buffer CgQBuf { vec2 cgq[]; };
 layout(std430, set = 0, binding = 25) buffer VisRBuf { vec2 vr[]; };     // viscosity residual
 layout(std430, set = 0, binding = 26) buffer VisPBuf { vec2 vp[]; };     // viscosity search direction
+// The new viscosity search direction (visc_iter.comp); swaps bindings with vp every iteration.
+layout(std430, set = 0, binding = 76) buffer VisP2Buf { vec2 vp2[]; };
+// What the viscosity solve changed the face velocities by (x - u*), kept for the next
+// substep's warm start (visc_iter.comp, WARM).
+layout(std430, set = 0, binding = 78) buffer VisDBuf { vec2 vd[]; };
 layout(std430, set = 0, binding = 27) buffer VisQBuf { vec2 vq[]; };     // A * search direction
 // Viscosity weights: 2 dt mu (cell sample), 4 dt mu V (node sample), diagonal of A for u, v.
 layout(std430, set = 0, binding = 28) buffer VisWBuf { vec4 vw[]; };

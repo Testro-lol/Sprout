@@ -17,8 +17,10 @@ Performance "Wall circulation (2026-11-15)", and Limitations.
 - Cost: +6 % (Kitchen) to +36 % (Lava Meets Water) GPU time per substep; the second
   solve needs 6 – 7 iterations against the first one's 8 – 9.
 
-Possible follow-ups (not started):
-- Make the second solve cheaper, e.g. a looser tolerance measured against the density
-  correction's volume budget, or a coupled pressure–viscosity solve.
+Follow-up done (2026-11-15, branch perf/speed-pass, README Performance "Performance pass"):
+the cost is won back. Both pressure solves and the viscosity solve start warm, and the
+solver as a whole needs fewer dispatches. Still open:
+- A coupled pressure–viscosity solve, or a looser tolerance for the second solve measured
+  against the density correction's volume budget.
 - The remaining free-surface motion (0.04 – 0.07 cells/s) belongs to the density-correction
   issue (README Limitations, the water pool entry).

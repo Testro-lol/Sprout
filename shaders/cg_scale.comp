@@ -3,7 +3,11 @@
 #include "common.glsl"
 #include "mg.glsl"
 
-// Applies the warm-start rescaling of cg_init to the stored potential itself.
+// Applies the warm-start rescaling of cg_init to the stored potential itself. Mode 1 (a
+// second solve follows the viscosity, `viscous_warm`): the first solve starts from last
+// substep's P1, its pressure without the viscous part P2 (kept by project_visc.comp), which
+// the second solve starts from instead (rhs_visc.comp). Mode 0: from the whole pressure,
+// and P2 is forgotten.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -12,6 +16,12 @@ void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (!inside_f(c)) return;
     int i = fidx(c);
-    if (mgd[i] > 0.0) pres[i].x *= S.dt / S.dt_prev;
-    else pres[i] = vec2(0.0);
+    if (mgd[i] > 0.0) {
+        float p = pres[i].x;
+        if (M.mode == 1u) p -= p2keep[i];
+        else p2keep[i] = 0.0;
+        pres[i].x = p * (S.dt / S.dt_prev);
+    } else {
+        pres[i] = vec2(0.0);
+    }
 }

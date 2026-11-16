@@ -224,7 +224,7 @@ Defaults are unchanged from before this overhaul.
 |---|---|---|
 | World | Physics panel | `gravity` (m/s²), `cell_size` (m; the panel shows mm and the tank size) |
 | Liquids | the liquid editor (per liquid); pair tensions and heat in the Physics panel | every material property as `<property>_<liquid>` or `<liquid>.<property>` (see [Liquids](#liquids); old names such as `density_oil`, `nu_syrup` still work), the six `tension_<group>_<group>` pair tensions, `droplet_cells`; heat: `ambient_temp`, `heat_rate`, `air_cooling`, `contact_heat`, `eddy_heat`, `evaporation`, `heat_power`, `rigid_viscosity`; steam: `steam` (on/off, in the panel), `steam_boil`, `steam_condense`, `steam_mixing`, `steam_rise`, `steam_life`, `steam_swirl`, `steam_eddy` |
-| Time step and accuracy | `cfl`, `pressure_tol`, `viscosity_tol` in the Solver panel; the rest `--set` only | `cfl`, `advection_order`, `dt_max`, `fixed_hz`, `pressure_tol`, `pressure_max_iters`, `correction_tol`, `viscosity_tol`, `viscosity_max_iters`, `implicit_viscosity_min` |
+| Time step and accuracy | `cfl`, `pressure_tol`, `viscosity_tol` in the Solver panel; the rest `--set` only | `cfl`, `advection_order`, `dt_max`, `fixed_hz`, `pressure_tol`, `pressure_max_iters`, `iters_margin`, `correction_tol`, `viscosity_tol`, `viscosity_max_iters`, `implicit_viscosity_min`, `viscous_projection`, `viscous_warm`, `viscosity_warm` |
 | Stabilisation | `speed_cap` in the Solver panel (with an off box); the rest `--set` only | see [Numerical stabilisation](#physics) |
 
 The Physics panel's *Restore defaults* resets world and liquids and returns the cell size to
@@ -1181,6 +1181,13 @@ low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each 
 6. Viscosity, implicit, in the other tiles, then a second pressure solve on the same
    matrix for the divergence it left (below).
 
+All three solves start from where the last substep's ended (2026-11-15, Performance,
+"Performance pass"): the first pressure solve from last substep's pressure without its
+viscous part, the second from that plus last substep's viscous part (`viscous_warm`), the
+viscosity from the velocity before it plus last substep's change (`viscosity_warm`), each
+rescaled to this substep's length. Each still stops at the same residual as from a cold
+start, so a good guess saves iterations and a bad one costs some.
+
 Both solves need a free surface somewhere in every connected body of liquid: a region
 sealed off by solids on all sides has a singular system. Where two shapes touch (the two
 ramps that form the crown of the Hourglass map), the rasteriser could leave a crack of a
@@ -1274,9 +1281,11 @@ The first takes out what the liquid cannot follow, above all the pull `g dt` of 
 a pool at rest, so the no-slip walls of the viscosity see only real motion; the second
 removes the divergence the viscosity leaves (`rhs_visc.comp`, `project_visc.comp`). It
 reuses the matrix and multigrid hierarchy of the first, solves for the total pressure
-starting from the first one's (so its first residual is just the divergence the viscosity
-added, and a pool at rest needs no iterations), carries no interface jumps (the first solve
-took them) and leaves the density correction alone. With one solve after the viscosity
+starting from the first one's plus last substep's viscous part (`viscous_warm`; from the
+first one's alone its first residual is just the divergence the viscosity added, and a
+pool at rest needs no iterations either way), carries no interface jumps (the first solve
+took them) and leaves the density correction alone. The first solve, in turn, starts from
+last substep's pressure without that viscous part. With one solve after the viscosity
 (`viscous_projection=0`, the order before) the solve held back the whole pull of gravity
 along every wall and the pressure pushed that layer up: every resting viscous pool
 circulated along its walls at about 6 cells/s. Gravity added after the viscosity instead
@@ -2242,6 +2251,7 @@ the tolerance. It has its own adaptive iteration count, so where it has nothing 
 (rest, a tank whose viscosity is all explicit) it records few. Frame times grew where
 simulation frames were already the slow ones (p75 – p99); the simulated / wall ratio stays
 within 3 %, Playground 0.94 → 0.91×. `viscous_projection=0` restores the old cost and order.
+The same day's performance pass (below) won this cost back and more.
 
 ### Still water surface (2026-11-15)
 
@@ -2265,8 +2275,149 @@ timestamps (`sprout profile --grid 1600x900 --map 1`, interleaved) it took 0.480
 per substep before and 0.466 / 0.466 ms after. The substeps per frame are unchanged (6.8 /
 6.8 before, 6.7 / 6.7 after).
 
+### Performance pass (2026-11-15)
+
+The two solver fixes of this day (wall circulation, still water surface) made viscous
+scenes 20 – 36 % more expensive per substep; this round won that back and more, without
+changing what the solver computes. Three builds, the same commands, the GPU otherwise
+idle except for the desktop and an idle ComfyUI process (12 % load before the runs):
+*before the fixes* (3e9964c), *with the fixes* (solver/wall-circulation merged with
+solver/water-surface-pump, the starting point of this round) and *now*.
+
+Window, 1600 × 900, uncapped (`--map N --no-vsync --frames 2400`, `SPROUT_FRAMES_CSV`,
+the first 20 % and then 300 more frames skipped), two rounds interleaved, round 1 / round 2:
+
+| Scene | Build | mean frame (ms) | fps | p50 / p90 / p99 (ms, round 1) | simulated / wall after warm-up |
+|---|---|---|---|---|---|
+| Playground | before the fixes | 1.62 / 1.59 | 618 / 628 | 0.91 / 5.26 / 5.64 | 0.98× |
+| | with the fixes | 1.96 / 2.12 | 511 / 471 | 0.90 / 6.45 / 6.81 | 0.99× |
+| | now | **1.35 / 1.39** | **740 / 719** | 0.80 / 4.89 / 5.34 | 0.98× |
+| Lava Meets Water | before the fixes | 1.96 / 1.93 | 510 / 519 | 1.10 / 5.94 / 6.21 | 0.99× |
+| | with the fixes | 3.90 / 3.68 | 256 / 272 | 1.20 / 7.83 / 8.24 | 1.00× |
+| | now | **1.75 / 1.71** | **573 / 584** | 1.06 / 4.95 / 5.25 | 0.99× |
+| Upside Down | before the fixes | 4.88 / 4.88 | 205 / 205 | 7.69 / 8.49 / 8.89 | 1.00× |
+| | with the fixes | 6.90 / 6.79 | 145 / 147 | 9.61 / 10.97 / 11.60 | 0.99× |
+| | now | **1.71 / 1.73** | **585 / 579** | 1.09 / 4.77 / 6.79 | 1.00× |
+| Kitchen | before the fixes | 3.15 / 2.99 | 317 / 335 | 1.14 / 6.48 / 10.66 | 0.99× |
+| | with the fixes | 6.56 / 4.97 | 152 / 201 | 7.21 / 14.05 / 14.90 | 0.99× |
+| | now | **2.77 / 2.63** | **361 / 380** | 1.12 / 5.81 / 9.38 | 0.99× |
+| Dam Break | before the fixes | 1.44 / 1.45 | 693 / 691 | 0.74 / 3.25 / 3.52 | 0.98× |
+| | with the fixes | 1.43 / 1.44 | 698 / 694 | 0.75 / 3.23 / 3.49 | 0.98× |
+| | now | **1.26 / 1.24** | **792 / 808** | 0.63 / 2.81 / 3.09 | 0.99× |
+
+Upside Down's median fell from a frame with a substep in it to one without: a substep now
+fits in a 165 Hz refresh with the frame's rendering, where before it took most of two.
+(The app now also prints the simulated / wall ratio past the warm-up: over a whole
+`--frames` run a faster build reaches its end sooner and its slow start weighs more.)
+
+Simulation alone, head-less (`sprout bench --grid G --map N`: 120 frames of 1/60 s after
+6 simulated seconds, wall time; per substep = that over the substeps it took):
+
+| Scene, grid | before the fixes | with the fixes | now |
+|---|---|---|---|
+| Playground 512 × 288 | 7.47 ms (3.74 per substep) | 9.97 (4.90) | **6.76 (3.38)** |
+| Lava Meets Water 512 × 288 | 8.85 (4.43) | 11.82 (5.91) | **6.46 (3.23)** |
+| Upside Down 512 × 288 | 12.40 (6.20) | 17.38 (8.55) | **12.19 (6.00)** |
+| Kitchen 512 × 288 | 9.51 (4.53) | 11.87 (5.56) | **8.14 (4.00)** |
+| Dam Break 512 × 288 | 3.97 (1.99) | 4.17 (2.03) | **3.52 (1.72)** |
+| Playground 1024 × 576 | 25.88 (9.41) | 30.92 (11.6) | **26.03 (8.53)** |
+| Dam Break 1024 × 576 | 13.72 (4.43) | 13.75 (4.44) | **13.53 (3.85)** |
+| Upside Down 1024 × 576 | 39.76 (18.5) | 49.50 (24.3) | **33.57 (16.8)** |
+
+What changed, each measured on its own as it went in (GPU timestamps, `sprout profile`,
+512 × 288 unless stated; `SPROUT_PROFILE_REPS=8` takes the best of eight substeps per pass,
+`SPROUT_PROFILE_CALLS=1` prints each pass's dispatch count):
+
+1. **The particles' scatter sums in shared memory first** (`particles.comp`). Particles are
+   sorted by cell, so one work group's particles usually lie in a short run of a row: it
+   adds their mass, momentum and channels into a box of cells in shared memory and sends
+   each node's sum to the grid with one atomic, instead of one atomic per particle and node
+   (about 45 each, which were most of the pass). A group whose particles spread too far
+   takes the global atomics. The sums are integers, so the grid gets the same values to the
+   bit. Particle pass: Dam Break 1600 × 900 2.53 → 1.07 ms, Playground 1600 × 900 4.99 →
+   1.82 ms, Upside Down 0.93 → 0.52 ms.
+2. **The conjugate-gradient reductions run in the last work group of the kernel before
+   them** (`reduce_tail.glsl`): each group of the kernel that writes the partial sums counts
+   itself in, and the last one sums them all, with the same invocations adding the same
+   partials as the separate `cg_reduce` dispatch did (identical to the bit). Two dispatches
+   and barriers fewer per pressure iteration and per viscosity iteration: 0.5 – 0.9 ms of
+   `cg_reduce` per substep became 0.013 ms (the closing statistics).
+3. **One viscosity iteration is two passes instead of four** (`visc_iter.comp`): the new
+   search direction, its strain and `A p` in one pass, each work group computing the
+   direction two cells and the strain one cell around its tile in shared memory, then the
+   update. Identical results. Playground 4.28 → 3.90 ms per substep, Lava Meets Water 4.61
+   → 4.09, Upside Down 6.65 → 5.95.
+4. **The coarse end of the multigrid works in shared memory** (`mg_tail.comp`): the iterate,
+   the diagonals and the coarse right-hand sides live in shared memory, and the levels of
+   at most 128 cells are swept by one subgroup, whose barriers cost next to nothing (a
+   barrier of the whole 1024-invocation group costs about 0.7 µs). One V-cycle (`profile`,
+   500 back to back): 122 → 114 µs.
+5. **Warm starts for all three solves** (`viscous_warm`, `viscosity_warm`; Physics). The
+   first pressure solve used to start from last substep's whole pressure, viscous part
+   included, and spent iterations taking that out again; the second started from nothing
+   of its own. The viscosity solve starts from u* plus last substep's change and still stops
+   at `|r| <= tol |r0|` of u*. Recorded iterations (pressure, second pressure, viscosity):
+   Lava Meets Water 14 / 9 / 71 → 10 / 7 / 38, Playground 12 / 8 / 38 → 10 / 8 / 23. Head-less
+   with `viscosity_warm` 0 → 1: Lava Meets Water −18 %, Upside Down −8 %, Playground and
+   Kitchen −4 %.
+6. **Fewer empty pressure iterations** (`iters_margin`): iterations recorded after a solve has
+   converged cost an empty dispatch each (2.5 µs; nine or more of them per pressure
+   iteration). The pressure solves now record a quarter more than recent solves needed
+   instead of half (rounded to 2 instead of 4); the viscosity solve keeps half and 4 (with
+   less, `validate rheology` ran its Bingham slot out of iterations). −0 to −5 % head-less.
+7. **Viscosity set-up in three passes instead of five**: `visc_setup` also takes the strain
+   of u*, `visc_diag` also removes the inactive tiles from the system (`visc_clear.comp` is
+   gone), and after the first pressure solve the strain is taken again in the active tiles
+   only (the inactive ones had been taken and cleared for nothing). These passes together,
+   Playground 1600 × 900: 1.35 → 0.92 ms per substep.
+8. **The composite shader comes in variants** for what the tank can show (`composite.frag`
+   `FX`, `render.rs` `Features`): with or without carried patterns (crackle, iridescence,
+   glints that sparkle) and stains, besides steam as before. Their code cost time even where
+   it never ran. The eight variants are built in parallel at start, so none compiles
+   mid-run, and `sprout profile` renders each scene with its variant and with the full
+   shader and compares: 0 values differ in every map tried. Composite pass at 1600 × 900,
+   full → variant: Dam Break 0.347 → 0.247 ms, Empty Tank 0.264 → 0.179, Playground 0.456 →
+   0.379, Upside Down 0.582 → 0.502, Cascade 0.403 → 0.334; scenes that have everything
+   (Lava Meets Water, Kitchen) unchanged.
+
+Also fixed on the way: the first version of the warm start read P1 from `prhs.z`, which
+`project.comp` wrote only in cells with a fluid face on their left or bottom, so a corner
+cell's P1 was 0 (Kitchen then ran 10 pressure solves out of iterations, with residuals up
+to 0.12).
+
+Tried and not kept:
+- Moving one more multigrid level into the shared-memory tail (64 × 36 at 512 × 288): 102
+  instead of 114 µs a V-cycle, but any other split of the hierarchy changes the solves'
+  rounding, and three checks that sit close to their bounds failed with it at the defaults
+  (`validate metals`: the ferrofluid drop's acceleration 1585 against a limit of 1579, where
+  every build with the old split gives 1456; the water puddle's drift; `liquids`: Milk
+  settles). The original code with a different split gives the same 1585, so it is the
+  split, not the new tail. The hierarchy now splits where it always did.
+- A first shared-memory tail of 36 bytes a cell for 1360 cells was 320 bytes over the 48 KiB
+  a work group may have; the driver accepted it without complaint and large tails came out
+  wrong. A compile-time assertion now guards the layout.
+- Compiling metal out of the composite shader: no measurable gain.
+- `iters_margin` 0.15: within noise of 0.25.
+
+Checks: `validate` all 241 pass, `--selftest`, `cargo test` (42) and clippy pass. Some
+checks flip under 0.001 % changes of gravity in the build with the fixes as well and were
+compared that way rather than by one run: `rheology` "slot flows: viscosity solves
+converged" (the Bingham slot reaches the 200-iteration cap; 1 unconverged in the build
+with the fixes at three such changes), `liquids` "Milk: settles" and the water puddle's
+drift in `metals`. The pressure solves of Lava Meets Water and Kitchen sometimes need far
+more iterations than the substep before and run out of recorded ones (`sprout probe --map
+13 --at 3`: 16 of 395 substeps now, worst residual 3.3e-3; in the build with the fixes 0 at
+the defaults and 7 with water's viscosity 0.1 % lower). That is a jump no margin covers, not
+the margin: in a build earlier in this round 0.25 and 0.5 gave identical results there and
+1.0 brought 16 down to 6. Kitchen: 2 of 438. Open (Limitations).
+
 ## Limitations
 
+- **Some pressure solves run out of recorded iterations in Lava Meets Water** (found
+  2026-11-15, Performance, "Performance pass"): the iterations a substep records follow
+  what recent ones needed, and a sudden jump (16 of the first 395 substeps of Lava Meets
+  Water) leaves that substep at a residual of up to 3e-3 instead of 1e-4. The build before
+  the performance pass shows it too under 0.1 % parameter changes.
 - **A resting viscous pool still moves a little at its free surface** (2026-11-15). Its
   wall circulation is gone (Physics, Viscosity; Validation, "Wall circulation"): a
   wall-to-wall layer of lava at rest moves 0.02 cells in 2 s next to the walls (was 11.6)
@@ -2394,7 +2545,7 @@ per substep before and 0.466 / 0.466 ms after. The substeps per frame are unchan
 | [src/world.rs](src/world.rs) | The sandbox world: solids plus the simulations living in it. New simulations plug in here. |
 | [src/scene.rs](src/scene.rs) | Shapes and their rasterisation into the fields the solver and renderer use |
 | [src/sim/](src/sim/mod.rs) | The fluid solver: buffers, pipelines, the substep; [params.rs](src/sim/params.rs) holds every parameter and the `PARAMS` table of names, units and ranges; [raw.rs](src/sim/raw.rs) the hand-synchronised substep command buffers |
-| [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer. |
+| [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer; `reduce_tail.glsl` the scalar steps of the Krylov solves (run in the last work group of the kernel before them), `visc_iter.comp` one viscosity iteration (and, specialised, its warm start). |
 | [src/render.rs](src/render.rs), [src/gui.rs](src/gui.rs) | The renderer (see [Look](#look)): splatting, the wide field, the wet map, shading; a small egui painter |
 | `shaders/splat.*`, `down.frag`, `blur.frag`, `wet.frag`, `composite.frag` | The render passes; `composite.frag` holds the whole look |
 | [src/app.rs](src/app.rs), [src/ui.rs](src/ui.rs), [src/camera.rs](src/camera.rs), [src/pacing.rs](src/pacing.rs) | Window and input; panel and canvas overlays; eased camera; substep pacing |

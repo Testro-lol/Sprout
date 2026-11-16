@@ -9,14 +9,16 @@
 // that out again.
 //
 // It solves for the total pressure P = P1 + P2 on the matrix rhs.comp built (unchanged,
-// as is the multigrid hierarchy): b = -div(u) + A P1, starting from P1. Its first residual
-// is then just -div(u) of the viscous velocity, P1 stays the warm start of the next
-// substep's first solve, and project_visc.comp subtracts the gradient of P - P1 (kept in
-// prhs.z). P2 has no interface terms: the jumps were all taken by the first solve. The
+// as is the multigrid hierarchy): b = -div(u) + A P1, starting from P1 plus last substep's
+// P2 (rescaled to this substep, `viscous_warm`; plain P1 without it, whose first residual
+// is then just -div(u) of the viscous velocity). project_visc.comp subtracts the gradient
+// of P - P1 (P1 kept in prhs.z, by project.comp) and keeps P2 for the next substep. P2 has no interface terms: the jumps were all taken by the first solve. The
 // density correction is not solved again (cg_reduce mode 8 marks it done) and keeps its
 // right-hand side and potential.
 
 layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform WPC { uint warm; } V2;   // `viscous_warm`
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -30,15 +32,17 @@ void main() {
     // Unknowns are never on the border (rhs.comp), so every neighbour exists.
     int W = P.grid.x;
     vec4 w = mga[i];
-    float p1 = pres[i].x;
+    // P1 from prhs.z: pres itself is rewritten here (the start of the solve).
+    float p1 = prhs[i].z;
     float ap = D * p1;
-    if (mgd[i - 1] > 0.0) ap -= w.x * pres[i - 1].x;
-    if (mgd[i + 1] > 0.0) ap -= w.y * pres[i + 1].x;
-    if (mgd[i - W] > 0.0) ap -= w.z * pres[i - W].x;
-    if (mgd[i + W] > 0.0) ap -= w.w * pres[i + W].x;
+    if (mgd[i - 1] > 0.0) ap -= w.x * prhs[i - 1].z;
+    if (mgd[i + 1] > 0.0) ap -= w.y * prhs[i + 1].z;
+    if (mgd[i - W] > 0.0) ap -= w.z * prhs[i - W].z;
+    if (mgd[i + W] > 0.0) ap -= w.w * prhs[i + W].z;
     float aL = solid[i].x, aB = solid[i].y, aR = solid[i + 1].x, aT = solid[i + W].y;
     vec4 vme = vel[i];
     float div = aR * vel[i + 1].x - aL * vme.x + aT * vel[i + W].y - aB * vme.y;
     vec4 r = prhs[i];
     prhs[i] = vec4(ap - div, r.y, p1, 0.0);
+    if (V2.warm != 0u) pres[i].x = p1 + p2keep[i] * (S.dt / S.dt_prev);
 }

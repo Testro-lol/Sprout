@@ -98,6 +98,8 @@ struct App {
     frame_index: u64,
     /// Frame times of the whole run, kept only for `--frames`.
     bench: Vec<f32>,
+    /// Simulated time at each benchmark frame, s.
+    bench_sim: Vec<f64>,
     selftest: Option<SelfTest>,
     /// Liquid swatches, drawn by the renderer (made with the window).
     swatches: Option<crate::editor::Swatches>,
@@ -137,6 +139,7 @@ pub fn run(event_loop: EventLoop<()>, gpu: Arc<Gpu>, opts: AppOptions) -> bool {
         step_once: false,
         frame_index: 0,
         bench: Vec::new(),
+        bench_sim: Vec::new(),
         selftest: None,
         swatches: None,
     };
@@ -609,6 +612,11 @@ impl App {
         let wall: f32 = self.bench.iter().sum();
         let simulated = self.world.sim.sim_time() as f32;
         println!("simulated {:.2} s in {:.2} s: {:.2}x real time", simulated, wall, simulated / wall);
+        // The same past the warm-up (a faster build reaches the end of its frames sooner, so
+        // the start weighs more in the whole-run figure).
+        let wall_late: f32 = self.bench[skip..].iter().sum();
+        let sim_late = self.bench_sim.last().copied().unwrap_or(0.0) - self.bench_sim[skip - 1];
+        println!("after warm-up: simulated {:.2} s in {:.2} s: {:.2}x real time", sim_late, wall_late, sim_late as f32 / wall_late);
     }
 
     fn zoom_at_cursor(&mut self, factor: f32) {
@@ -799,6 +807,7 @@ impl App {
         }
         self.frame_index += 1;
         self.bench.push(frame_dt);
+        self.bench_sim.push(self.world.sim.sim_time());
 
         // Actions that replace the world run last, once this frame no longer borrows it.
         self.apply(actions, None);

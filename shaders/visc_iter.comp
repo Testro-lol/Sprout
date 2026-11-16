@@ -1,0 +1,153 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "visc.glsl"
+#include "reduce.glsl"
+#include "reduce_tail.glsl"
+
+// One conjugate-gradient iteration of the viscosity solve up to its step length, in a
+// single pass over the active tiles (it replaced three kernels, visc_dir and the
+// iteration modes of visc_strain and visc_apply, and their dispatches and barriers):
+//
+//   p = z + beta p_old     z = r / diag; on the first iteration beta = 0 and p = z
+//   s = W G p              the weighted strain (visc.glsl: strain_of_vel, of p)
+//   q = M p + G^T s        as visc_apply.comp
+//
+// with the partial sums of p.q; the last work group computes alpha (cg_reduce mode 5,
+// reduce_tail.glsl). G^T s on the tile needs s one cell around it, and s needs p one cell
+// further, so the work group computes p on the tile and two cells around, s on the tile
+// and one cell around, both in shared memory. The arithmetic per value is that of the
+// three kernels it replaces. p_old is read from vp and the new p written to vp2; the two
+// buffers swap bindings every iteration (mod.rs). In inactive tiles every viscosity
+// vector is zero (cleared by visc_diag.comp), so p computed there is zero too, as before.
+
+const int PW = 20;   // p: the tile and two cells around
+const int SW = 18;   // s: the tile and one cell around
+shared vec2 sp[PW * PW];
+shared vec4 ss[SW * SW];
+
+ivec2 O;   // first cell of the tile
+
+// WARM (visc_warm in mod.rs, `viscosity_warm`): the warm start of the solve instead of an
+// iteration. It steps from x0 = u* by d, last substep's change x - u* (rescaled to this
+// substep and masked to the live faces by visc_diag.comp): x = u* + d, r = r0 - A d, with
+// the partial sums of r.z and r.r; its last work group restarts the iteration from there
+// (cg_reduce mode 10). The solve still stops at the same |r| <= tol |r0| of x0 = u*, so a
+// good guess only saves iterations. A solve that has nothing to do (mode 4 found it
+// converged) takes no step.
+layout(constant_id = 1) const uint WARM = 0u;
+
+// The new direction at cell c, zero outside the interior; with WARM,
+// the step d.
+vec2 direction(ivec2 c) {
+    if (!interior(c)) return vec2(0.0);
+    int i = cidx(c);
+    if (WARM != 0u) return vd[i];
+    vec2 z = vr[i] / vw[i].zw;
+    float b = K.v_beta;
+    return b == 0.0 ? z : z + b * vp[i];
+}
+
+vec2 pdir(ivec2 c) { ivec2 l = c - O + 2; return sp[l.y * PW + l.x]; }
+float U(ivec2 c, int i) { return live_u(i) ? pdir(c).x : 0.0; }
+float Vv(ivec2 c, int i) { return live_v(i) ? pdir(c).y : 0.0; }
+
+// Weighted strain of p at cell c (as strain_of_vel in visc.glsl, of the velocity).
+vec4 strain(ivec2 c) {
+    if (!in_grid(c)) return vec4(0.0);
+    int i = cidx(c);
+    int W = P.grid.x;
+    vec4 o = vec4(0.0);
+    vec4 w = vw[i];
+    if (w.x > 0.0) {
+        o.x = w.x * (U(c + ivec2(1, 0), i + 1) - U(c, i));
+        o.y = w.x * (Vv(c + ivec2(0, 1), i + W) - Vv(c, i));
+    }
+    if (w.y > 0.0) {
+        float ua = U(c, i), ub = U(c - ivec2(0, 1), i - W), va = Vv(c, i), vb = Vv(c - ivec2(1, 0), i - 1);
+        if (closed_u(i) && live_u(i - W)) ua = -ub;
+        if (closed_u(i - W) && live_u(i)) ub = -ua;
+        if (closed_v(i) && live_v(i - 1)) va = -vb;
+        if (closed_v(i - 1) && live_v(i)) vb = -va;
+        o.z = w.y * 0.5 * ((ua - ub) + (va - vb));
+    }
+    return o;
+}
+
+vec4 sat(ivec2 c) { ivec2 l = c - O + 1; return ss[l.y * SW + l.x]; }
+
+// G^T s at the faces of cell c (visc_apply.comp).
+vec2 gts(ivec2 c, int i) {
+    vec2 g = vec2(0.0);
+    if (live_u(i)) {
+        int W = P.grid.x;
+        float c1 = closed_u(i - W) ? 1.0 : 0.5, c2 = closed_u(i + W) ? -1.0 : -0.5;
+        g.x = sat(c - ivec2(1, 0)).x - sat(c).x + sat(c).z * c1 + sat(c + ivec2(0, 1)).z * c2;
+    }
+    if (live_v(i)) {
+        float d1 = closed_v(i - 1) ? 1.0 : 0.5, d2 = closed_v(i + 1) ? -1.0 : -0.5;
+        g.y = sat(c - ivec2(0, 1)).y - sat(c).y + sat(c).z * d1 + sat(c + ivec2(1, 0)).z * d2;
+    }
+    return g;
+}
+
+void main() {
+    if (WARM != 0u && K.v_done != 0u) return;   // (the same for every work group)
+    if (!tile_active()) {
+        if (gl_LocalInvocationIndex == 0u) part[(WARM != 0u ? 0u : V.half_off) + group_slot()] = vec4(0.0);
+        finish_group(WARM != 0u ? 10u : 5u);
+        return;
+    }
+    O = ivec2(gl_WorkGroupID.xy) * 16;
+    uint t = gl_LocalInvocationIndex;
+    for (uint k = t; k < uint(PW * PW); k += 256u) {
+        ivec2 c = O - 2 + ivec2(int(k) % PW, int(k) / PW);
+        sp[k] = in_grid(c) ? direction(c) : vec2(0.0);
+    }
+    barrier();
+    for (uint k = t; k < uint(SW * SW); k += 256u) {
+        ivec2 c = O - 1 + ivec2(int(k) % SW, int(k) / SW);
+        ss[k] = strain(c);
+    }
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    vec4 acc4 = vec4(0.0);
+    if (WARM != 0u) {
+        if (in_grid(c) && interior(c)) {
+            int i = cidx(c);
+            vec2 g = gts(c, i);
+            vec2 live = vec2(live_u(i) ? 1.0 : 0.0, live_v(i) ? 1.0 : 0.0);
+            vec4 cf = coef[i];
+            vec2 d = pdir(c) * live;
+            vec2 q = (vec2(cf.z, cf.w) * d + g) * live;
+            vec4 v = vel[i];
+            v.xy += d;
+            vel[i] = v;
+            vec2 r = vr[i] - q;
+            vr[i] = r;
+            vec2 z = r / vw[i].zw;
+            acc4 = vec4(dot(r, z), dot(r, r), 0.0, 0.0);
+        }
+        group_sum(acc4, group_slot());
+        finish_group(10u);   // restart from the warm start
+        return;
+    }
+    if (in_grid(c)) {
+        int i = cidx(c);
+        vec2 pn = pdir(c);
+        vp2[i] = pn;
+        if (interior(c)) {
+            vec2 g = gts(c, i);
+            vec2 live = vec2(live_u(i) ? 1.0 : 0.0, live_v(i) ? 1.0 : 0.0);
+            vec4 cf = coef[i];
+            vec2 p = pn * live;
+            vec2 q = (vec2(cf.z, cf.w) * p + g) * live;
+            vq[i] = q;
+            acc4 = vec4(0.0, 0.0, dot(p, q), 0.0);
+        } else {
+            vq[i] = vec2(0.0);
+        }
+    }
+    group_sum(acc4, V.half_off + group_slot());
+    finish_group(5u);   // alpha
+}

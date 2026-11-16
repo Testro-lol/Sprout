@@ -3,13 +3,16 @@
 #include "common.glsl"
 #include "visc.glsl"
 #include "reduce.glsl"
+#include "reduce_tail.glsl"
 
-// u += alpha p, r -= alpha q, and the partial sums of r.z and r.r with z = r / diag.
+// u += alpha p, r -= alpha q, and the partial sums of r.z and r.r with z = r / diag; the
+// last work group computes beta.
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (!tile_active()) {
         if (gl_LocalInvocationIndex == 0u) part[group_slot()] = vec4(0.0);
+        finish_group(6u);
         return;
     }
     vec4 acc4 = vec4(0.0);
@@ -17,14 +20,17 @@ void main() {
         int i = cidx(c);
         float a = K.v_alpha;
         vec4 v = vel[i];
-        vec2 p = vp[i];
+        vec2 p = vp2[i];   // this iteration's direction (visc_iter.comp)
         if (live_u(i)) v.x += a * p.x;
         if (live_v(i)) v.y += a * p.y;
         vel[i] = v;
+        // The change x - u*, for the next substep's warm start (visc_iter.comp, WARM).
+        vd[i] += a * vec2(live_u(i) ? p.x : 0.0, live_v(i) ? p.y : 0.0);
         vec2 r = vr[i] - a * vq[i];
         vr[i] = r;
         vec2 z = r / vw[i].zw;
         acc4 = vec4(dot(r, z), dot(r, r), 0.0, 0.0);
     }
     group_sum(acc4, group_slot());
+    finish_group(6u);   // beta (reduce_tail.glsl)
 }

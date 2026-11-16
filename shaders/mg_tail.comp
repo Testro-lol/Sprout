@@ -1,5 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_KHR_shader_subgroup_basic : enable
 #include "common.glsl"
 
 // The coarse end of the multigrid hierarchy in a single dispatch.
@@ -31,6 +32,9 @@ const int HALF_SWEEPS = 9;
 const ivec2 NB[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
 
 #define SYNC memoryBarrierBuffer(); barrier()
+#define WSYNC subgroupMemoryBarrierShared(); subgroupBarrier()
+// Levels this small are swept by one subgroup (see main).
+const int WARP_CELLS = 128;
 
 float wcomp(vec4 w, int k) { return k == 0 ? w.x : k == 1 ? w.y : k == 2 ? w.z : w.w; }
 int at(ivec4 L, ivec2 c) { return L.x + c.y * L.y + c.x; }
@@ -65,70 +69,90 @@ void build(ivec4 F, ivec4 C) {
     }
 }
 
+// The V-cycle (mode 0) keeps the iterate and the diagonal of every tail level, and the
+// right-hand side of all but the first, in shared memory: a barrier then orders only shared
+// memory, which is far cheaper than the global memory barrier each sweep needed before
+// (README, Performance, 2026-11-15). The first level's right-hand side and the couplings
+// (mga) are read-only here and stay in global memory. Slot of a cell: its offset from the
+// first tail level.
+const int TS = 3328;   // TAIL_SHARED in mod.rs: cells of all tail levels
+const int TR = 1024;   // TAIL_SHARED_COARSE: cells of all but the first
+shared vec2 sx[TS];
+shared float sd[TS];
+shared vec2 sr[TR];
+shared ivec4 sl[32];
+int BASE;
+int NF;   // cells of the first tail level
+
+vec2 rhs_at(int s) { return s < NF ? mgr[BASE + s] : sr[s - NF]; }
+
+int sat(ivec4 L, ivec2 c) { return L.x - BASE + c.y * L.y + c.x; }
+bool sunknown(ivec4 L, ivec2 c) { return inside(L, c) && sd[sat(L, c)] > 0.0; }
+
 // One Gauss-Seidel half-sweep over the cells of one colour. With `zero`, the other colour
 // is known to be zero (the first half-sweep from a zero guess) and cells that are not
 // unknowns are cleared.
-void sweep(ivec4 L, int colour, bool zero) {
-    for (int t = int(gl_LocalInvocationIndex); t < L.y * L.z; t += N) {
+void sweep(ivec4 L, int colour, bool zero, int t0, int step) {
+    for (int t = t0; t < L.y * L.z; t += step) {
         ivec2 c = ivec2(t % L.y, t / L.y);
-        int i = L.x + t;
-        float D = mgd[i];
+        int s = L.x - BASE + t;
+        float D = sd[s];
         if (D <= 0.0) {
-            if (zero) mgx[i] = vec2(0.0);
+            if (zero) sx[s] = vec2(0.0);
             continue;
         }
         if (((c.x + c.y) & 1) != colour) {
-            if (zero) mgx[i] = vec2(0.0);
+            if (zero) sx[s] = vec2(0.0);
             continue;
         }
-        vec2 sum = mgr[i];
+        vec2 sum = rhs_at(s);
         if (!zero) {
-            vec4 w = mga[i];
+            vec4 w = mga[BASE + s];
             for (int d = 0; d < 4; d++) {
                 ivec2 n = c + NB[d];
-                if (unknown(L, n)) sum += wcomp(w, d) * mgx[at(L, n)];
+                if (sunknown(L, n)) sum += wcomp(w, d) * sx[sat(L, n)];
             }
         }
-        mgx[i] = sum / D;
+        sx[s] = sum / D;
     }
 }
 
-void restrict_to(ivec4 F, ivec4 C) {
-    for (int t = int(gl_LocalInvocationIndex); t < C.y * C.z; t += N) {
+void restrict_to(ivec4 F, ivec4 C, int t0, int step) {
+    for (int t = t0; t < C.y * C.z; t += step) {
         ivec2 cc = ivec2(t % C.y, t / C.y);
         vec2 sum = vec2(0.0);
         for (int k = 0; k < 4; k++) {
             ivec2 c = 2 * cc + ivec2(k & 1, k >> 1);
-            if (!unknown(F, c)) continue;
-            int i = at(F, c);
-            vec4 w = mga[i];
-            vec2 az = mgd[i] * mgx[i];
+            if (!sunknown(F, c)) continue;
+            int s = sat(F, c);
+            vec4 w = mga[BASE + s];
+            vec2 az = sd[s] * sx[s];
             for (int d = 0; d < 4; d++) {
                 ivec2 n = c + NB[d];
-                if (unknown(F, n)) az -= wcomp(w, d) * mgx[at(F, n)];
+                if (sunknown(F, n)) az -= wcomp(w, d) * sx[sat(F, n)];
             }
-            sum += mgr[i] - az;
+            sum += rhs_at(s) - az;
         }
-        mgr[C.x + t] = sum;
+        sr[C.x - BASE + t - NF] = sum;
     }
 }
 
 // Coarse-grid correction fused with the black half-sweep (see mg_up.comp).
-void post_black(ivec4 F, ivec4 C) {
-    for (int t = int(gl_LocalInvocationIndex); t < F.y * F.z; t += N) {
+void post_black(ivec4 F, ivec4 C, int t0, int step) {
+    for (int t = t0; t < F.y * F.z; t += step) {
         ivec2 c = ivec2(t % F.y, t / F.y);
         if (((c.x + c.y) & 1) == 0) continue;
-        int i = F.x + t;
-        float D = mgd[i];
+        int s = F.x - BASE + t;
+        float D = sd[s];
         if (D <= 0.0) continue;
-        vec4 w = mga[i];
-        vec2 sum = mgr[i];
+        vec4 w = mga[BASE + s];
+        vec2 sum = rhs_at(s);
         for (int d = 0; d < 4; d++) {
             ivec2 n = c + NB[d];
-            if (!unknown(F, n)) continue;
-            sum += wcomp(w, d) * (mgx[at(F, n)] + T.omega * mgx[at(C, n >> 1)]);
+            if (!sunknown(F, n)) continue;
+            sum += wcomp(w, d) * (sx[sat(F, n)] + T.omega * sx[sat(C, n >> 1)]);
         }
-        mgx[i] = sum / D;
+        sx[s] = sum / D;
     }
 }
 
@@ -141,28 +165,61 @@ void main() {
         }
         return;
     }
-    for (int l = first; l < last; l++) {
-        sweep(lev[l], 0, true);
-        SYNC;
-        sweep(lev[l], 1, false);
-        SYNC;
-        restrict_to(lev[l], lev[l + 1]);
-        SYNC;
+    // Load the diagonals of all tail levels.
+    BASE = lev[first].x;
+    ivec4 E = lev[last];
+    int total = E.x + E.y * E.z - BASE;
+    ivec4 F = lev[first];
+    int nf = F.y * F.z;
+    NF = nf;
+    int bt = int(gl_LocalInvocationIndex);
+    for (int t = int(gl_LocalInvocationIndex); t < total; t += N) sd[t] = mgd[BASE + t];
+    if (bt <= last) sl[bt] = lev[bt];
+    barrier();
+    // Levels of more than WARP_CELLS cells are swept by the whole work group, the smaller
+    // ones by its first subgroup alone, whose barriers cost next to nothing. The arithmetic
+    // and its order per cell are the same either way.
+    int ls = first;
+    while (ls < last && sl[ls].y * sl[ls].z > WARP_CELLS) ls++;
+    for (int l = first; l < ls; l++) {
+        sweep(sl[l], 0, true, bt, N);
+        barrier();
+        sweep(sl[l], 1, false, bt, N);
+        barrier();
+        restrict_to(sl[l], sl[l + 1], bt, N);
+        barrier();
     }
-    // Coarsest level: a fixed palindromic run of half-sweeps from zero (red, black, ..., red).
-    sweep(lev[last], 0, true);
-    SYNC;
-    for (int s = 1; s < HALF_SWEEPS; s++) {
-        sweep(lev[last], s & 1, false);
-        SYNC;
+    if (gl_SubgroupID == 0u) {
+        int wt = int(gl_SubgroupInvocationID), ws = int(gl_SubgroupSize);
+        for (int l = ls; l < last; l++) {
+            sweep(sl[l], 0, true, wt, ws);
+            WSYNC;
+            sweep(sl[l], 1, false, wt, ws);
+            WSYNC;
+            restrict_to(sl[l], sl[l + 1], wt, ws);
+            WSYNC;
+        }
+        // Coarsest level: a fixed palindromic run of half-sweeps from zero (red, black, ..., red).
+        sweep(sl[last], 0, true, wt, ws);
+        WSYNC;
+        for (int s = 1; s < HALF_SWEEPS; s++) {
+            sweep(sl[last], s & 1, false, wt, ws);
+            WSYNC;
+        }
+        for (int l = last - 1; l >= ls; l--) {
+            post_black(sl[l], sl[l + 1], wt, ws);
+            WSYNC;
+            sweep(sl[l], 0, false, wt, ws);
+            WSYNC;
+        }
     }
-    for (int l = last - 1; l >= first; l--) {
-        post_black(lev[l], lev[l + 1]);
-        SYNC;
-        sweep(lev[l], 0, false);
-        SYNC;
+    barrier();
+    for (int l = ls - 1; l >= first; l--) {
+        post_black(sl[l], sl[l + 1], bt, N);
+        barrier();
+        sweep(sl[l], 0, false, bt, N);
+        barrier();
     }
     // Hand the finished level to mg_up of the level above.
-    ivec4 F = lev[first];
-    for (int t = int(gl_LocalInvocationIndex); t < F.y * F.z; t += N) mgz[F.x + t] = mgx[F.x + t];
+    for (int t = int(gl_LocalInvocationIndex); t < nf; t += N) mgz[BASE + t] = sx[t];
 }

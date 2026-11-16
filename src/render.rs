@@ -265,14 +265,20 @@ pub struct Renderer {
     splat: Arc<GraphicsPipeline>,
     down: Arc<GraphicsPipeline>,
     blur: Arc<GraphicsPipeline>,
-    composite: Arc<GraphicsPipeline>,
-    composite_dry: Arc<GraphicsPipeline>,
+    /// The composite shader, specialised for what the tank can show (`variant`): steam,
+    /// stains, carried patterns. All share one layout.
+    composite: Vec<Arc<GraphicsPipeline>>,
     steam: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
     splat_set: Option<Arc<DescriptorSet>>,
     steam_set: Option<Arc<DescriptorSet>>,
     accum: Option<Targets>,
     targets: Vec<(Arc<ImageView>, Arc<Framebuffer>)>,
+    /// Profiling (`sprout profile`): a timestamp after each pass of `render`.
+    pub timing: Option<Arc<vulkano::query::QueryPool>>,
+    /// Always the full composite shader (`sprout profile` checks that the variants draw the
+    /// same picture).
+    pub full_composite: bool,
 }
 
 const ACCUM_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
@@ -336,6 +342,31 @@ fn pipeline_with(
     .unwrap()
 }
 
+/// Variants of the composite shader: with or without steam, times `Features`.
+const COMPOSITE_VARIANTS: u32 = 8;
+
+/// What the liquids of a tank can show beyond the basics (composite.frag `FX`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Features {
+    /// Carried patterns: a liquid with crackle, iridescence or glints.
+    patterns: bool,
+    /// Stains: a staining liquid has been in the tank (the film map may hold some).
+    film: bool,
+}
+
+impl Features {
+    fn of(sim: &FluidSim) -> Features {
+        let (patterns, film) = sim.render_features();
+        Features { patterns, film }
+    }
+}
+
+/// Index into `Renderer::composite`: bit 0 steam, bit 1 patterns, bit 2 stains (composite.frag:
+/// HAS_VAPOUR, FX).
+fn variant(steam: bool, f: Features) -> usize {
+    steam as usize | (f.patterns as usize) << 1 | (f.film as usize) << 2
+}
+
 fn viewport(size: [u32; 2]) -> Viewport {
     Viewport { offset: [0.0, 0.0], extent: [size[0] as f32, size[1] as f32], depth_range: 0.0..=1.0 }
 }
@@ -374,23 +405,40 @@ impl Renderer {
             pipeline(&gpu, spirv!("composite.vert"), spirv!("wet.frag"), Subpass::from(wet_pass.clone(), 0).unwrap(), None);
         let down = pipeline(&gpu, spirv!("composite.vert"), spirv!("down.frag"), accum_subpass(), None);
         let blur = pipeline(&gpu, spirv!("composite.vert"), spirv!("blur.frag"), accum_subpass(), None);
-        let composite = pipeline(
+        // The composite shader with what the tank cannot show compiled out (HAS_VAPOUR, FX in
+        // composite.frag): the code of steam alone cost ~0.09 ms a 1080p frame even where it
+        // never ran, that of stains and patterns ~0.1 ms at 1600 x 900. Built at start, in
+        // parallel, so that no variant is compiled mid-run.
+        let composite_full = pipeline(
             &gpu,
             spirv!("composite.vert"),
             spirv!("composite.frag"),
             Subpass::from(final_pass.clone(), 0).unwrap(),
             None,
         );
-        // Without steam, the same shader with the vapour field compiled out (HAS_VAPOUR):
-        // its code cost ~0.09 ms a 1080p frame even where it never ran.
-        let composite_dry = pipeline_with(
-            &gpu,
-            spirv!("composite.vert"),
-            gpu.shader_specialized(spirv!("composite.frag"), &[(0, 0)]),
-            Subpass::from(final_pass.clone(), 0).unwrap(),
-            None,
-            Some(composite.layout().clone()),
-        );
+        let layout = composite_full.layout().clone();
+        let composite: Vec<Arc<GraphicsPipeline>> = std::thread::scope(|sc| {
+            let jobs: Vec<_> = (0..COMPOSITE_VARIANTS)
+                .map(|v| {
+                    let (gpu, final_pass, layout, full) = (&gpu, &final_pass, &layout, &composite_full);
+                    sc.spawn(move || {
+                        if v == COMPOSITE_VARIANTS - 1 {
+                            return full.clone();
+                        }
+                        let (vapour, fx) = (v & 1, v >> 1);
+                        pipeline_with(
+                            gpu,
+                            spirv!("composite.vert"),
+                            gpu.shader_specialized(spirv!("composite.frag"), &[(0, vapour), (1, fx)]),
+                            Subpass::from(final_pass.clone(), 0).unwrap(),
+                            None,
+                            Some(layout.clone()),
+                        )
+                    })
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        });
         let steam = pipeline(&gpu, spirv!("steam.vert"), spirv!("steam.frag"), accum_subpass(), Some(additive));
         let sampler = Sampler::new(
             device,
@@ -415,13 +463,14 @@ impl Renderer {
             down,
             blur,
             composite,
-            composite_dry,
             steam,
             sampler,
             splat_set: None,
             steam_set: None,
             accum: None,
             targets: Vec::new(),
+            timing: None,
+            full_composite: false,
         }
     }
 
@@ -582,7 +631,7 @@ impl Renderer {
         };
         let composite_set = DescriptorSet::new(
             self.gpu.descriptors.clone(),
-            self.composite.layout().set_layouts()[0].clone(),
+            self.composite[0].layout().set_layouts()[0].clone(),
             [
                 WriteDescriptorSet::image_view_sampler(0, accum_view.clone(), self.sampler.clone()),
                 WriteDescriptorSet::buffer(1, sim.sdf_buffer().clone()),
@@ -653,9 +702,18 @@ impl Renderer {
             );
         }
         let target_fb = self.target_framebuffer(&target);
+        let stamp = |b: &mut Builder, k: u32, pool: &Option<Arc<vulkano::query::QueryPool>>| {
+            if let Some(pool) = pool {
+                // SAFETY: profiling only; the pool was reset before this frame was recorded.
+                unsafe { b.write_timestamp(pool.clone(), k, vulkano::sync::PipelineStage::AllCommands) }.unwrap();
+            }
+        };
+        let timing = self.timing.clone();
+        stamp(b, 0, &timing);
         let t = self.accum.as_ref().unwrap();
         let half = [extent[0] as f32 * 0.5, extent[1] as f32 * 0.5];
         sim.record_cell_optics(b, 1.0 / fast_speed(sim));
+        stamp(b, 1, &timing);
         let inline = || SubpassBeginInfo { contents: SubpassContents::Inline, ..Default::default() };
         let clear = |fb: &Arc<Framebuffer>| RenderPassBeginInfo {
             clear_values: vec![Some([0.0; 4].into()); fb.attachments().len()],
@@ -702,6 +760,7 @@ impl Renderer {
             }
             b.end_render_pass(SubpassEndInfo::default()).unwrap();
         }
+        stamp(b, 2, &timing);
 
         // Pass 1b: the vapour field (bubbles and puffs of steam), in the same layout. Without
         // steam it is only cleared once: the composite pass binds it (and ignores it,
@@ -737,6 +796,7 @@ impl Renderer {
             b.end_render_pass(SubpassEndInfo::default()).unwrap();
         }
 
+        stamp(b, 3, &timing);
         // Passes 2 to 4: the wide field. Downsample, then blur across and down.
         let wide = WideLayout::new(view.zoom, div, extent, t.wide_extent);
         let wide_texel = [1.0 / t.wide_extent[0] as f32, 1.0 / t.wide_extent[1] as f32];
@@ -776,6 +836,7 @@ impl Renderer {
             b.end_render_pass(SubpassEndInfo::default()).unwrap();
         }
 
+        stamp(b, 4, &timing);
         // Pass 5: shade to the target.
         b.begin_render_pass(
             RenderPassBeginInfo {
@@ -785,19 +846,21 @@ impl Renderer {
             inline(),
         )
         .unwrap();
-        b.bind_pipeline_graphics(if steam { self.composite.clone() } else { self.composite_dry.clone() })
+        let fx = if self.full_composite { Features { patterns: true, film: true } } else { Features::of(sim) };
+        let composite = self.composite[variant(steam, fx)].clone();
+        b.bind_pipeline_graphics(composite.clone())
             .unwrap()
             .set_viewport(0, [viewport(extent)].into_iter().collect())
             .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.composite.layout().clone(),
+                composite.layout().clone(),
                 0,
                 t.composite_set.clone(),
             )
             .unwrap()
             .push_constants(
-                self.composite.layout().clone(),
+                composite.layout().clone(),
                 0,
                 CompositePc {
                     cam: view.center,
@@ -828,6 +891,7 @@ impl Renderer {
         unsafe { b.draw(3, 1, 0, 0) }.unwrap();
         overlay(b);
         b.end_render_pass(SubpassEndInfo::default()).unwrap();
+        stamp(b, 5, &timing);
     }
 }
 

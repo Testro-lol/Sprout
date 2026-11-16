@@ -259,6 +259,11 @@ pub struct SimParams {
     /// Pressure solve: stop when |r| <= tol * |b|.
     pub pressure_tol: f32,
     pub pressure_max_iters: u32,
+    /// Pressure iterations recorded per substep on top of what recent solves needed, as a
+    /// share of that count (plus two; the viscosity solve records half as many again). Recorded iterations after convergence are skipped but still
+    /// cost an empty dispatch each; a solve that runs out is counted unconverged and the
+    /// next batches record half as many again.
+    pub iters_margin: f32,
     /// Density-correction solve (same matrix), looser: it only nudges positions.
     pub correction_tol: f32,
     /// Viscosity solve: stop when |r| <= tol * |r0|.
@@ -274,6 +279,14 @@ pub struct SimParams {
     /// then hold back the whole pull of gravity on a resting pool, which circulates along
     /// the walls at about 6 cells/s (README, Viscosity).
     pub viscous_projection: u32,
+    /// With `viscous_projection`: 1 starts each of the two pressure solves from its own part
+    /// of last substep's pressure (the first from P1, the second from P1 plus last substep's
+    /// viscous part P2); 0 starts the first from the whole of last substep's pressure and the
+    /// second from P1, as before 2026-11-15 (README, Performance).
+    pub viscous_warm: u32,
+    /// 1 starts the implicit viscosity solve from u* plus last substep's change of the
+    /// velocity (rescaled), instead of from u*; it stops at the same residual either way.
+    pub viscosity_warm: u32,
 
     // ---- stabilisation (README, "Numerical stabilisation"); see `PARAMS` for "off" -------
     /// Spray in free flight (less than half the rest density around it) may travel this many
@@ -372,6 +385,7 @@ impl Default for SimParams {
             fixed_hz: 0.0,
             pressure_tol: 1e-4,
             pressure_max_iters: 60,
+            iters_margin: 0.25,
             correction_tol: 1e-2,
             viscosity_tol: 1e-3,
             viscosity_max_iters: 200,
@@ -382,6 +396,8 @@ impl Default for SimParams {
             correction_max: 0.5,
             correction_deadband: 0.25,
             viscous_projection: 1,
+            viscous_warm: 1,
+            viscosity_warm: 1,
             correction_step_max: 0.5,
             crowd_jitter: 0.5,
             tool_crowd_max: 2.0,
@@ -657,6 +673,8 @@ pub static PARAMS: &[Param] = &[
     param!("pressure_tol", Accuracy, "", [1e-6, 1e-2], None, false, |p| p.pressure_tol, |p, v| p.pressure_tol = v, "Relative residual the pressure solve stops at."),
     param!("pressure_max_iters", Accuracy, "", [10.0, 400.0], None, true, |p| p.pressure_max_iters as f32, |p, v| p.pressure_max_iters = v as u32,
         "Most pressure iterations recorded per substep (fewer are recorded when recent solves needed fewer)."),
+    param!("iters_margin", Accuracy, "", [0.0, 2.0], None, false, |p| p.iters_margin, |p, v| p.iters_margin = v,
+        "Pressure iterations recorded on top of what recent solves needed, as a share of that count (plus two)."),
     param!("correction_tol", Accuracy, "", [1e-4, 0.1], None, false, |p| p.correction_tol, |p, v| p.correction_tol = v, "Relative residual the density-correction solve stops at."),
     param!("viscosity_tol", Accuracy, "", [1e-5, 0.1], None, false, |p| p.viscosity_tol, |p, v| p.viscosity_tol = v, "Relative residual the viscosity solve stops at."),
     param!("viscosity_max_iters", Accuracy, "", [20.0, 1000.0], None, true, |p| p.viscosity_max_iters as f32, |p, v| p.viscosity_max_iters = v as u32,
@@ -665,6 +683,10 @@ pub static PARAMS: &[Param] = &[
         "Diffusion number nu dt/dx² below which a tile takes the explicit viscous step; 0 = implicit everywhere."),
     param!("viscous_projection", Accuracy, "", [0.0, 1.0], None, true, |p| p.viscous_projection as f32, |p, v| p.viscous_projection = v as u32,
         "1: implicit viscosity between two pressure solves (a resting viscous pool stays at rest); 0 = one solve after it, cheaper, but resting pools circulate along the walls."),
+    param!("viscous_warm", Accuracy, "", [0.0, 1.0], None, true, |p| p.viscous_warm as f32, |p, v| p.viscous_warm = v as u32,
+        "With viscous_projection: 1 starts each pressure solve from its own part of last substep's pressure; 0 = both from the whole."),
+    param!("viscosity_warm", Accuracy, "", [0.0, 1.0], None, true, |p| p.viscosity_warm as f32, |p, v| p.viscosity_warm = v as u32,
+        "1 starts the implicit viscosity solve from last substep's change of the velocity; 0 = from the velocity before it."),
     // ---- stabilisation ----
     param!("speed_cap", Stabilisation, "× √(2gH)", [1.0, 4.0], Some(0.0), false, |p| p.speed_cap, |p, v| p.speed_cap = v,
         "Particle speed cap as a multiple of the free-fall speed over the tank height; 0 = off."),
@@ -1172,6 +1194,8 @@ pub struct GpuParams {
     /// Heat: Smagorinsky constant of the eddy diffusivity (0 off); evaporation factor
     /// L / c_p,air in kelvin (0 off); unused; unused.
     pub heat3: [f32; 4],
+    /// Krylov solves: indirect entries per set (cg_reduce, reduce_tail.glsl); unused x3.
+    pub solve: [u32; 4],
 }
 
 /// What the tank needs from the solver, from the materials in it (`GpuParams::caps`).
@@ -1191,7 +1215,7 @@ pub const STEFAN_BOLTZMANN: f32 = 5.670_374e-8;
 
 const _: () = assert!(std::mem::size_of::<Particle>() == 48);
 const _: () = assert!(KIND_SRC & (KIND_FRESH | KIND_REAL_T | KIND_PUFF | KIND_MAT_MASK) == 0);
-const _: () = assert!(std::mem::size_of::<GpuParams>() == 32 + 64 + 16 + 32 + 16 * (MAX_PRESENT / 4) + 16 * MAX_PRESENT + 32 + 32 + 32 + 48 + 32 * MAX_CURRENTS + 16 + 32 * MAX_MAGNETS + 16 + 48);
+const _: () = assert!(std::mem::size_of::<GpuParams>() == 32 + 64 + 16 + 32 + 16 * (MAX_PRESENT / 4) + 16 * MAX_PRESENT + 32 + 32 + 32 + 48 + 32 * MAX_CURRENTS + 16 + 32 * MAX_MAGNETS + 16 + 48 + 16);
 
 #[cfg(test)]
 mod tests {

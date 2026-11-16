@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 #include "mg.glsl"
+#include "reduce_tail.glsl"
 
 // The way up of a V-cycle on one level, in a single pass over its cells: the coarse-grid
 // correction z + omega * z_parent and one Gauss-Seidel sweep, black first, then red (the
@@ -14,7 +15,8 @@
 // tile. The pass reads the pre-smoothed values (mgx) and the finished coarser level (mgz)
 // and writes the finished values of this level to mgz, so no tile ever reads what another
 // is writing. On level 0 (flag set) it also forms the partial sums r.z and r.r that
-// conjugate gradients needs next.
+// conjugate gradients needs next, and its last work group runs the reduction that follows
+// (cg_reduce mode in bits 4..7 of the mode word, plus one; reduce_tail.glsl).
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -36,6 +38,7 @@ vec2 black(ivec2 n) {
 void main() {
     if (!tile_on(mg_level())) {
         if (mg_flag() && gl_LocalInvocationIndex == 0u) part[group_slot()] = vec4(0.0);
+        if (mg_flag() && mg_reduce() != 0u) finish_group(mg_reduce() - 1u);
         return;
     }
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -68,4 +71,5 @@ void main() {
         mgz[i] = z;
     }
     if (mg_flag()) group_sum(acc4, group_slot());
+    if (mg_flag() && mg_reduce() != 0u) finish_group(mg_reduce() - 1u);
 }

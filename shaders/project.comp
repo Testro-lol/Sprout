@@ -32,6 +32,8 @@ void main() {
     int i = cidx(c);
     vec4 cf = coef[i];
     vec4 me = vel[i];
+    // P1 for rhs_visc.comp, which then sets the second solve's start in pres.
+    if (mgd[i] > 0.0) prhs[i].z = pres[i].x;
     if (cf.x != 0.0 || cf.y != 0.0) {
         vec2 p = pres[i];
         bool liq = cell[i].w > 0.0;

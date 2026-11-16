@@ -38,3 +38,25 @@ bool tile_active() { return tiles[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_Wor
 // implicit_viscosity_min, default 1e-3) a cell needs no implicit solve: the explicit step
 // with the same operator is accurate there (its stability limit is ~0.12). Pure water on
 // 1 cm cells sits near 1e-5.
+
+// Weighted strain W G u of the current velocities at cell i, with its weights w (vw[i].xy):
+// D_xx, D_yy at the cell centre (x, y), D_xy at its lower-left node (z).
+float vel_u(int i) { return live_u(i) ? vel[i].x : 0.0; }
+float vel_v(int i) { return live_v(i) ? vel[i].y : 0.0; }
+vec4 strain_of_vel(int i, vec2 w) {
+    int W = P.grid.x;
+    vec4 o = vec4(0.0);
+    if (w.x > 0.0) {
+        o.x = w.x * (vel_u(i + 1) - vel_u(i));
+        o.y = w.x * (vel_v(i + W) - vel_v(i));
+    }
+    if (w.y > 0.0) {
+        float ua = vel_u(i), ub = vel_u(i - W), va = vel_v(i), vb = vel_v(i - 1);
+        if (closed_u(i) && live_u(i - W)) ua = -ub;
+        if (closed_u(i - W) && live_u(i)) ub = -ua;
+        if (closed_v(i) && live_v(i - 1)) va = -vb;
+        if (closed_v(i - 1) && live_v(i)) vb = -va;
+        o.z = w.y * 0.5 * ((ua - ub) + (va - vb));
+    }
+    return o;
+}

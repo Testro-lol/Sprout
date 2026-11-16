@@ -107,7 +107,23 @@ float keep_heat(float t, float c0, float c1) {
     return c0 == c1 ? t : (t + 273.15) * c0 / c1 - 273.15;
 }
 
-void main() {
+// Scatter inputs, left by advance() for scatter (below).
+const int SCATTER_SHARED = 4096;   // ints: the box of cells times P.acc_stride must fit
+shared int sacc[SCATTER_SHARED];
+shared int s_box[4];   // min x, min y, max x, max y of floor(pos) of the group's particles
+
+bool g_live = false;
+vec2 g_pos, g_vs;
+vec4 g_Cs;
+float g_rho, g_s, g_CT;
+int g_cw, g_cs, g_ct, g_cg, g_ce;
+vec3 g_te;
+
+bool g_shared;
+ivec2 g_b0;   // first cell of the box
+int g_bw;     // its width
+
+void advance() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= P.n_slots) return;
     Particle p = particles[id];
@@ -878,69 +894,134 @@ void main() {
         atomicAdd(hcell[hc].y, q.y);
     }
 
-    // ---- scatter ---------------------------------------------------------------------
-    vec2 vs = p.vel * S.dt;  // cells / step
-    vec4 Cs = p.c * S.dt;
+    // ---- scatter (run by scatter_group, below, once every invocation is here) ----------
+    g_live = true;
+    g_pos = p.pos;
+    g_vs = p.vel * S.dt;  // cells / step
+    g_Cs = p.c * S.dt;
+    g_rho = rho_p;
+    g_s = p.s;
+    g_CT = CT;
+    g_cw = Mia.z;
+    g_cs = Mia.w;
+    g_ct = thermal ? int(P.heat2.z) : -1;
+    g_cg = thermal ? group_heat_chan(Mia.x) : -1;
+    g_ce = elastic && tau != vec4(0.0) ? int(P.elastic.x) : -1;
+    g_te = tau.xyz / P.elastic.y * STRESS_FIX;
+}
+
+// ---- scatter ---------------------------------------------------------------------------
+//
+// Mass, momentum and the cell channels go to the grid as 32-bit fixed-point sums (quadratic
+// B-spline weights: 3 x 3 nodes on each of the u, v and cell grids). The particles are sorted
+// by cell (sort.comp), so a work group's particles usually lie in a short run of one row of
+// cells: it then adds them up in shared memory first and sends each node's sum to the grid
+// with one atomic, instead of one per particle (most of the cost of this pass was those
+// atomics). Integer sums do not depend on the order of the adds, so the grid gets the same
+// values to the bit. A group whose particles spread too far takes the global atomics.
+
+void add(ivec2 node, int ch, int v) {
+    if (g_shared) {
+        ivec2 l = node - g_b0;
+        atomicAdd(sacc[(l.y * g_bw + l.x) * P.acc_stride + ch], v);
+    } else {
+        atomicAdd(acc[cidx(node) * P.acc_stride + ch], v);
+    }
+}
+
+void deposit() {
     vec2 w[3];
     {
-        vec2 gp = p.pos - vec2(0.0, 0.5);
+        vec2 gp = g_pos - vec2(0.0, 0.5);
         ivec2 base = ivec2(floor(gp - 0.5));
         vec2 f = gp - vec2(base);
         bspline(f, w);
         for (int b = 0; b < 3; b++) {
             for (int a = 0; a < 3; a++) {
-                int k = cidx(base + ivec2(a, b)) * P.acc_stride;
-                float m = w[a].x * w[b].y * rho_p;
+                float m = w[a].x * w[b].y * g_rho;
                 vec2 d = vec2(a, b) - f;
-                atomicAdd(acc[k + 0], int(floor(m * MASS_SCALE + 0.5)));
-                atomicAdd(acc[k + 1], int(floor(m * (vs.x + dot(Cs.xy, d)) * MOM_SCALE + 0.5)));
+                add(base + ivec2(a, b), 0, int(floor(m * MASS_SCALE + 0.5)));
+                add(base + ivec2(a, b), 1, int(floor(m * (g_vs.x + dot(g_Cs.xy, d)) * MOM_SCALE + 0.5)));
             }
         }
     }
     {
-        vec2 gp = p.pos - vec2(0.5, 0.0);
+        vec2 gp = g_pos - vec2(0.5, 0.0);
         ivec2 base = ivec2(floor(gp - 0.5));
         vec2 f = gp - vec2(base);
         bspline(f, w);
         for (int b = 0; b < 3; b++) {
             for (int a = 0; a < 3; a++) {
-                int k = cidx(base + ivec2(a, b)) * P.acc_stride;
-                float m = w[a].x * w[b].y * rho_p;
+                float m = w[a].x * w[b].y * g_rho;
                 vec2 d = vec2(a, b) - f;
-                atomicAdd(acc[k + 2], int(floor(m * MASS_SCALE + 0.5)));
-                atomicAdd(acc[k + 3], int(floor(m * (vs.y + dot(Cs.zw, d)) * MOM_SCALE + 0.5)));
+                add(base + ivec2(a, b), 2, int(floor(m * MASS_SCALE + 0.5)));
+                add(base + ivec2(a, b), 3, int(floor(m * (g_vs.y + dot(g_Cs.zw, d)) * MOM_SCALE + 0.5)));
             }
         }
     }
     {
-        vec2 gp = p.pos - 0.5;
+        vec2 gp = g_pos - 0.5;
         ivec2 base = ivec2(floor(gp - 0.5));
         vec2 f = gp - vec2(base);
         bspline(f, w);
-        int cw = Mia.z, cs = Mia.w;
-        int ct = thermal ? int(P.heat2.z) : -1;
-        int cg = thermal ? group_heat_chan(Mia.x) : -1;
-        int ce = elastic && tau != vec4(0.0) ? int(P.elastic.x) : -1;
-        vec3 te = tau.xyz / P.elastic.y * STRESS_FIX;
         for (int b = 0; b < 3; b++) {
             for (int a = 0; a < 3; a++) {
-                int k = cidx(base + ivec2(a, b)) * P.acc_stride;
+                ivec2 n = base + ivec2(a, b);
                 int wi = int(floor(w[a].x * w[b].y * MASS_SCALE + 0.5));
-                atomicAdd(acc[k + 4], wi);
-                if (cw >= 0) atomicAdd(acc[k + cw], wi);
-                if (cs >= 0 && p.s > 0.0) atomicAdd(acc[k + cs], int(floor(w[a].x * w[b].y * p.s * MASS_SCALE + 0.5)));
-                if (ct >= 0) {
-                    int h = int(floor(w[a].x * w[b].y * CT * MASS_SCALE + 0.5));
-                    atomicAdd(acc[k + ct], h);
-                    if (cg >= 0) atomicAdd(acc[k + cg], h);
+                add(n, 4, wi);
+                if (g_cw >= 0) add(n, g_cw, wi);
+                if (g_cs >= 0 && g_s > 0.0) add(n, g_cs, int(floor(w[a].x * w[b].y * g_s * MASS_SCALE + 0.5)));
+                if (g_ct >= 0) {
+                    int h = int(floor(w[a].x * w[b].y * g_CT * MASS_SCALE + 0.5));
+                    add(n, g_ct, h);
+                    if (g_cg >= 0) add(n, g_cg, h);
                 }
-                if (ce >= 0) {
-                    vec3 q = floor(w[a].x * w[b].y * te + 0.5);
-                    atomicAdd(acc[k + ce], int(q.x));
-                    atomicAdd(acc[k + ce + 1], int(q.y));
-                    atomicAdd(acc[k + ce + 2], int(q.z));
+                if (g_ce >= 0) {
+                    vec3 q = floor(w[a].x * w[b].y * g_te + 0.5);
+                    add(n, g_ce, int(q.x));
+                    add(n, g_ce + 1, int(q.y));
+                    add(n, g_ce + 2, int(q.z));
                 }
             }
         }
+    }
+}
+
+void main() {
+    advance();
+    uint t = gl_LocalInvocationIndex;
+    // The box of the group's particles: every node a particle adds to lies within one cell
+    // left / below and two right / above of the cell it is in.
+    if (t == 0u) s_box = int[4](0x7fffffff, 0x7fffffff, -0x7fffffff, -0x7fffffff);
+    barrier();
+    ivec2 f = g_live ? ivec2(floor(g_pos)) : ivec2(0x7fffffff);
+    ivec2 lo = subgroupMin(f);
+    ivec2 hi = subgroupMax(g_live ? f : ivec2(-0x7fffffff));
+    if (subgroupElect() && lo.x != 0x7fffffff) {
+        atomicMin(s_box[0], lo.x);
+        atomicMin(s_box[1], lo.y);
+        atomicMax(s_box[2], hi.x);
+        atomicMax(s_box[3], hi.y);
+    }
+    barrier();
+    if (s_box[0] == 0x7fffffff) return;   // no live particle in the group
+    g_b0 = ivec2(s_box[0], s_box[1]) - 1;
+    g_bw = s_box[2] + 2 - g_b0.x + 1;
+    int bh = s_box[3] + 2 - g_b0.y + 1;
+    int n = g_bw * bh * P.acc_stride;
+    g_shared = n <= SCATTER_SHARED;   // the same for the whole group
+    if (g_shared) {
+        for (int k = int(t); k < n; k += 128) sacc[k] = 0;
+        barrier();
+    }
+    if (g_live) deposit();
+    if (!g_shared) return;
+    barrier();
+    for (int k = int(t); k < n; k += 128) {
+        int v = sacc[k];
+        if (v == 0) continue;
+        int cell = k / P.acc_stride;
+        ivec2 node = g_b0 + ivec2(cell % g_bw, cell / g_bw);
+        atomicAdd(acc[cidx(node) * P.acc_stride + (k - cell * P.acc_stride)], v);
     }
 }

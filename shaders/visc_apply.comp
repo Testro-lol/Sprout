@@ -3,13 +3,15 @@
 #include "common.glsl"
 #include "visc.glsl"
 #include "reduce.glsl"
+#include "reduce_tail.glsl"
 
-// G^T of the weighted strain, per face:
-//   mode 0 (start):     r = b - A x0 = -G^T W G u*  (x0 = u*, b = M u*), p = z = r / diag
-//   mode 1 (iteration): q = M p + G^T W G p
+// G^T of the weighted strain of u*, per face:
+//   mode 0 (start):     r = b - A x0 = -G^T W G u*  (x0 = u*, b = M u*), p = z = r / diag,
+//                       with the partial sums of r.z and r.r; the last work group starts the
+//                       solve (cg_reduce mode 4, reduce_tail.glsl)
 //   mode 2 (explicit):  u = u* - M^-1 G^T W G u*  (forward Euler with the same operator,
 //                       used when the viscous diffusion number is small; see mod.rs)
-// with the partial sums CG needs (r.z, r.r into the first half; p.q into the second).
+// The iterations apply A to their search direction themselves (visc_iter.comp).
 
 vec2 gts(ivec2 c, int i) {
     int W = P.grid.x;
@@ -27,8 +29,9 @@ vec2 gts(ivec2 c, int i) {
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    if (V.mode != 2u && !tile_active()) {
-        if (gl_LocalInvocationIndex == 0u) part[((V.mode == 0u) ? 0u : V.half_off) + group_slot()] = vec4(0.0);
+    if (V.mode == 0u && !tile_active()) {
+        if (gl_LocalInvocationIndex == 0u) part[group_slot()] = vec4(0.0);
+        finish_group(4u);
         return;
     }
     vec4 acc4 = vec4(0.0);
@@ -43,27 +46,20 @@ void main() {
             if (live.x > 0.0) v.x -= g.x / cf.z;
             if (live.y > 0.0) v.y -= g.y / cf.w;
             vel[i] = v;
-        } else if (V.mode == 0u) {
+        } else {
             vec2 r = -g * live;
             vec2 z = r / diag;
             vr[i] = r;
             vp[i] = z;
             acc4 = vec4(dot(r, z), dot(r, r), 0.0, 0.0);
-        } else {
-            vec4 cf = coef[i];
-            vec2 p = vp[i] * live;
-            vec2 q = (vec2(cf.z, cf.w) * p + g) * live;
-            vq[i] = q;
-            acc4 = vec4(0.0, 0.0, dot(p, q), 0.0);
         }
-    } else if (in_grid(c) && V.mode != 2u) {
+    } else if (in_grid(c) && V.mode == 0u) {
         int i = cidx(c);
-        if (V.mode == 0u) {
-            vr[i] = vec2(0.0);
-            vp[i] = vec2(0.0);
-        } else {
-            vq[i] = vec2(0.0);
-        }
+        vr[i] = vec2(0.0);
+        vp[i] = vec2(0.0);
     }
-    if (V.mode != 2u) group_sum(acc4, (V.mode == 0u ? 0u : V.half_off) + group_slot());
+    if (V.mode == 0u) {
+        group_sum(acc4, group_slot());
+        finish_group(4u);   // start (reduce_tail.glsl)
+    }
 }

@@ -2,9 +2,10 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 #include "mg.glsl"
+#include "reduce_tail.glsl"
 
 // The new search direction p = z + beta p_old, q = A p, and the partial sums of p.q (into
-// the second half of the partial buffer), in one pass. A cell needs the new direction of
+// the second half of the partial buffer), in one pass; its last work group computes alpha. A cell needs the new direction of
 // its four neighbours as well, so the old one is read from one buffer and the new one
 // written to another; the two swap roles every iteration (two descriptor sets, see
 // mod.rs). On the first iteration beta is zero and the old buffer is not read.
@@ -22,6 +23,7 @@ vec2 direction(int i) {
 void main() {
     if (ptile[group_slot()] == 0u) {
         if (gl_LocalInvocationIndex == 0u) part[M.mode + group_slot()] = vec4(0.0);
+        finish_group(1u);
         return;
     }
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
@@ -45,4 +47,5 @@ void main() {
         }
     }
     group_sum(acc4, M.mode + group_slot());
+    finish_group(1u);   // alpha (reduce_tail.glsl)
 }
