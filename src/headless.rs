@@ -690,6 +690,55 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         wait(&mut w, 3.0);
         save(&w, "mix_blood", fit);
         save(&w, "mix_blood_zoom", zoom([256.0, 60.0], 3.0));
+        save(&w, "mix_blood_close", zoom([236.0, 40.0], 9.0));
+    }
+    // Blood poured onto honey over water (two liquids of one phase group that a concentration
+    // alone does not tell apart), and ferrofluid stirred into oil.
+    if wants("mix") {
+        let mut w = pool(&[([0.0, 0.0, 512.0, 50.0], Material::Water), ([0.0, 50.0, 512.0, 100.0], Material::Syrup)], &[]);
+        hold(&mut w, Source::Pour, Material::Blood, [256.0, 200.0], 9.0, 12000.0, 1.5);
+        wait(&mut w, 2.0);
+        save(&w, "mix_blood_honey", zoom([256.0, 70.0], 3.0));
+        save(&w, "mix_blood_honey_close", zoom([256.0, 80.0], 8.0));
+        save(&w, "mix_blood_honey_far", fit);
+        save(&w, "mix_blood_honey_mid", zoom([256.0, 70.0], 1.5));
+        let mut w = pool(&[([0.0, 0.0, 512.0, 80.0], Material::Oil)], &[]);
+        hold(&mut w, Source::Pour, Material::Ferrofluid, [256.0, 200.0], 6.0, 8000.0, 1.0);
+        wait(&mut w, 1.5);
+        save(&w, "mix_ferro_oil", zoom([256.0, 50.0], 3.0));
+    }
+    // Ferrofluid poured into the Playground's pool after the syrup has fallen in (the user's
+    // screenshot of 2026-11-16: dark outlines round the ferrofluid in the syrup and water).
+    if wants("ferro_pool") {
+        let mut w = map("Playground", G, 4.0);
+        hold(&mut w, Source::Pour, Material::Ferrofluid, [300.0, 150.0], 9.0, 8000.0, 3.0);
+        wait(&mut w, 6.0);
+        save(&w, "ferro_pool", fit);
+        save(&w, "ferro_pool_zoom", zoom([300.0, 40.0], 3.0));
+        save(&w, "ferro_pool_close", zoom([300.0, 40.0], 8.0));
+    }
+    // A magnet under and over a pool of ferrofluid on 1 cm cells, as the Magnet tool places
+    // them (README, "Magnetism"): the dish heaps up and spikes, and comes to rest. And six
+    // consecutive frames of the first, for the flicker count. Kinetic energy is printed.
+    if wants("magnet") {
+        let cup = |x: f32| crate::scene::Shape::Box { c: [x, 30.0], half: [4.0, 28.0], angle: 0.0 };
+        for (name, at, deg) in [("magnet_under", [256.0, WALL + 3.0], 0.0f32), ("magnet_over", [256.0, 28.0], 180.0)] {
+            let mut w = pool(&[([152.0, WALL, 360.0, WALL + 14.0], Material::Ferrofluid)], &[cup(146.0), cup(366.0)]);
+            w.add_magnet(crate::sim::Magnet::new(at, 6.0, deg, crate::sim::MAGNET_STRENGTH_DEFAULT));
+            for k in 0..8 {
+                wait(&mut w, 1.0);
+                let d = diagnose(&w.sim.download_particles(), &w.sim.params);
+                println!("{name} t = {} s: kinetic energy {:.1}, fastest {:.1} cells/s", k + 1, d.ke, d.max_speed);
+            }
+            save(&w, name, fit);
+            save(&w, &format!("{name}_zoom"), zoom([256.0, 25.0], 4.0));
+            if name == "magnet_under" {
+                for k in 0..6 {
+                    save(&w, &format!("motion_magnet_{k}"), zoom([256.0, 25.0], 4.0));
+                    wait(&mut w, 1.0 / 60.0);
+                }
+            }
+        }
     }
     // Small droplets inside another liquid: clusters of 1, 2, 4, 9 and 16 particles of lava and
     // of oil in water, and of water in lava and in oil, shortly after they were placed (and six
@@ -1054,6 +1103,9 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         wait(&mut w, t as f32);
         save(&w, file, fit);
         save(&w, &format!("{file}_zoom"), view);
+        if file == "ferrofluid_spikes" {
+            save(&w, "ferrofluid_spikes_close", zoom([256.0, 22.0], 10.0));
+        }
     }
 
     // Zoom and resolution: far out, very close, and the coarsest and finest presets.

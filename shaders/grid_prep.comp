@@ -198,6 +198,17 @@ void main() {
         // cell of a non-Newtonian liquid: the plug holds the sparse top of a yield-stress
         // pile (particles.comp), which as liquid ran out 60 % further.
         else if (P.gravity > 0.0 && nn.x <= 0.0 && phi_t > RESTING_LEVEL && packed(i - W)) level = BRIDGE_LEVEL;
+        // With a magnet, "lying on" is towards the pull of gravity and the field together
+        // (magnet.comp, from the last substep's energy): the sparse side of a blob that a
+        // magnet holds up, or the top of a dish it pulls down, is not left to fall under gravity
+        // alone and be pulled back (a ferrofluid column hanging from a magnet on 1 cm cells kept
+        // ~125 units of kinetic energy, ~40 % of it in its few sparse surface cells).
+        else if (has_cap(CAP_MAGNET) && nn.x <= 0.0 && phi_t > RESTING_LEVEL && chi > 0.0) {
+            float km = chi / P.mag.y / max(rho, 0.05);
+            vec2 pull = -km * 0.5 * vec2(magc[i + 1].y - magc[i - 1].y, magc[i + W].y - magc[i - W].y) - vec2(0.0, P.gravity);
+            int toward = abs(pull.x) > abs(pull.y) ? (pull.x > 0.0 ? i + 1 : i - 1) : (pull.y > 0.0 ? i + W : i - W);
+            if (packed(toward)) level = BRIDGE_LEVEL;
+        }
     }
 
     // An open cell without liquid: its region has a free surface (see rhs.comp).
@@ -214,7 +225,9 @@ void main() {
         mu = min(mu, cap);
         rh[i] = nn;
     }
-    if (has_cap(CAP_MAGNET)) magc[i].x = chi * min(phi_f, 1.0);
+    // The susceptibility of the cell's liquid (its composition, not times its occupancy:
+    // magnet.comp).
+    if (has_cap(CAP_MAGNET)) magc[i].x = chi;
     if (has_cap(CAP_ELASTIC)) {
         int ce = int(P.elastic.x);
         estr[i] = vec4(acc[k + ce], acc[k + ce + 1], acc[k + ce + 2], 0.0) * (P.elastic.y * P.inv_ppc / STRESS_FIX);

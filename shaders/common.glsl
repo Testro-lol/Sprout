@@ -80,7 +80,7 @@ layout(std140, set = 0, binding = 0) uniform Params {
     vec4 elastic;         // accumulator channel of the stress (3 channels); largest shear modulus in the tank (grid units); most stress, x modulus; most deformation per substep
     vec4 steam;           // vapour quality below which steam condenses; puff rise speed (cells / s); puff lifetime (s); quality at which boiling water becomes steam
     vec4 steam2;          // rate of the exchange inside a cell that holds steam (1 / s); 1: boiling aqueous liquid turns into steam (0: it leaves at once); eddy speed of the air puffs ride (cells / s); eddy size (cells)
-    vec4 heat3;           // Smagorinsky constant of the sub-grid heat mixing (0 off); evaporation: L_vap / c_p,air (K, 0 off); unused; unused
+    vec4 heat3;           // Smagorinsky constant of the sub-grid heat mixing (0 off); evaporation: L_vap / c_p,air (K, 0 off); film map texels per cell; magnet_demag
     uvec4 solve;          // indirect entries per set (reduce_tail.glsl); unused x3
 } P;
 
@@ -374,6 +374,21 @@ const float STRESS_FIX = 65536.0;
 // Per cell (when CAP_MAGNET): susceptibility of the cell's liquid (share-weighted), and the
 // magnetic energy density of pure magnetic liquid there (grid units; magnet.comp).
 layout(std430, set = 0, binding = 51) buffer MagBuf { vec2 magc[]; };
+
+// The field of the placed magnets at x (cells), T: each a point dipole evaluated in the plane,
+// B0 (R / r)^3 (3 (m.r) r - m) / 2 (B0 on the axis at the rim, constant inside the rim).
+vec2 magnet_field(vec2 x) {
+    vec2 B = vec2(0.0);
+    for (int k = 0; k < int(P.mag.x); k++) {
+        vec4 mg = P.magnet[k];
+        vec2 m = P.magnet_dir[k].xy;
+        vec2 d = x - mg.xy;
+        float r = max(length(d), mg.z);
+        vec2 e = length(d) > 1e-4 ? d / length(d) : m;
+        B += mg.w * pow(mg.z / r, 3.0) * 0.5 * (3.0 * dot(m, e) * e - m);
+    }
+    return B;
+}
 
 // Per cell, from grid_prep.comp (when CAP_RIGID): share of the cell's non-Newtonian
 // material, its table row, its concentration, and 1 where the cell is too stiff to flow

@@ -223,7 +223,7 @@ Defaults are unchanged from before this overhaul.
 | Group | Where | Parameters |
 |---|---|---|
 | World | Physics panel | `gravity` (m/s²), `cell_size` (m; the panel shows mm and the tank size) |
-| Liquids | the liquid editor (per liquid); pair tensions and heat in the Physics panel | every material property as `<property>_<liquid>` or `<liquid>.<property>` (see [Liquids](#liquids); old names such as `density_oil`, `nu_syrup` still work), the six `tension_<group>_<group>` pair tensions, `droplet_cells`; heat: `ambient_temp`, `heat_rate`, `air_cooling`, `contact_heat`, `eddy_heat`, `evaporation`, `heat_power`, `rigid_viscosity`; steam: `steam` (on/off, in the panel), `steam_boil`, `steam_condense`, `steam_mixing`, `steam_rise`, `steam_life`, `steam_swirl`, `steam_eddy` |
+| Liquids | the liquid editor (per liquid); pair tensions and heat in the Physics panel | every material property as `<property>_<liquid>` or `<liquid>.<property>` (see [Liquids](#liquids); old names such as `density_oil`, `nu_syrup` still work), the six `tension_<group>_<group>` pair tensions, `droplet_cells`; heat: `ambient_temp`, `heat_rate`, `air_cooling`, `contact_heat`, `eddy_heat`, `evaporation`, `heat_power`, `rigid_viscosity`; magnets: `magnet_demag`; steam: `steam` (on/off, in the panel), `steam_boil`, `steam_condense`, `steam_mixing`, `steam_rise`, `steam_life`, `steam_swirl`, `steam_eddy` |
 | Time step and accuracy | `cfl`, `pressure_tol`, `viscosity_tol` in the Solver panel; the rest `--set` only | `cfl`, `advection_order`, `dt_max`, `fixed_hz`, `pressure_tol`, `pressure_max_iters`, `iters_margin`, `correction_tol`, `viscosity_tol`, `viscosity_max_iters`, `implicit_viscosity_min`, `viscous_projection`, `viscous_warm`, `viscosity_warm`, `viscosity_precond`, `viscosity_mg_levels`, `viscosity_mg_sweeps` |
 | Stabilisation | `speed_cap` in the Solver panel (with an off box); the rest `--set` only | see [Numerical stabilisation](#physics) |
 
@@ -682,19 +682,47 @@ the flux form is used.
 
 **Magnetism.** Up to eight magnets (the Magnet tool, or a map) are point dipoles evaluated in
 the plane: no field is solved and the liquid does not change the field. A magnetisable liquid
-(linear, saturating: `M = χe H / (1 + χe H/Ms)`) gets the force `−∇ψ` of its magnetic energy
-density, applied to the face velocities before viscosity and pressure as gravity is, with the
-pressure solve's own face density: inside a body of magnetic liquid that is exactly a discrete
-gradient, which the pressure takes up, so only the surface and interfaces feel a net force.
-(Until 2026-11-14 it was applied per particle, sampled between grid points; that is not a
-discrete gradient, the projection could not balance it, and on the Ferrofluid map, at some
-75 g near the magnet, the dish was crushed into a film on the floor within a second, with
-9 000 particles in one cell and particles racing at the speed cap. Now the dish heaps up over
-the magnet.) Demagnetisation is estimated locally from the interface normal (N = 1 facing the
-field, 0 along it, 1/3 inside): this pulls liquid into shapes elongated along the field, the
-mechanism behind Rosensweig spikes — a qualitative local estimate of a non-local effect, not a
-spike model. Spike spacing is ~1 cm (2π√(σ/ρg)): resolved on the 1 mm Ferrofluid map, below
-one cell on 1 cm maps.
+(linear, saturating: `M = χe H / (1 + χe H/Ms)`, demagnetised as a sphere, N = 1/3) gets the
+force `−∇ψ` of its magnetic energy density, applied to the face velocities before viscosity
+and pressure as gravity is, with the pressure solve's own face density: inside a body of
+magnetic liquid that is exactly a discrete gradient, which the pressure takes up, so only the
+surface and interfaces feel a net force. A face takes the susceptibility of the liquid on it:
+the mean of its two cells' where both are liquid, the liquid cell's own on a face to air (the
+magnetic energy's own boundary condition: with the effective pressure p + ψ inside, the free
+surface sits at ψ interpolated to its sub-cell place, and the face's force is the whole
+difference). A sparse cell resting against packed liquid in the direction of the pull of
+gravity and the field together stays liquid, as one resting on liquid below does
+(`RESTING_LEVEL`). (Until 2026-11-14 the force was applied per particle, sampled between grid
+points; that is not a discrete gradient, the projection could not balance it, and on the
+Ferrofluid map, at some 75 g near the magnet, the dish was crushed into a film on the floor
+within a second. Until 2026-11-15 the face's share was the cells' susceptibility *times their
+occupancy*, which jitters by a quarter as particles cross cells: times a Kelvin force of
+tens of g that noise is not a gradient, and a dish over a magnet never came to rest; see
+Validation, "Blood, magnets and spikes".)
+
+`magnet_demag` (0 by default, 0 – 1) blends in a local estimate of demagnetisation by the
+liquid's shape (N = 1 for a surface facing the field, 0 along it), the mechanism behind
+Rosensweig spikes. It makes ψ depend on the shape of the surface, so `−∇ψ` is no longer the
+force of any energy, and from a surface that jitters with its particles it pumps energy in
+without end (Ferrofluid map, kinetic energy after 10 s: ~3500 at 1, ~380 at 0, about that of
+the same dish dropped without a magnet); no spikes formed with it either.
+
+**Ferrofluid spikes** are drawn instead (`cell_optics.comp` layers 13 – 14, `composite.frag`
+"ferrofluid spikes"). A magnetisable surface facing a field breaks into spikes along it when
+its magnetisation passes Rosensweig's threshold, `Mc² = (2/μ0)(1 + 1/μr)√(ρgσ)` (ferrofluid:
+μ0Mc = 7.7 mT), at the spacing of the fastest-growing wave, `2π√(σ/ρg)` (9.8 mm). Per cell, the
+field gives the height of a spike standing on liquid there (`SPIKE_HEIGHT` 0.85 of the spacing
+at full strength, growing as `1 − exp(−(M²/Mc² − 1))` with the magnetisation of a flat surface
+facing the field) and its direction. The composite finds the surface below a pixel along the
+field (a march and a bisection in the sharp field), keeps only a surface of magnetisable
+liquid that faces the field, and adds a cone with slightly hollow flanks to the sharp field
+there, so it is shaded as the liquid itself. Spikes stand on a lattice counted as distance
+round the strongest magnet (radius × angle from its pole), which stays put while the liquid
+moves under it, as real spikes stand over a magnet. On 1 mm cells (the Ferrofluid map) they are
+at their physical spacing; on 1 cm cells that would be one spike per cell, a pixel or two in
+the whole-tank view, so they are drawn at least `SPIKE_MIN_GAP` 3 cells apart there (an
+exaggeration, for the eye). They fade out where they would be narrower than a few pixels.
+They have no mass and do not move the liquid.
 
 **Gallium's oxide skin**: a surface yield stress `skin/dx` in free-surface cells, made rigid
 (one 8-connected shell) while the inertial stress of the motion across the cell, ρ(γ̇dx)²,
@@ -853,6 +881,46 @@ interleaved rounds). Flicker is equal or lower in four of the six motion scenes;
 Water (0.052 → 0.074 %) and Kitchen (0.026 → 0.033 %) are higher, at the splashing water
 surface, not at ice: those scenes now run differently (the frozen-clump fix below lets lava's
 crust keep its volume). One-cell-thin threads of a miscible liquid are a little fainter.
+
+**Which liquid is where** (2026-11-15; reported: blood in honey or water looked big, blocky
+and pixelated). Within one phase group the sharp field sees one liquid, so the colour of blood
+in honey, ink in water or ferrofluid in oil came from the cells alone, and there a few
+particles of a strongly absorbing liquid count as spread through every cell they pass, then
+over 3 × 3 cells: a trail of single blood particles in honey (a dotted line of drops) was
+drawn as a red band two or three cells wide in the cells' staircase shape, and ferrofluid
+stirred into oil as black squares two cells across. Two changes:
+- *The liquids' colour from their particles.* A second, cheaper splat, the *tint field*
+  (`tint.frag`, half the splat's resolution, two targets): each particle lays down how it
+  absorbs and scatters (an aqueous one: its concentrate part and its concentrate share; the
+  diluent's absorption per unit comes from the cells, layer 15, and its tint fades by the
+  concentrate share at the pixel exactly as in the cells, `particle_absorb`), and its weight
+  as aqueous or other. Each side's colour is used where that side has the pixel nearly to
+  itself (95 – 99.5 % of the weight), after taking out the few percent of the other side
+  with that side's coefficients from the cells; elsewhere the interface rules above decide.
+  (Mixed in, every speck of chocolate in water drew a brown ring round itself.) Those cell
+  coefficients are the cells' blend of that side, not the particles' own: where what is taken
+  out is more than a tenth of what stays, the particles' colour gives way to the cells' (fully
+  at four tenths, `TINT_TRUST`). Without that, ferrofluid stirred into the Playground's pool,
+  which also holds oil, was taken out as mostly oil, and every speck drew a black ring with a
+  pale rim round it in the syrup and water. The field is read with a cubic B-spline (four
+  bilinear taps, `tint_read`): its texels are 2 – 4 pixels and its kernels about one and a half
+  texels when zoomed out, and the sharp ownership cut on a bilinear read drew every edge of
+  blood in honey in pixel steps until zoomed in. The pass is
+  drawn only in a tank with two liquids of one phase group (with one of each there is nothing
+  the sharp field cannot already tell apart).
+- *The rest of the look from the cells that match.* Each cell also holds a look key, the colour
+  of a thin film of its liquid (layer 12). Where the key of the particles' liquid at the pixel
+  differs from its cells' (by more than 0.03 – 0.10), the cell optics (opacity, gloss, light,
+  glow, ...) are read up to 1.6 cells off, along the direction in which the cells' key moves
+  towards it, at the point closest to it (`seek_key`): in a drop of blood the read moves to
+  where the cells hold blood, beside it to clear liquid. Reading the unsmoothed cells instead,
+  weighted towards those that matched, drew their cell-to-cell noise as dark blocks.
+
+Gallery: `mix_blood_honey*` (blood poured onto honey over water), `mix_blood_close`,
+`mix_ferro_oil` (ferrofluid stirred into oil: black squares two cells across before,
+particle-sized drops now), `kitchen`. Left as it was: opacity, gloss and scattering of a speck still come
+from the cells, so a single red particle in milk is a slightly squared dot rather than a round
+one.
 
 **Effects** (2026-11-13). The look was simple and a little cartoonish: flat colour with a
 drawn rim, no light from hot liquid, nothing left behind. What changed, all of it driven by
@@ -1023,13 +1091,14 @@ Lava Meets Water 0.054 → 0.024 %, Kitchen 0.014 → 0.013 %.
 | **Lava** | Molten: a glow that swells slowly at rest and is drawn into bright streaks where it flows; cooling: dark plates with glowing seams that tear open where it spreads | A rind of dark glassy rock with dim cracks where it meets air or water; a steady, soft bloom | Thick | Lights walls and liquids near it (water beside it turns orange); boils the water it meets; scorches what it touches |
 | **Blood** | Deep red, opaque, glossy; scarlet where thin | A wet highlight | Medium | Spatters the back wall and what it hits; coats solids, and the coat runs down their faces in drips with beads at their heads; dries darker and browner |
 | **Mercury, gallium** | A smooth mirror of the tank (and of any glow nearby) | A hard highlight | Medium | |
-| **Ferrofluid** | A dark mirror: glossy black that shows the tank's light in its surface (until 2026-11-14 a black body with a quarter of a mirror, nearly invisible against the dark tank) | A hard highlight | Medium | Heaps up over a magnet |
+| **Ferrofluid** | A dark mirror: glossy black that shows the tank's light in its surface (until 2026-11-14 a black body with a quarter of a mirror, nearly invisible against the dark tank) | A hard highlight | Medium | Heaps up over a magnet, and stands up in a crown of spikes where the field at its surface passes the Rosensweig threshold (Physics, Magnetism) |
 
 | Interaction | How it reads |
 |---|---|
 | Oil – water interface | An ink line on the oil side and a pale meniscus on the water side, as sharp at 20 × zoom as at 1 × |
 | Oil dispersed in water | Gold droplets suspended in clear water, which takes a faint warm tint from oil too fine to draw; they gather into drops and layers. (This was a pale "milky" emulsion until 2026-11-11; any stirred tank then looked cloudy white.) |
 | A small drop inside another liquid | A bead of its own colour with a darker rim, down to two particles: lava or oil in water, water in lava or oil |
+| A trail of one liquid in another of its kind (blood in honey or water, ink in water, ferrofluid in oil) | Drops at the particles' own size and place: a few particles of blood are a few red drops, not the cells they pass through |
 | Water – syrup mixing | No line: from blue through pale gold to amber, as syrup dissolving in water does (until the third round of 2026-11-14 it ran through violet and rose) |
 | Spray and droplets | Each lone particle is a droplet, drawn stretched back along its path, so spray is streaks. Far out, where a droplet is smaller than a pixel, spray becomes a haze instead of sparkling. The Spray tool scatters its droplets (up to 14° off straight outwards, speed ± 25 %, positions off its lattice by up to 0.3 of the spacing): launched exactly outwards from a lattice at one speed, every frame's droplets flew along the same rays, a regular sunburst |
 | Splashes and impacts | White water: liquid that is both fast and thin |
@@ -1042,6 +1111,9 @@ Lava Meets Water 0.054 → 0.024 %, Kitchen 0.014 → 0.013 %.
    added into a half-float target that ends up holding, per pixel, the weight of aqueous
    liquid, of oil, of syrup, and weight × speed. A moving particle is drawn over the path it
    covers in 1/160 s.
+   *The tint field* (only with two liquids of one phase group): the particles again, at half
+   that resolution, into two more targets: how they absorb and scatter (Which liquid is
+   where, above).
 2. *The wide field* (three small passes): the same target box-filtered down and blurred to a
    standard deviation of 2 cells. It says how much liquid is *around* a point: 0.5 at a flat
    surface, 1 deep inside, little in a droplet or a film. It is rendered at whatever
@@ -1939,6 +2011,37 @@ Fragile in both builds and left as they are:
 
 `validate`: all 241 checks pass; `--selftest`, `cargo test` (42) and clippy pass.
 
+### Blood, magnets and spikes (2026-11-15)
+
+Reported: blood looks big, blocky and pixelated in other liquids (not all), likely other
+liquids too; ferrofluid should spike near a magnet, and that interaction should be steadier.
+
+| Symptom | Cause | Fix | Measured |
+|---|---|---|---|
+| Blood in honey a red band 2 – 3 cells wide in cell-sized steps; ferrofluid in oil black squares | Colour from the cells alone within a phase group: a few particles of a strong absorber count as spread through each cell, then over 3 × 3 | Colour from the particles (the tint field) and the rest of the look from the matching cells (Look, "Which liquid is where") | `gallery DIR mix`: a dotted trail of drops instead of a band (`docs/look/fixes/blood_ferrofluid.jpg`) |
+| Ferrofluid in the Playground pool (syrup, water and oil): a black ring with a pale rim round every speck | The tint field took the other side's few percent out with the cells' blend of it (oil and ferrofluid), and ferrofluid absorbs so strongly that the error dominated | The particles' colour gives way to the cells' where what is taken out is large against what stays (`TINT_TRUST`, composite.frag) | `gallery DIR ferro_pool`: rings gone; liquids of one side only (`mix`) unchanged |
+| Blood and other liquids in pixel steps when zoomed out, sharp when zoomed in | The tint field (4-pixel texels, kernels 1.5 texels wide zoomed out) read bilinearly under a sharp 95 – 99.5 % ownership cut: the edge followed the texel grid | Cubic B-spline read of the tint field (`tint_read`, composite.frag) | `gallery DIR mix`, `mix_blood_honey_mid` (1.5x): stepped edges and square drops → smooth edges and round drops; close-up unchanged |
+| A dish over a magnet never comes to rest | The face's share of the force was susceptibility × occupancy (particle noise times tens of g, not a gradient); a surface face got half the force | The liquid's susceptibility (Physics, Magnetism) | Ferrofluid map, kinetic energy after 10 s (`probe --map 17 --at 10`): ~9000 → ~3500 |
+| ... and still not | The local shape-dependent demagnetisation is not the force of an energy | `magnet_demag` (default 0) | ~3500 → ~380 (the same dish without a magnet: ~350) |
+| A blob round a magnet held in it churns at its edge | Sparse cells at its side feel gravity alone | A sparse cell resting against packed liquid along the pull of gravity and field together stays liquid | Magnet in a 1 cm pool (`gallery DIR magnet`, `magnet_over`): fastest particle ~140 → ~85 cells/s |
+| No spikes | Neither resolved on 1 cm cells nor produced by the local model on 1 mm cells | Drawn from Rosensweig's threshold and spacing (Physics, "Ferrofluid spikes") | `gallery DIR ferrofluid_spikes`, `magnet` |
+
+![Before and after: blood on honey, ferrofluid stirred into oil, the Ferrofluid map, a magnet under a 1 cm dish](docs/look/fixes/blood_ferrofluid.jpg)
+
+New checks (`validate metals`), rms particle speed 6 – 8 s after the Magnet tool's default
+magnet (0.3 T) was placed in a 1 cm dish of ferrofluid, before → after:
+
+| Check | Before | After | Limit |
+|---|---|---|---|
+| ferrofluid dish over a magnet comes to rest | 25.0 cells/s | 3.6 | < 8 |
+| ferrofluid round a magnet held in it settles | 34.0 | 15 | < 22 |
+
+The ferrofluid drop's acceleration towards a magnet (`validate metals`) passes in both builds.
+Flicker (motion frames, `gallery DIR motion`, before → after): Kitchen 0.073 → 0.123 % (blood and
+chocolate now drawn as moving drops rather than smoothed cells), Ferrofluid 0.037 → 0.051 %
+(the spikes' outline rides the moving surface); Dam Break, Playground, Upside Down, Lava Meets
+Water and the droplets unchanged.
+
 ## Performance
 
 Hardware: AMD Ryzen 5 3600, NVIDIA RTX 3060 Ti 8 GB, Fedora 45, Wayland. All three versions
@@ -2550,6 +2653,25 @@ Water 6 → 2 (worst residual 4.6e-3 → 1.3e-3), Kitchen 18 → 13 (3.7e-3 → 
 and Upside Down 0 → 0. Kitchen's are jumps in the iteration count no margin covers, as with
 the pressure (Limitations).
 
+### Blood, magnets and spikes (2026-11-15)
+
+Frame times, `sprout --map N --no-vsync --frames 600` with `SPROUT_FRAMES_CSV`, 1600 × 900,
+old and new builds interleaved, two rounds (p50 / p90 / p99 ms; simulated time per wall
+second after warm-up):
+
+| Map | Before | After |
+|---|---|---|
+| Playground (water and syrup: the tint field is drawn) | 7.16 / 8.15 / 10.17, 4.77 / 8.12 / 11.19; 1.00×, 0.99× | 7.67 / 8.41 / 8.79, 5.01 / 8.39 / 8.71; 0.99×, 1.00× |
+| Ferrofluid | 12.39 / 12.89 / 13.37, 12.38 / 12.83 / 13.49; 1.00× | 8.16 / 8.51 / 9.41, 7.91 / 8.40 / 9.44; 1.00× |
+| Oil Drops (1 mm cells) | 11.82 / 12.39 / 12.95, 11.72 / 12.28 / 12.91; 0.25× | 12.05 / 12.59 / 13.33, 12.05 / 12.59 / 13.14; 0.25× |
+
+The Ferrofluid map runs a third faster: the dish now lies still instead of churning, so the
+step is longer. Render passes per 1080p frame (`SPROUT_PROFILE_SIZE=1920x1080 sprout profile
+--map N`, best of 20): Playground splat + tint 0.20 → 0.42 ms, composite 0.52 → 0.57; Dam Break
+(one liquid: no tint field) splat 0.12 → 0.13, composite 0.34 → 0.41. The tint draw is bound
+by its triangles, not its pixels (three full-resolution targets on the main splat instead
+cost 1.0 ms), hence it is drawn only where two liquids share a phase group.
+
 ## Limitations
 
 - **Some pressure solves run out of recorded iterations in Lava Meets Water** (found
@@ -2630,8 +2752,15 @@ the pressure (Limitations).
   by itself, but its elastic waves need substeps 4 times shorter (Viscoelasticity, "Slime
   holds together"); the thicker solvent does the same at no cost. An implicit elastic stress
   would lift that limit; not done in this round.
-- **Magnetism has no field solve**: ferrofluid spikes come from a local demagnetisation
-  estimate and are qualitative; spacing ~1 cm is below a cell on 1 cm maps.
+- **Magnetism has no field solve**, and the ferrofluid spikes are drawn, not simulated: their
+  onset and spacing follow Rosensweig's linear theory, their shape is a fixed cone, and on 1 cm
+  cells they are drawn three times their physical spacing apart. Liquid can flow into a magnet
+  (a magnet is a field, not a solid). A blob of ferrofluid round a magnet held in it does not
+  quite settle (rms speed 15 cells/s at the neck where it meets the dish, against 34 before
+  2026-11-15), nor does a dish over a magnet (3.6 cells/s in a slow current over the heap,
+  against 25): sparse surface cells (under a quarter full) still feel gravity but no
+  magnetic force; giving them the force as well stirred the 1 mm Ferrofluid map twice as
+  hard.
 - **No gas phase** besides steam bubbles: there is no air to push, steam that escapes leaves
   the simulation (reported as boiled); salt residue does not redissolve; suspensions do not cream (milk fat); a particle holds one concentrate, so
   ink in syrup-water mixes with the water only.
@@ -2688,7 +2817,7 @@ the pressure (Limitations).
 | [src/sim/](src/sim/mod.rs) | The fluid solver: buffers, pipelines, the substep; [params.rs](src/sim/params.rs) holds every parameter and the `PARAMS` table of names, units and ranges; [raw.rs](src/sim/raw.rs) the hand-synchronised substep command buffers |
 | [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer; `reduce_tail.glsl` the scalar steps of the Krylov solves (run in the last work group of the kernel before them), `visc_iter.comp` one Jacobi-preconditioned viscosity iteration (and, specialised, its warm start), `vmg.glsl` the viscosity multigrid and its iteration (`visc_mgu.comp`, `visc_mgz.comp`, `vmg_*.comp`). |
 | [src/render.rs](src/render.rs), [src/gui.rs](src/gui.rs) | The renderer (see [Look](#look)): splatting, the wide field, the wet map, shading; a small egui painter |
-| `shaders/splat.*`, `down.frag`, `blur.frag`, `wet.frag`, `composite.frag` | The render passes; `composite.frag` holds the whole look |
+| `shaders/splat.*`, `tint.frag`, `down.frag`, `blur.frag`, `wet.frag`, `composite.frag` | The render passes (`tint.frag`: the aqueous liquids' colour from their particles); `composite.frag` holds the whole look, ferrofluid spikes included |
 | [src/app.rs](src/app.rs), [src/ui.rs](src/ui.rs), [src/camera.rs](src/camera.rs), [src/pacing.rs](src/pacing.rs) | Window and input; panel and canvas overlays; eased camera; substep pacing |
 | [src/brush.rs](src/brush.rs) | Brush strokes, the stream of the pour and the jet, and the admission of new liquid (CPU only) |
 | [src/maps.rs](src/maps.rs) | Built-in maps |

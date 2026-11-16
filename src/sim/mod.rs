@@ -87,7 +87,7 @@ const STAIN_WASH_RATE: f32 = 0.06;
 /// Thickness unit of the film map, m (film.comp: 0.1 mm).
 const FILM_UNIT: f32 = 1.0e-4;
 /// Layers of the per-cell optics image (cell_optics.comp writes them, composite.frag reads them).
-const CELL_OPTICS_LAYERS: u32 = 12;
+const CELL_OPTICS_LAYERS: u32 = 16;
 const PARTICLE_GROUP: u32 = 128;
 /// Substeps between two particle sorts (see `sort.comp`), and the particle count below
 /// which sorting is not worth its dispatches.
@@ -419,6 +419,24 @@ struct FilmPc {
 /// PERIOD_LONG), s.
 pub const FLOW_PERIOD_SHORT: f32 = 4.0;
 pub const FLOW_PERIOD_LONG: f32 = 12.0;
+
+/// Push constants of cell_optics.comp (`OPC`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct OpticsPc {
+    inv_speed: f32,
+    spike_gap: f32,
+    spike_mc: f32,
+    spike_k: f32,
+}
+
+/// Ferrofluid spikes as drawn (cell_optics.comp, README "Magnetism"): never closer than this
+/// many cells, so that they stay visible on 1 cm cells (at their physical ~1 cm spacing one
+/// spike a cell would be a pixel or two wide in the whole-tank view)...
+pub const SPIKE_MIN_GAP: f32 = 3.0;
+/// ...and a full spike this tall over its spacing (photographs of the Rosensweig lattice:
+/// spikes about as tall as they are apart).
+pub const SPIKE_HEIGHT: f32 = 0.85;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -1532,7 +1550,8 @@ impl FluidSim {
         };
         self.stain_at.set(Some((self.resets, now)));
         self.record_smoke(b);
-        let key = (self.substeps_done, self.resets, self.tables_uploaded, inv_speed.to_bits());
+        let (spike_gap, spike_mc) = self.spike_params();
+        let key = (self.substeps_done, self.resets, self.tables_uploaded, inv_speed.to_bits() ^ spike_gap.to_bits().rotate_left(7));
         if self.optics_key.replace(Some(key)) == Some(key) {
             return;
         }
@@ -1541,7 +1560,7 @@ impl FluidSim {
         let nt = self.film_tiles.len() / 5;
         b.fill_buffer(self.film_tiles.clone().slice(4 * nt..5 * nt), 0).unwrap();
         self.pass.cell_optics.bind(b);
-        self.pass.cell_optics.push(b, inv_speed);
+        self.pass.cell_optics.push(b, OpticsPc { inv_speed, spike_gap, spike_mc, spike_k: SPIKE_HEIGHT });
         dispatch(b, groups);
         // The light reaching each cell from above, one workgroup per column (light.comp).
         self.pass.light.bind(b);
@@ -1659,10 +1678,45 @@ impl FluidSim {
     /// crackle, iridescence, or glints strong enough to sparkle: composite.frag draws the
     /// sparkle above 0.5, and a blend of liquids under 0.45 stays clear of it) and stains
     /// (`film_live`).
-    pub fn render_features(&self) -> (bool, bool) {
+    /// What the renderer needs to draw: carried patterns (a liquid with crackle, iridescence
+    /// or glints), stains (a staining liquid has been in the tank), ferrofluid spikes (a
+    /// magnet and a magnetisable liquid).
+    pub fn render_features(&self) -> (bool, bool, bool) {
         let p = &self.params;
         let patterns = self.tank.rows.iter().any(|&r| p.mat[r].crackle > 0.0 || p.mat[r].iridescence > 0.0 || p.mat[r].glint > 0.45);
-        (patterns, self.film_live())
+        (patterns, self.film_live(), self.spike_params().0 > 0.0)
+    }
+
+    /// Whether two liquids of one phase group are in the tank (steam aside): only then does the
+    /// renderer draw the liquids' colour from the particles (render.rs: the tint field), which
+    /// the sharp field's groups cannot tell apart.
+    pub fn shares_a_group(&self) -> bool {
+        let mut seen = [0u32; 8];
+        for &r in self.tank.rows.iter().filter(|&&r| r != Material::Steam.index()) {
+            let g = (self.params.mat[r].group as usize).min(7);
+            seen[g] += 1;
+        }
+        seen.iter().any(|&n| n >= 2)
+    }
+
+    /// Ferrofluid spikes (cell_optics.comp): their spacing in cells, and mu0 Mc of the most
+    /// susceptible liquid in the tank, T (Rosensweig's threshold); (0, 0) without a magnet or
+    /// a magnetisable liquid. Gravity is taken as at least 1 m/s² (without it the threshold
+    /// falls to zero and the spacing grows without bound).
+    pub fn spike_params(&self) -> (f32, f32) {
+        let p = &self.params;
+        let Some(m) = self.tank.rows.iter().map(|&r| &p.mat[r]).filter(|m| m.susceptibility > 0.0).max_by(|a, b| a.susceptibility.total_cmp(&b.susceptibility)) else {
+            return (0.0, 0.0);
+        };
+        if self.magnets.is_empty() {
+            return (0.0, 0.0);
+        }
+        let g = p.gravity.max(1.0);
+        let (rho, sigma) = (m.density.max(1.0), m.tension.max(1e-4));
+        let gap = (2.0 * std::f32::consts::PI * (sigma / (rho * g)).sqrt() / p.cell_size).max(SPIKE_MIN_GAP);
+        let mu0 = 1.256_637_1e-6f32;
+        let mc = (2.0 * mu0 * (1.0 + 1.0 / (1.0 + m.susceptibility)) * (rho * g * sigma).sqrt()).sqrt();
+        (gap, mc)
     }
 
     fn film_live(&self) -> bool {
@@ -2065,7 +2119,7 @@ impl FluidSim {
             steam: [p.steam_condense.clamp(0.0, 1.0), p.steam_rise / dx, p.steam_life, p.steam_boil.clamp(p.steam_condense, 1.0)],
             steam2: [p.steam_mixing, p.steam as f32, p.steam_swirl / dx, p.steam_eddy / dx],
             // Latent heat of vaporisation of water over the heat capacity of air (1005 J/(kg K)).
-            heat3: [p.eddy_heat.max(0.0), if p.evaporation != 0 { 2.257e6 / 1005.0 } else { 0.0 }, film_res(self.grid) as f32, 0.0],
+            heat3: [p.eddy_heat.max(0.0), if p.evaporation != 0 { 2.257e6 / 1005.0 } else { 0.0 }, film_res(self.grid) as f32, p.magnet_demag.clamp(0.0, 1.0)],
             solve: [self.entries(), self.visc_entry() as u32, 0, 0],
         }
     }

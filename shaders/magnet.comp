@@ -8,22 +8,25 @@
 //
 // The field is analytic: each magnet is a point dipole, evaluated in the plane of the
 // simulation, B = B0 (R / r)^3 (3 (m.r) r - m) / 2 (B0 on the axis at the rim, constant
-// inside the rim). No field is solved, so the liquid does not reshape the field around
-// it. What a field solve would add first, demagnetisation, is estimated locally: a
-// liquid surface facing the field is magnetised less (factor N = 1) than one along it
-// (N = 0), with N = 1/3 (a sphere) inside the liquid. The magnetisation of a linear
-// liquid that saturates, M = chi_e H / (1 + chi_e H / Ms) with chi_e = chi / (1 + N chi),
-// has the energy density
+// inside the rim; common.glsl: magnet_field). No field is solved, so the liquid does not
+// reshape the field around it, and it is demagnetised as a sphere is (N = 1/3). The
+// magnetisation of a linear liquid that saturates, M = chi_e H / (1 + chi_e H / Ms) with
+// chi_e = chi / (1 + N chi), has the energy density
 //     psi = -mu0 int_0^H M dH' = -mu0 Ms^2 / chi_e (x - ln(1 + x)),   x = chi_e H / Ms,
-// and the force per volume on the liquid is -grad psi: the Kelvin force mu0 M grad H
-// where N is uniform, plus a pull towards shapes elongated along the field where the
-// surface tilts, which is what raises spikes (Rosensweig instability). That second part
-// is a local estimate of a non-local effect: qualitative, not a quantitative spike model.
+// and the force per volume on the liquid is -grad psi: the Kelvin force mu0 M grad H.
+// `magnet_demag` (params.rs, 0 by default) blends in a local estimate of what a field solve
+// would add, demagnetisation by the shape: a surface facing the field magnetised less
+// (N = 1) than one along it (N = 0). It pulls liquid into shapes elongated along the field,
+// the mechanism of Rosensweig spikes, but psi then depends on the surface's shape, so
+// -grad psi is not the force of an energy: from a surface that jitters with its particles
+// it pumped energy in without end (the Ferrofluid map at 1: kinetic energy ~3500 after 10 s
+// against ~380 at 0) and no spikes formed. The spikes are drawn instead (cell_optics.comp,
+// composite.frag), where the field passes the Rosensweig threshold.
 //
 // Two dispatches: mode 0 stores psi per cell; mode 1 applies the force to the face
 // velocities, before viscosity and pressure, as gravity is: u -= dt s (psi_c - psi_n) / rho
-// on each face, with s the faces's magnetisable share (the cells' susceptibility x
-// occupancy over the tank's largest) and rho the face density the projection uses. Inside
+// on each face, with s the face's magnetisable share (face_force) and rho the face density
+// the projection uses. Inside
 // a body of magnetic liquid that is exactly a discrete gradient with the projection's own
 // coefficient, so the pressure takes it up and nothing moves; only where the share or the
 // demagnetisation changes (the surface, an interface) is there a net force. (Applied per
@@ -38,9 +41,24 @@ layout(push_constant) uniform MPC {
     uint mode;
 } M;
 
-// Velocity change of the face between cell i and the cell n behind it.
+// Velocity change of the face between cell i and the cell n behind it. The share s is the
+// susceptibility of the liquid on the face over the tank's largest: the mean of the two
+// cells' where both are liquid, the liquid cell's own where the other is air. That is the
+// magnetic energy's own boundary condition: with the effective pressure p + psi inside, the
+// surface (p = 0, at its sub-cell place, grid_coef.comp) sits at psi interpolated there, and
+// the face's force is then the whole difference, whatever theta is.
+// (Until 2026-11-15 s was the cells' susceptibility times their occupancy. Occupancy jitters
+// by a quarter as particles cross cells, and times a Kelvin force of tens of g that noise is
+// not a gradient, so the projection could not take it up: it stirred the Ferrofluid map
+// without end (with the shape term below, kinetic energy after 10 s ~9000 against ~3500 with
+// this fix); and a surface face got half the force an inner one did.)
+// Faces between two cells of sparse liquid (spray) get none. (Given the force a droplet feels,
+// as gravity is given, the sparse top of a dish over a magnet was pulled into the packed
+// liquid below and lifted back by the density correction: the Ferrofluid map's kinetic
+// energy after 10 s rose from ~380 to ~810.)
 float face_force(int i, int n, float rho) {
-    float s = 0.5 * (magc[i].x + magc[n].x) / P.mag.y;
+    bool li = cell[i].w > 0.0, ln = cell[n].w > 0.0;
+    float s = (li == ln ? 0.5 * (magc[i].x + magc[n].x) : li ? magc[i].x : magc[n].x) / P.mag.y;
     return -S.dt * s * (magc[i].y - magc[n].y) / max(rho, 0.05);
 }
 
@@ -59,28 +77,23 @@ void main() {
         vel[i] = me;
         return;
     }
-    vec2 x = vec2(c) + 0.5;
-    vec2 B = vec2(0.0);
-    for (int k = 0; k < int(P.mag.x); k++) {
-        vec4 mg = P.magnet[k];
-        vec2 m = P.magnet_dir[k].xy;
-        vec2 d = x - mg.xy;
-        float r = max(length(d), mg.z);
-        vec2 e = length(d) > 1e-4 ? d / length(d) : m;
-        B += mg.w * pow(mg.z / r, 3.0) * 0.5 * (3.0 * dot(m, e) * e - m);
-    }
+    vec2 B = magnet_field(vec2(c) + 0.5);
     float H = length(B) / MU0;
     float psi = 0.0;
     float chi = P.mag.y;
     if (H > 0.0 && chi > 0.0) {
         // Interface normal from the smoothed liquid fraction; N blends from the bulk value
-        // to (n.h)^2 as the gradient becomes a surface.
-        int W = P.grid.x;
-        vec2 g = c.x > 0 && c.y > 0 && c.x < P.grid.x - 1 && c.y < P.grid.y - 1
-            ? 0.5 * vec2(surf[i + 1].x - surf[i - 1].x, surf[i + W].x - surf[i - W].x) : vec2(0.0);
-        float gl = length(g);
-        float nh = gl > 1e-6 ? dot(g / gl, B / length(B)) : 0.0;
-        float N = mix(1.0 / 3.0, nh * nh, clamp(gl / 0.25, 0.0, 1.0));
+        // to (n.h)^2 as the gradient becomes a surface, by `magnet_demag` (P.heat3.w; 0 by
+        // default, see the top).
+        float N = 1.0 / 3.0;
+        if (P.heat3.w > 0.0) {
+            int W = P.grid.x;
+            vec2 g = c.x > 0 && c.y > 0 && c.x < P.grid.x - 1 && c.y < P.grid.y - 1
+                ? 0.5 * vec2(surf[i + 1].x - surf[i - 1].x, surf[i + W].x - surf[i - W].x) : vec2(0.0);
+            float gl = length(g);
+            float nh = gl > 1e-6 ? dot(g / gl, B / length(B)) : 0.0;
+            N = mix(1.0 / 3.0, nh * nh, clamp(gl / 0.25, 0.0, 1.0) * P.heat3.w);
+        }
         float ce = chi / (1.0 + N * chi);
         float Ms = P.mag.z / MU0;
         float xs = ce * H / Ms;

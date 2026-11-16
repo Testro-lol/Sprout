@@ -208,6 +208,14 @@ pub struct SimParams {
     pub rigid_friction: f32,
     /// Heat / Cool brush: kelvin per second for water at the centre of the brush.
     pub heat_power: f32,
+    /// 0..1: how much of the local estimate of demagnetisation by the liquid's shape the
+    /// magnetic force includes (magnet.comp; README, "Magnetism"). 0 = the liquid is
+    /// magnetised as a sphere everywhere, and the force is the gradient of an energy. At 1 a
+    /// surface facing the field is magnetised less than one along it: a pull towards spikes,
+    /// but not the force of any energy, and from a surface that jitters with its particles it
+    /// stirred a dish over a magnet without end (Ferrofluid map, kinetic energy after 10 s
+    /// ~3500 at 1, ~380 at 0, about that of the same dish without a magnet).
+    pub magnet_demag: f32,
     /// 1: aqueous liquid that boils turns into steam (README, "Steam"): bubbles that rise
     /// through the liquid, condense where it is colder, and escape at the free surface as
     /// puffs. 0: boiled liquid leaves the tank at once, wherever it is.
@@ -383,6 +391,7 @@ impl Default for SimParams {
             rigid_contact: 1,
             rigid_friction: 0.6,
             heat_power: 300.0,
+            magnet_demag: 0.0,
             steam: 1,
             steam_boil: 0.02,
             steam_condense: 0.005,
@@ -652,6 +661,8 @@ pub static PARAMS: &[Param] = &[
         "Coulomb friction between a rigid body and the solid it rests on (rock on rock 0.5 - 0.8); 0 = frictionless."),
     param!("heat_power", World, "K/s", [10.0, 5000.0], None, false, |p| p.heat_power, |p, v| p.heat_power = v,
         "Heat / Cool brush: kelvin per second for water at its centre."),
+    param!("magnet_demag", World, "", [0.0, 1.0], None, false, |p| p.magnet_demag, |p, v| p.magnet_demag = v,
+        "Share of the local estimate of demagnetisation by the liquid's shape in the magnetic force (a pull towards spikes that is not the force of an energy, and stirs a dish over a magnet without end); 0 = magnetised as a sphere."),
     param!("steam", World, "", [0.0, 1.0], None, true, |p| p.steam as f32, |p, v| p.steam = v as u32,
         "1: boiling water turns into steam bubbles that rise, condense in colder water and escape at the surface as puffs; 0 = boiled liquid leaves the tank at once."),
     param!("steam_boil", World, "", [0.001, 1.0], None, false, |p| p.steam_boil, |p, v| p.steam_boil = v,

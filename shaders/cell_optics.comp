@@ -27,6 +27,16 @@
 //  10  drying time (s, for the film map: film.comp); not smoothed
 //  11  absorption and scattering of the dense groups (liquid metals, melts) x their share;
 //      layer 1 then holds the oil-like group alone, 5 a their share and 6 a their frozen share
+//  12  the look key of the cell's liquid (optics.glsl: look_key of all its coefficients), 1,
+//      x the occupancy: composite.frag compares it with the key of the particles under a
+//      pixel (README, "Look")
+//  13  ferrofluid spikes (below): the field's direction x the spikes' height (cells), unused,
+//      the spikes' spacing (cells); written in every cell (the spikes stand in the air)
+//  15  absorption (rgb) of the aqueous plain and diluent liquid x its share, that share; x
+//      the occupancy (composite.frag: the particles' colour, particle_absorb)
+//  14  where the spikes stand: cos and sin of 2 pi x the distance round the nearest magnet in
+//      spacings / SPIKE_PHASE_DIV (spike_phase), in every cell; the magnetisable share x the
+//      occupancy
 // A concentrate's coefficients blend with its diluent's linearly in its concentration, as a
 // dissolved dye's absorbance does (Beer's law), and so does every other property.
 // A frozen share loses gloss here; its colour is kept apart (layers 5 - 7) so that the
@@ -46,7 +56,51 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(push_constant) uniform OPC {
     float inv_speed;   // 1 / the speed that counts as fast (cells / s)
+    float spike_gap;   // spacing of ferrofluid spikes, cells (0: no magnet or no magnetisable liquid)
+    float spike_mc;    // mu0 Mc of the most susceptible liquid, T: the Rosensweig threshold
+    float spike_k;     // height of a full spike over its spacing
 } OP;
+
+// Ferrofluid spikes (README, "Magnetism"). A magnetisable liquid whose surface faces a field
+// strong enough breaks up into a lattice of spikes along the field (Rosensweig 1967): when
+// its magnetisation passes Mc, Mc^2 = (2 / mu0) (1 + 1 / mu_r) sqrt(rho g sigma), with the
+// spacing of the fastest growing wave, 2 pi sqrt(sigma / (rho g)) (~1 cm). The grid does not
+// resolve them (the field is not solved, and on 1 cm cells they are below a cell), so they
+// are drawn: here their height per cell from the field, in composite.frag their shape.
+// The magnetisation is that of a flat surface facing the field (N = 1); the spikes grow
+// with how far its square passes Mc^2, to `spike_k` of their spacing.
+float spike_height(float B) {
+    if (OP.spike_gap <= 0.0 || P.mag.y <= 0.0) return 0.0;
+    float chi = P.mag.y, ce = chi / (1.0 + chi);
+    float m = ce * B / (1.0 + ce * B / max(P.mag.z, 1e-6));   // mu0 M, T
+    float over = m * m / max(OP.spike_mc * OP.spike_mc, 1e-12) - 1.0;
+    return over > 0.0 ? OP.spike_k * OP.spike_gap * (1.0 - exp(-over)) : 0.0;
+}
+
+// Where along the surface the spikes stand: a lattice at the spacing, counted as distance
+// round the magnet whose field is strongest here (radius x angle from its pole), so that it
+// is the same whichever way the field turns over a heap. (Along a fixed direction across
+// the field, the lattice turned with the field and crowded the spikes together.) As cos and
+// sin, which interpolate between cells; the seam behind the magnet is where no liquid can
+// face its pole. At a quarter of the rate (composite.frag multiplies it back): at a spacing of
+// three cells the phase turns 120 degrees a cell, and smoothed over 3 x 3 cells its cos and sin
+// averaged out to nothing.
+const float SPIKE_PHASE_DIV = 4.0;   // composite.frag: the same
+vec2 spike_phase(vec2 x) {
+    int best = 0;
+    float bb = -1.0;
+    for (int k = 0; k < int(P.mag.x); k++) {
+        vec4 mg = P.magnet[k];
+        float r = max(length(x - mg.xy), mg.z);
+        float b = mg.w * pow(mg.z / r, 3.0);
+        if (b > bb) { bb = b; best = k; }
+    }
+    vec2 d = x - P.magnet[best].xy;
+    vec2 m = P.magnet_dir[best].xy;
+    float ang = atan(m.x * d.y - m.y * d.x, dot(m, d));
+    float ph = 6.2831853 * length(d) * ang / (max(OP.spike_gap, 1e-3) * SPIKE_PHASE_DIV);
+    return vec2(cos(ph), sin(ph));
+}
 
 layout(std430, set = 0, binding = 57) readonly buffer OptBuf { Optics optics[]; };
 layout(set = 0, binding = 58, rgba16f) uniform writeonly image2DArray cellopt;
@@ -54,8 +108,6 @@ layout(set = 0, binding = 58, rgba16f) uniform writeonly image2DArray cellopt;
 // (bit 1) in the tile's cells; the caller clears it first.
 layout(std430, set = 0, binding = 74) buffer FilmTileBuf { uint ftile[]; };
 
-// How fast a diluent's own tint gives way to its concentrate's: exp(-DILUENT_FADE s).
-const float DILUENT_FADE = 24.0;
 
 // Occupancy of a cell (1 = rest), from its scattered weight.
 float occ_of(ivec2 q) {
@@ -109,6 +161,13 @@ void main() {
     int cw = acc[k + 4];
     vec4 o0 = vec4(0.0), o1 = vec4(0.0), o2 = vec4(0.0), o3 = vec4(0.0), o4 = vec4(0.0);
     vec4 o5 = vec4(0.0), o6 = vec4(0.0), o7 = vec4(0.0), o8 = vec4(0.0), o9 = vec4(0.0), o10 = vec4(0.0), o11 = vec4(0.0);
+    vec4 o12 = vec4(0.0), o13 = vec4(0.0), o14 = vec4(0.0), o15 = vec4(0.0);
+    if (OP.spike_gap > 0.0) {
+        vec2 B = magnet_field(vec2(c) + 0.5);
+        float b = length(B);
+        o13 = vec4(b > 1e-9 ? B / b * spike_height(b) : vec2(0.0), 0.0, OP.spike_gap);
+        o14.xy = spike_phase(vec2(c) + 0.5);
+    }
     if (cw > 0) {
         bool thermal = has_cap(CAP_THERMAL);
         float T = thermal ? therm[i].x : P.heat.x;
@@ -155,6 +214,8 @@ void main() {
         // look instead of tinting the cells around it.
         vec4 dense = vec4(0.0);
         float wden = 0.0, fden = 0.0;
+        // The magnetisable share.
+        float mag = 0.0;
         vec2 fz = vec2(0.0);
         vec3 em = vec3(0.0);
         float waq = 0.0, wot = 0.0, skin = 0.0;
@@ -180,6 +241,7 @@ void main() {
                 st = mix(d.sty, st, s);
                 ef = mix(d.fx, ef, s);
             }
+            mag += sh * mats[r].el.z;
             // Frozen share at its group's temperature (as grid_prep.comp has it).
             float Tm = Tg[ia.x];
             float fs = 0.0;
@@ -257,6 +319,7 @@ void main() {
         // water's blue is the look of a body of clear water, many times stronger than its
         // real absorption, and kept in proportion it turned a little syrup in it green, as a
         // blue and a yellow filter do (a tenth of syrup is already pale gold).
+        o15 = vec4(aq_plain.rgb, max(waq - c_aq, 0.0)) * occ;
         if (waq > 0.0) aq = aq_plain * exp(-DILUENT_FADE * c_aq / waq) + aq_conc;
         o0 = aq * occ;
         o1 = ot * occ;
@@ -290,6 +353,9 @@ void main() {
         // drying time, for the film map.
         o9 = vec4(0.0, 0.0, 0.0, skin) * occ;
         o10 = vec4(sty.z * occ, 0.0, 0.0, 0.0);
+        float wl = waq + wot;
+        o12 = wl > 0.0 ? vec4(look_key((aq + ot + dense) / wl), 1.0) * occ : vec4(0.0);
+        o14.z = P.mag.y > 0.0 ? mag / P.mag.y * occ : 0.0;
     }
     imageStore(cellopt, ivec3(c, 0), o0);
     imageStore(cellopt, ivec3(c, 1), o1);
@@ -303,4 +369,8 @@ void main() {
     imageStore(cellopt, ivec3(c, 9), o9);
     imageStore(cellopt, ivec3(c, 10), o10);
     imageStore(cellopt, ivec3(c, 11), o11);
+    imageStore(cellopt, ivec3(c, 12), o12);
+    imageStore(cellopt, ivec3(c, 13), o13);
+    imageStore(cellopt, ivec3(c, 14), o14);
+    imageStore(cellopt, ivec3(c, 15), o15);
 }

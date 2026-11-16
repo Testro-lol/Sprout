@@ -723,6 +723,44 @@ pub fn metals(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         pulled > predicted[0] && pulled < predicted[1] && still.abs() < 0.05 * predicted[0],
     );
 
+    // ---- a dish of ferrofluid with a magnet under it, and one hanging in it, comes to rest -------
+    // 1 cm cells, the Magnet tool's default magnet. The liquid heaps up over the first (or
+    // climbs round the second) and should then lie still: a force that is the gradient of an
+    // energy cannot keep it moving. The rms speed over the 2 s after the first 6 s.
+    let grid = [192, 108];
+    let mut settle = |gpu: &Arc<Gpu>, at: [f32; 2], degrees: f32| -> f32 {
+        let cup = |x: f32| (Shape::Box { c: [x, 20.0], half: [3.0, 18.0], angle: 0.0 }, None);
+        let ps = block(grid, [40.0, WALL, 152.0, WALL + 12.0], Material::Ferrofluid);
+        let mut w = build(gpu, grid, apply, vec![cup(36.0), cup(156.0)], ps, &|p: &mut SimParams| p.cell_size = 0.01);
+        w.add_magnet(crate::sim::Magnet::new(at, 6.0, degrees, crate::sim::MAGNET_STRENGTH_DEFAULT));
+        run(&mut w, 6.0);
+        let mut ms = 0.0f64;
+        for _ in 0..8 {
+            run(&mut w, 0.25);
+            let ps = w.sim.download_particles();
+            let live: Vec<&Particle> = ps.iter().filter(|p| p.kind & 255 != 0).collect();
+            ms += live.iter().map(|p| (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]) as f64).sum::<f64>() / live.len().max(1) as f64 / 8.0;
+        }
+        if degrees == 0.0 {
+            r.shot(&w, "ferrofluid_dish_magnet");
+        }
+        ms.sqrt() as f32
+    };
+    let under = settle(gpu, [96.0, WALL + 3.0], 0.0);
+    let inside = settle(gpu, [96.0, WALL + 22.0], 180.0);
+    r.check(
+        "ferrofluid dish over a magnet comes to rest, 1 cm cells",
+        format!("rms speed {under:.2} cells/s 6 - 8 s after the magnet was placed"),
+        "< 8 (before the 2026-11-15 fixes: 25; after: 3.6, a slow surface current over the heap)",
+        under < 8.0,
+    );
+    r.check(
+        "ferrofluid round a magnet held in it settles, 1 cm cells",
+        format!("rms speed {inside:.2} cells/s 6 - 8 s after the magnet was placed"),
+        "< 22 (before the 2026-11-15 fixes: 34; after: 15, at the neck where it meets the dish)",
+        inside < 22.0,
+    );
+
     // ---- gallium: the oxide skin holds a stretched shape; without it tension pulls it round -----
     let grid = [192, 108];
     let mut aspect = |gpu: &Arc<Gpu>, skin: bool| -> f32 {

@@ -45,6 +45,12 @@ layout(set = 0, binding = 9) uniform sampler2D smoke_map;
 // patterns restarted, two copies (xy, zw) for each of two periods; layer 2 pc.flow_layer +
 // 0 the short period, + 1 the long.
 layout(set = 0, binding = 11) uniform sampler2DArray flow_map;
+// The tint field (splat.vert, tint.frag): how the particles absorb and scatter, at half the
+// resolution of `accum` and laid out as it (the same uv): the (aqueous: concentrate part's)
+// absorption and the scattering; the aqueous concentrate share, the aqueous weight and the
+// others', times the kernel (optics.glsl: particle_absorb).
+layout(set = 0, binding = 12) uniform sampler2D tint_c;
+layout(set = 0, binding = 13) uniform sampler2D tint_s;
 
 layout(push_constant) uniform PC {
     vec2 cam;         // world position at the centre of the view, cells
@@ -67,6 +73,7 @@ layout(push_constant) uniform PC {
     float vapour;     // 1 when the tank has steam (the vapour field is drawn), else 0
     float film_layer; // the copy of the film map that holds it now (0 or 1)
     float flow_layer; // the copy of the flow map that holds it now (0 or 1)
+    float tint;       // 1 when the tint field is drawn (two aqueous liquids or more), else 0
 } pc;
 
 layout(location = 0) out vec4 f_color;
@@ -75,7 +82,8 @@ layout(location = 0) out vec4 f_color;
 layout(constant_id = 0) const uint HAS_VAPOUR = 1u;
 // What else the tank can show (render.rs: `Features`): bit 0 the carried patterns (lava's
 // crackle, oil's iridescence, the sparkle of a liquid that glints above 0.5, as honey),
-// bit 1 stains (the film map). A variant
+// bit 1 stains (the film map), bit 2 ferrofluid spikes (a magnet and a magnetisable
+// liquid; cell optics layer 13). A variant
 // without one compiles its code out: the code alone cost about 0.1 ms a 1600 x 900 frame
 // where it never ran. Leaving a bit out is exact where no liquid in the tank has the effect:
 // its weight is then zero in every cell, and the film map is empty until a staining liquid
@@ -83,6 +91,7 @@ layout(constant_id = 0) const uint HAS_VAPOUR = 1u;
 layout(constant_id = 1) const uint FX = 3u;
 const bool FX_PATTERNS = (FX & 1u) != 0u;
 const bool FX_FILM = (FX & 2u) != 0u;
+const bool FX_SPIKES = (FX & 4u) != 0u;
 
 // Light comes from the upper left; world space, +y up.
 const vec2 LIGHT = vec2(-0.45, 0.893);
@@ -180,6 +189,80 @@ CellOptics cell_optics(vec2 x) {
                       textureLod(cellopt, vec3(uv, 8.0), 0.0), textureLod(cellopt, vec3(uv, 9.0), 0.0),
                       textureLod(cellopt, vec3(uv, 11.0), 0.0),
                       vec2(textureLod(cellopt, vec3(uv, 5.0), 0.0).a, textureLod(cellopt, vec3(uv, 6.0), 0.0).a));
+}
+CellOptics mix_optics(CellOptics a, CellOptics b, float t) {
+    return CellOptics(mix(a.aq, b.aq, t), mix(a.ot, b.ot, t), mix(a.opt, b.opt, t), mix(a.em, b.em, t),
+                      mix(a.sty, b.sty, t), mix(a.fz, b.fz, t), mix(a.fx, b.fx, t), mix(a.l9, b.l9, t),
+                      mix(a.ds, b.ds, t), mix(a.dn, b.dn, t));
+}
+
+// The tint field read with a cubic B-spline (four bilinear taps) instead of bilinearly: its
+// texels are 2 - 4 pixels, its kernels only one and a half texels wide when zoomed out, and
+// the sharp cut on the share below (own_aq, own_ot) followed bilinear's texel grid: blood in
+// honey had an edge in pixel steps until zoomed in.
+vec4 tint_read(sampler2D t, vec2 uv) {
+    vec2 ts = vec2(textureSize(t, 0));
+    vec2 p = uv * ts - 0.5;
+    vec2 i = floor(p), f = p - i;
+    vec2 f2 = f * f, f3 = f2 * f;
+    vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    vec2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    vec2 w3 = f3 / 6.0;
+    vec2 g0 = w0 + w1, g1 = w2 + w3;
+    vec2 h0 = (i - 0.5 + w1 / g0) / ts, h1 = (i + 1.5 + w3 / g1) / ts;
+    return g0.y * (g0.x * textureLod(t, h0, 0.0) + g1.x * textureLod(t, vec2(h1.x, h0.y), 0.0))
+         + g1.y * (g0.x * textureLod(t, vec2(h0.x, h1.y), 0.0) + g1.x * textureLod(t, h1, 0.0));
+}
+
+// ---- which liquid where: the look key (README, "Look") ------------------------------------
+// The cell optics hold a cell's liquids blended, smoothed over 3 x 3 cells: a strand of blood
+// in water or honey, ferrofluid in oil or glass in lava (one phase group, so the sharp field
+// sees one liquid) was drawn in the cells' shapes, a cell or two wider than the particles,
+// in lumps and blocks. Each particle also lays down the key of its liquid (splat.vert), at
+// the particles' resolution. Where the key under a pixel differs from the cells' there, the
+// optics are read a little way off instead: along the direction in which the cells' key
+// moves towards the particles', at the point of that path whose key comes closest to it
+// (up to SEEK cells away). Inside a blob of blood the read moves inwards to where the cells
+// hold blood, in the water beside it outwards to clear water; the edge between them is the
+// particles'. The colours are still the cells' own, smoothed: only where they apply follows
+// the particles. (Reading the cells before smoothing, weighted towards those whose key
+// matched, drew their cell-to-cell noise as dark blocks along every edge.)
+const float KEY_LO = 0.03, KEY_HI = 0.10;   // key mismatch over which the moved read takes over
+const float SEEK = 1.6;                     // cells: farthest the read moves
+// The particles' colour gives way to the cells' as the other side's absorption, taken out of
+// it with the cells' coefficients, goes from the first to the second fraction of its own.
+const vec2 TINT_TRUST = vec2(0.1, 0.4);
+
+vec3 key_cell(vec2 x) {
+    vec4 k = textureLod(cellopt, vec3(x / vec2(pc.grid), 12.0), 0.0);
+    return k.rgb / max(k.a, 1e-4);
+}
+
+// Where to read the cell optics for particles of key `ks` at x, whose cells' key is `k0`.
+vec2 seek_key(vec2 x, vec3 ks, vec3 k0) {
+    // The direction in which the cells' key moves towards ks (each channel's gradient,
+    // weighted by how far it has to go).
+    vec3 dx = key_cell(x + vec2(0.5, 0.0)) - key_cell(x - vec2(0.5, 0.0));
+    vec3 dy = key_cell(x + vec2(0.0, 0.5)) - key_cell(x - vec2(0.0, 0.5));
+    vec3 want = ks - k0;
+    vec2 dir = vec2(dot(dx, want), dot(dy, want));
+    float dl = length(dir);
+    if (dl < 1e-6) return x;
+    dir /= dl;
+    // Along x -> x + dir SEEK, the point whose key is closest to ks (the path through two
+    // samples, projected segment by segment).
+    vec3 k1 = key_cell(x + dir * (0.5 * SEEK)), k2 = key_cell(x + dir * SEEK);
+    float best = 1e9, at = 0.0;
+    vec3 ka[3] = vec3[3](k0, k1, k2);
+    for (int j = 0; j < 2; j++) {
+        vec3 seg = ka[j + 1] - ka[j];
+        float tau = clamp(dot(ks - ka[j], seg) / max(dot(seg, seg), 1e-8), 0.0, 1.0);
+        vec3 r = ka[j] + tau * seg - ks;
+        float dd = dot(r, r);
+        if (dd < best - 1e-6) { best = dd; at = (float(j) + tau) * 0.5 * SEEK; }
+    }
+    return x + dir * at;
 }
 
 // The colour of liquid of coefficients `k` (absorption rgb, scattering; per cell), linear RGB,
@@ -591,6 +674,115 @@ vec3 backdrop(vec2 x, vec2 p, float zoom, vec3 glow, bool grain) {
     return col;
 }
 
+// ---- ferrofluid spikes (README, "Magnetism") ---------------------------------------------
+// Where a magnet's field passes the Rosensweig threshold at the surface of a magnetisable
+// liquid, the surface stands up in a row of spikes along the field (cell_optics.comp works
+// out their height per cell from the field, layer 13). They are drawn into the sharp field:
+// from a pixel, the surface below it along the field is found (marching towards the liquid),
+// and the spike there is a cone with slightly hollow flanks, centred on a lattice across the
+// field (fixed to the field, as real spikes stand over a magnet while the liquid moves under
+// them). The spike adds liquid of the base's own phase groups where it reaches past the
+// field, so the rest of the shading draws it as that liquid.
+const int SPIKE_STEPS = 6;
+const float SPIKE_SHARP = 1.6;   // flank exponent (1: straight cones)
+const float SPIKE_G = 2.0;       // sharp-field weight per cell inside a spike's outline
+const float SPIKE_PHASE_DIV = 4.0;   // cell_optics.comp: the lattice's phase is stored at this fraction
+
+vec2 px_of(vec2 x) { return pc.half_res + (x - pc.cam) / pc.inv_zoom * vec2(1.0, -1.0); }
+float wide_total(vec2 x) { return total(textureLod(wide, min(px_of(x) * pc.wide_scale, pc.wide_max), 0.0)); }
+
+struct Spike { bool on; vec2 x0, ax, tg; float s0, gap, hs, ph; vec4 comp; vec2 inside; };
+
+Spike find_spike(vec2 world, float W, float zoom) {
+    Spike sp = Spike(false, world, vec2(0.0), vec2(0.0), 0.0, 1.0, 0.0, 0.0, vec4(0.0), world);
+    if (W >= BODY_CUT) return sp;
+    vec4 m = textureLod(cellopt, vec3(world / vec2(pc.grid), 13.0), 0.0);
+    float gap = m.w;
+    // (Spikes narrower than a few pixels would shimmer: faded out.)
+    float fade = smoothstep(4.0, 8.0, gap * zoom);
+    if (gap <= 0.0 || fade <= 0.0 || length(m.xy) < 1e-6) return sp;
+    vec2 bh = m.xy / length(m.xy);
+    // How tall a spike can be (cell_optics.comp: spike_k x the spacing); only where some
+    // magnetisable liquid lies within that along the field.
+    float reach = 0.9 * gap;
+    vec2 g = pc.grid;
+    if (max(textureLod(cellopt, vec3(world / g, 14.0), 0.0).z, max(textureLod(cellopt, vec3((world - bh * 0.6 * reach) / g, 14.0), 0.0).z,
+                     textureLod(cellopt, vec3((world + bh * 0.6 * reach) / g, 14.0), 0.0).z)) < 0.01) return sp;
+    float step = reach / float(SPIKE_STEPS);
+    bool found = false;
+    vec2 dir = vec2(0.0);
+    float s0 = 0.0;
+    for (int side = 0; side < 2 && !found; side++) {
+        dir = side == 0 ? -bh : bh;   // towards the liquid
+        float prev = W;
+        for (int k = 1; k <= SPIKE_STEPS; k++) {
+            float wk = total(field(px_of(world + dir * (step * float(k)))));
+            if (wk >= BODY_CUT) {
+                // Narrowed by bisection, then between the last two (a step's linear guess
+                // drew terraces down the flanks).
+                float lo = step * float(k - 1), hi = step * float(k);
+                for (int it = 0; it < 3; it++) {
+                    float mid = 0.5 * (lo + hi);
+                    float wm = total(field(px_of(world + dir * mid)));
+                    if (wm >= BODY_CUT) { hi = mid; wk = wm; } else { lo = mid; prev = wm; }
+                }
+                s0 = mix(lo, hi, clamp((BODY_CUT - prev) / max(wk - prev, 1e-4), 0.0, 1.0));
+                found = true;
+                break;
+            }
+            prev = wk;
+        }
+    }
+    if (!found) return sp;
+    vec2 base = world + dir * s0;
+    vec2 xb = base + dir * 0.8;
+    // The height is the field's at the base (it falls off towards the tips) ...
+    vec2 ub = xb / vec2(pc.grid);
+    vec4 mb = textureLod(cellopt, vec3(ub, 13.0), 0.0);
+    float hs = min(length(mb.xy), reach) * fade;
+    // ... only from a magnetisable liquid ...
+    vec4 mp = textureLod(cellopt, vec3(ub, 14.0), 0.0);
+    float share = mp.z / max(textureLod(cellopt, vec3(ub, 4.0), 0.0).w, 1e-3);
+    // ... whose surface faces the field (from the wide field: along it, the field holds a
+    // surface flat).
+    vec2 tg = vec2(-dir.y, dir.x);
+    float along = wide_total(base + dir * 1.5) - wide_total(base - dir * 1.5);
+    float across = wide_total(base + tg * 1.5) - wide_total(base - tg * 1.5);
+    float facing = along / max(length(vec2(along, across)), 1e-4);
+    hs *= smoothstep(0.3, 0.7, share) * smoothstep(0.45, 0.85, facing);
+    if (hs < 0.2) return sp;
+    vec4 ab = field(px_of(xb));
+    // The lattice's phase at the base, and which way along tg it grows.
+    float ph = SPIKE_PHASE_DIV * atan(mp.y, mp.x) / 6.2831853;
+    vec2 q = textureLod(cellopt, vec3((xb + tg) / g, 14.0), 0.0).xy;
+    float dph = atan(mp.x * q.y - mp.y * q.x, dot(mp.xy, q));
+    sp.on = true;
+    sp.ax = -dir;
+    sp.tg = dph < 0.0 ? -tg : tg;
+    sp.ph = ph;
+    sp.s0 = s0;
+    sp.gap = gap;
+    sp.hs = hs;
+    sp.comp = ab / max(total(ab), 1e-4);
+    sp.inside = xb;
+    return sp;
+}
+
+// The sharp field's weight of the spike at `dp` (cells) from the pixel: `cut` at its outline,
+// rising SPIKE_G a cell inwards; 0 below its base (the liquid itself).
+float spike_weight(Spike sp, vec2 dp, float cut) {
+    float s = sp.s0 + dot(dp, sp.ax);
+    if (s < -0.5) return 0.0;
+    float v = sp.ph + dot(dp, sp.tg) / sp.gap;
+    float u = abs(fract(v + 0.5) * 2.0 - 1.0);
+    float h = sp.hs * pow(1.0 - u, SPIKE_SHARP);
+    float slope = sp.hs * SPIKE_SHARP * pow(max(1.0 - u, 1e-4), SPIKE_SHARP - 1.0) * 2.0 / sp.gap;
+    return max(cut + SPIKE_G * (h - s) / sqrt(1.0 + slope * slope), 0.0);
+}
+vec4 with_spike(vec4 f, Spike sp, vec2 dp, float cut) {
+    return f + sp.comp * max(spike_weight(sp, dp, cut) - total(f), 0.0);
+}
+
 void main() {
     vec2 px = gl_FragCoord.xy;
     float zoom = 1.0 / pc.inv_zoom;
@@ -611,10 +803,6 @@ void main() {
     vec4 vap = (HAS_VAPOUR != 0u && pc.vapour > 0.0) ? vapour(px) : vec4(0.0);
     vec4 ax0 = field(px - vec2(e, 0.0)), ax1 = field(px + vec2(e, 0.0));
     vec4 ay0 = field(px + vec2(0.0, e)), ay1 = field(px - vec2(0.0, e));
-    float W = total(a);
-    // Gradients per cell, +y up.
-    float ge = 0.5 * zoom / e;
-    vec2 gW = vec2(total(ax1) - total(ax0), total(ay1) - total(ay0)) * ge;
 
     vec2 wuv = min(px * pc.wide_scale, pc.wide_max);
     vec4 b = textureLod(wide, wuv, 0.0);
@@ -625,6 +813,37 @@ void main() {
     float sd = sample_sdf(world);
     float open = 0.5 + 0.5 * tanh(1.2 * max(sd, -0.5) / (WIDE_SIGMA * 1.4142));
     float T = Wb / (pc.rest * open);
+    // The surface's cut (below) is taken from how much liquid is around before the spikes,
+    // which the wide field does not hold.
+    float Tc = T;
+    // Where the cell optics are read: here, or for a spike the liquid at its base.
+    vec2 xo = world;
+    bool spiked = false;
+    if (FX_SPIKES) {
+        Spike sp = find_spike(world, total(a), zoom);
+        if (sp.on) {
+            // (The cut a liquid without body takes, as below with `thick` 0.)
+            float cut = mix(pc.threshold, BODY_CUT, smoothstep(0.12, 0.38, Tc)) * (1.0 - 0.75 * smoothstep(0.62, 0.86, Tc));
+            float W0 = total(a);
+            float c = e * pc.inv_zoom;
+            a = with_spike(a, sp, vec2(0.0), cut);
+            ax0 = with_spike(ax0, sp, vec2(-c, 0.0), cut);
+            ax1 = with_spike(ax1, sp, vec2(c, 0.0), cut);
+            ay0 = with_spike(ay0, sp, vec2(0.0, -c), cut);
+            ay1 = with_spike(ay1, sp, vec2(0.0, c), cut);
+            // A spike shades as the surface of its liquid, not as spray.
+            float sw = smoothstep(0.0, 0.5, total(a) - W0);
+            if (sw > 0.0) {
+                xo = sp.inside;
+                spiked = true;
+                T = mix(T, max(T, 0.45), sw);
+            }
+        }
+    }
+    float W = total(a);
+    // Gradients per cell, +y up.
+    float ge = 0.5 * zoom / e;
+    vec2 gW = vec2(total(ax1) - total(ax0), total(ay1) - total(ay0)) * ge;
 
     // Aqueous liquids against the others (oil-like, metal, melt): the share of the others.
     float oil = (a.y + a.z + a.w) / max(W, 1e-4);
@@ -645,7 +864,52 @@ void main() {
     // into the aqueous liquids and the others. (Empty air with no liquid nearby needs none of
     // it: most of the screen.)
     bool near = W > 1e-4 || T > 0.003;
-    CellOptics co = near ? cell_optics(world) : CellOptics(vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec2(0.0));
+    CellOptics co = near ? cell_optics(xo) : CellOptics(vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), vec2(0.0));
+    // The liquids' colour from their particles (splat.vert), each side's (aqueous, others)
+    // where it has the pixel nearly to itself, and the rest of the look from the cells that
+    // match (above). (Not in a spike: no particles there.)
+    vec4 kaq_px = vec4(0.0), kot_px = vec4(0.0);
+    float own_aq = 0.0, own_ot = 0.0;
+    bool from_px = pc.tint > 0.0 && near && W > 0.05 && !spiked;
+    if (from_px) {
+        vec2 auv = min(px * pc.accum_scale, pc.accum_max);
+        vec3 sw = tint_read(tint_s, auv).xyz;
+        vec4 tc = tint_read(tint_c, auv);
+        float tw = sw.y + sw.z;
+        own_aq = smoothstep(0.95, 0.995, sw.y / max(tw, 1e-4)) * smoothstep(0.02, 0.1, sw.y);
+        own_ot = smoothstep(0.95, 0.995, sw.z / max(tw, 1e-4)) * smoothstep(0.02, 0.1, sw.z);
+        // (What the few percent of the other side lay down is taken out with its coefficients
+        // from the cells: a liquid that absorbs as strongly as chocolate still drew a brown
+        // line round every speck where its share passed through the cut.)
+        // Those coefficients are the cells' blend of that side, not those of the particles
+        // here: ferrofluid stirred into a pool that also holds oil was taken out as mostly
+        // oil (a black ring round each speck) or the reverse (a clear one). Where what is
+        // taken out is more than a fraction of what stays, the cells' colour is kept
+        // (TINT_TRUST).
+        vec4 kc_ot = (co.ot + co.ds) / max(co.sty.w - co.sty.z, 1e-4);
+        vec4 kc_aq = co.aq / max(co.sty.z, 1e-4);
+        float k_ot = sw.z * dot(kc_ot.rgb, vec3(1.0)), k_aq = sw.y * dot(kc_aq.rgb, vec3(1.0));
+        own_aq *= 1.0 - smoothstep(TINT_TRUST.x, TINT_TRUST.y, k_ot / max(k_aq, 1e-4));
+        own_ot *= 1.0 - smoothstep(TINT_TRUST.x, TINT_TRUST.y, k_aq / max(k_ot, 1e-4));
+        if (own_aq > 0.0) {
+            vec4 pl = textureLod(cellopt, vec3(xo / vec2(pc.grid), 15.0), 0.0);
+            kaq_px = particle_absorb(max(tc - sw.z * kc_ot, 0.0), sw.xy, pl.rgb / max(pl.a, 1e-4));
+        }
+        if (own_ot > 0.0) kot_px = max(tc - sw.y * kc_aq, 0.0) / max(sw.z, 1e-4);
+        from_px = own_aq + own_ot > 0.0;
+    }
+    if (near && W > 0.05 && !spiked) {
+        vec4 kc = textureLod(cellopt, vec3(xo / vec2(pc.grid), 12.0), 0.0);
+        if (kc.a > 1e-3) {
+            // (The particles' key where they are aqueous; elsewhere the cells' smoothed key, a
+            // little way along their gradient, stands in: the read then moves only where the
+            // cells change.)
+            vec3 k0 = kc.rgb / kc.a;
+            vec3 ks = own_aq > 0.5 ? look_key(kaq_px) : own_ot > 0.5 ? look_key(kot_px) : k0;
+            float guide = smoothstep(KEY_LO, KEY_HI, length(k0 - ks));
+            if (guide > 0.0) co = mix_optics(co, cell_optics(seek_key(xo, ks, k0)), guide);
+        }
+    }
     // A pocket of steam is part of the body (splat.vert), but the cell optics hold only the
     // liquid: where the cells here are mostly vapour, the look is taken from the liquid
     // around them (rings of eight points three and seven cells out), in whatever liquid it
@@ -667,6 +931,12 @@ void main() {
     // Coefficients of the aqueous liquids here, and their colour as a few cells of it in full
     // light (for rims, droplets and the wet tint).
     vec4 kaq = co.aq / max(sty.z, 1e-4);
+    // The colour is the particles' own where one side (aqueous or not) fills the pixel: a
+    // trail of a few particles of blood in honey is a trail of red drops. From the cells, which
+    // count those few as spread through each cell they pass and then smooth over 3 x 3, a
+    // liquid that absorbs as strongly as blood coloured a band two or three cells wide in
+    // their shapes (README, "Look").
+    kaq = mix(kaq, kaq_px, own_aq);
     vec3 base = near ? to_srgb(liquid_lin(kaq, light_in(kaq, 1.5), 3.0, LV_BODY, 1.0, vec3(0.0))) : vec3(0.0);
     if (near) base = iced(base, world, 5.0, co.fz.x, co.fz.x / max(sty.z, 1e-4), zoom);
     // Whether any of the other liquids is within reach of the blur. Where none is, every use
@@ -687,6 +957,7 @@ void main() {
     float wd_sharp = (a.z + a.w) / max(a.y + a.z + a.w, 1e-4);
     float wd = oil_o < 1e-3 ? 1.0 : den_o < 1e-3 ? 0.0 : wd_sharp;
     vec4 kot = mix(oo.ot / max(oil_o, 1e-4), oo.ds / max(den_o, 1e-4), wd);
+    kot = mix(kot, kot_px, own_ot * (1.0 - mixed_ot));
     float fz_ot = mix((oo.fz.y - oo.dn.y) / max(oil_o, 1e-4), oo.dn.y / max(den_o, 1e-4), wd);
     vec3 ob = others ? to_srgb(liquid_lin(kot, light_in(kot, 1.5), 3.0, LV_BODY, 1.0, vec3(0.0))) : vec3(0.0);
     if (others) ob = iced(ob, owld, 6.0, oo.fz.y, fz_ot, zoom);
@@ -716,8 +987,8 @@ void main() {
         // smooth instead of following each particle of the outermost layer.
         // Well inside, the cut drops again: only a real cavity opens a hole, not a spot where
         // the particles happen to sit a little apart (as they do where two liquids meet).
-        float t = mix(pc.threshold, mix(BODY_CUT, BODY_CUT_THICK, thick), smoothstep(0.12, 0.38, T));
-        t *= 1.0 - 0.75 * smoothstep(0.62, 0.86, T);
+        float t = mix(pc.threshold, mix(BODY_CUT, BODY_CUT_THICK, thick), smoothstep(0.12, 0.38, Tc));
+        t *= 1.0 - 0.75 * smoothstep(0.62, 0.86, Tc);
         float gn = length(gW) + 1e-5;
         float d = (W - t) / gn;                          // cells inside the surface
         vec2 n = -gW / gn;                               // out of the liquid

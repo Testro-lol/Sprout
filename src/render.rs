@@ -111,6 +111,7 @@ struct SplatPc {
     weight: f32,
     exposure: f32,
     inv_speed: f32,
+    tint: f32,
 }
 
 #[repr(C)]
@@ -167,6 +168,7 @@ struct CompositePc {
     vapour: f32,
     film_layer: f32,
     flow_layer: f32,
+    tint: f32,
 }
 
 #[repr(C)]
@@ -215,6 +217,9 @@ impl WideLayout {
 struct Targets {
     extent: [u32; 2],
     accum: Arc<Framebuffer>,
+    /// The tint field (tint.frag), `TINT_DIV` times coarser than `accum`.
+    tint: Arc<Framebuffer>,
+    tint_extent: [u32; 2],
     /// The two wide images: the downsampled copy and the first blur direction land in
     /// `wide[0]` and `wide[1]`, the finished field back in `wide[0]`.
     wide: [Arc<Framebuffer>; 2],
@@ -256,13 +261,16 @@ pub struct Renderer {
     /// Display settings, read each frame.
     pub look: Look,
     gpu: Arc<Gpu>,
-    /// A single-target pass: the splat and the wide field.
+    /// A single-target pass: the vapour field and the wide field.
     field_pass: Arc<RenderPass>,
+    /// The tint field's pass (splat.vert, tint.frag).
+    tint_pass: Arc<RenderPass>,
     wet_pass: Arc<RenderPass>,
     final_pass: Arc<RenderPass>,
     wet_pipeline: Arc<GraphicsPipeline>,
     wet: Option<Wet>,
     splat: Arc<GraphicsPipeline>,
+    tint: Arc<GraphicsPipeline>,
     down: Arc<GraphicsPipeline>,
     blur: Arc<GraphicsPipeline>,
     /// The composite shader, specialised for what the tank can show (`variant`): steam,
@@ -282,6 +290,12 @@ pub struct Renderer {
 }
 
 const ACCUM_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+/// The tint field (tint.frag): the concentrate share, the aqueous and the other weight.
+const TINT_SHARE_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+/// The tint field is this many times coarser than the accumulation target. Its colour varies
+/// over a particle's kernel, not a pixel; drawn into three targets at full resolution, the
+/// splat cost five times as much (1.0 against 0.2 ms a 1080p frame).
+const TINT_DIV: u32 = 2;
 /// The splat target (RGBA16F), the sharp field all surfaces and interfaces are drawn from:
 /// the weight of phase groups 0, 1, 2, 3 (aqueous, oil-like, liquid metal, silicate melt),
 /// times the kernel. What the liquid looks like comes from the grid, per cell
@@ -343,7 +357,7 @@ fn pipeline_with(
 }
 
 /// Variants of the composite shader: with or without steam, times `Features`.
-const COMPOSITE_VARIANTS: u32 = 8;
+const COMPOSITE_VARIANTS: u32 = 16;
 
 /// What the liquids of a tank can show beyond the basics (composite.frag `FX`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -352,19 +366,21 @@ struct Features {
     patterns: bool,
     /// Stains: a staining liquid has been in the tank (the film map may hold some).
     film: bool,
+    /// Ferrofluid spikes: a magnet and a magnetisable liquid.
+    spikes: bool,
 }
 
 impl Features {
     fn of(sim: &FluidSim) -> Features {
-        let (patterns, film) = sim.render_features();
-        Features { patterns, film }
+        let (patterns, film, spikes) = sim.render_features();
+        Features { patterns, film, spikes }
     }
 }
 
-/// Index into `Renderer::composite`: bit 0 steam, bit 1 patterns, bit 2 stains (composite.frag:
-/// HAS_VAPOUR, FX).
+/// Index into `Renderer::composite`: bit 0 steam, bit 1 patterns, bit 2 stains, bit 3 spikes
+/// (composite.frag: HAS_VAPOUR, FX).
 fn variant(steam: bool, f: Features) -> usize {
-    steam as usize | (f.patterns as usize) << 1 | (f.film as usize) << 2
+    steam as usize | (f.patterns as usize) << 1 | (f.film as usize) << 2 | (f.spikes as usize) << 3
 }
 
 fn viewport(size: [u32; 2]) -> Viewport {
@@ -377,6 +393,14 @@ impl Renderer {
         let field_pass = vulkano::single_pass_renderpass!(device.clone(),
             attachments: { color: { format: ACCUM_FORMAT, samples: 1, load_op: Clear, store_op: Store } },
             pass: { color: [color], depth_stencil: {} }
+        )
+        .unwrap();
+        let tint_pass = vulkano::single_pass_renderpass!(device.clone(),
+            attachments: {
+                conc: { format: ACCUM_FORMAT, samples: 1, load_op: Clear, store_op: Store },
+                share: { format: TINT_SHARE_FORMAT, samples: 1, load_op: Clear, store_op: Store },
+            },
+            pass: { color: [conc, share], depth_stencil: {} }
         )
         .unwrap();
         // The wet map keeps its contents between frames.
@@ -401,6 +425,15 @@ impl Renderer {
         };
         let accum_subpass = || Subpass::from(field_pass.clone(), 0).unwrap();
         let splat = pipeline(&gpu, spirv!("splat.vert"), spirv!("splat.frag"), Subpass::from(field_pass.clone(), 0).unwrap(), Some(additive.clone()));
+        // The tint field shares the splat's layout (and so its descriptor set).
+        let tint = pipeline_with(
+            &gpu,
+            spirv!("splat.vert"),
+            gpu.shader(spirv!("tint.frag")),
+            Subpass::from(tint_pass.clone(), 0).unwrap(),
+            Some(additive.clone()),
+            Some(splat.layout().clone()),
+        );
         let wet_pipeline =
             pipeline(&gpu, spirv!("composite.vert"), spirv!("wet.frag"), Subpass::from(wet_pass.clone(), 0).unwrap(), None);
         let down = pipeline(&gpu, spirv!("composite.vert"), spirv!("down.frag"), accum_subpass(), None);
@@ -455,6 +488,8 @@ impl Renderer {
             look: Look::default(),
             gpu,
             field_pass,
+            tint_pass,
+            tint,
             wet_pass,
             final_pass,
             wet_pipeline,
@@ -612,6 +647,32 @@ impl Renderer {
         }
         let wet_view = self.wet.as_ref().expect("the wet map comes first").view.clone();
         let (accum_view, accum) = self.field_target(extent);
+        // The tint field, at half the accumulation target's resolution: its images are half
+        // the size, so the same uv reads both.
+        let tint_extent = [extent[0].div_ceil(TINT_DIV), extent[1].div_ceil(TINT_DIV)];
+        let image = |format: Format| {
+            ImageView::new_default(
+                Image::new(
+                    self.gpu.memory.clone(),
+                    ImageCreateInfo {
+                        image_type: ImageType::Dim2d,
+                        format,
+                        extent: [tint_extent[0], tint_extent[1], 1],
+                        usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let (conc_view, share_view) = (image(ACCUM_FORMAT), image(TINT_SHARE_FORMAT));
+        let tint = Framebuffer::new(
+            self.tint_pass.clone(),
+            FramebufferCreateInfo { attachments: vec![conc_view.clone(), share_view.clone()], ..Default::default() },
+        )
+        .unwrap();
         let (vapour_view, vapour) = self.field_target(extent);
 
         let wide_extent = [
@@ -645,6 +706,8 @@ impl Renderer {
                 WriteDescriptorSet::buffer(8, sim.optics_buffer().clone()),
                 WriteDescriptorSet::image_view_sampler(9, sim.smoke_view().clone(), self.sampler.clone()),
                 WriteDescriptorSet::image_view_sampler(11, sim.flow_view().0.clone(), self.sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(12, conc_view, self.sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(13, share_view, self.sampler.clone()),
             ],
             [],
         )
@@ -652,6 +715,8 @@ impl Renderer {
         self.accum = Some(Targets {
             extent,
             accum,
+            tint,
+            tint_extent,
             wide: [wide0, wide1],
             wide_extent,
             down_set: sampled(&self.down, &accum_view),
@@ -684,6 +749,7 @@ impl Renderer {
                     [
                         WriteDescriptorSet::buffer(0, sim.particle_buffer().clone()),
                         WriteDescriptorSet::buffer(1, sim.material_buffer().clone()),
+                        WriteDescriptorSet::buffer(2, sim.optics_buffer().clone()),
                     ],
                     [],
                 )
@@ -751,11 +817,50 @@ impl Renderer {
                             weight,
                             exposure: EXPOSURE,
                             inv_speed: 1.0 / fast_speed(sim),
+                            tint: 0.0,
                         },
                     )
                     .unwrap();
                 // SAFETY: the vertex shader indexes the particle buffer with gl_VertexIndex / 3,
                 // which stays below the slot count.
+                unsafe { b.draw(sim.slots() * 3, 1, 0, 0) }.unwrap();
+            }
+            b.end_render_pass(SubpassEndInfo::default()).unwrap();
+        }
+        // Pass 1a: the tint field, the same particles into the top-left texels of its images
+        // that cover what the accumulation target's do (the same uv), its kernel at least
+        // SPLAT_MIN_TEXELS of its own texels. Only where it can show something: a tank with
+        // one liquid of each phase group has no colour within one to tell apart.
+        let tint_live = sim.slots() > 0 && sim.shares_a_group();
+        if tint_live {
+            let dt = div * TINT_DIV as f32;
+            let size = [accum_size[0].div_ceil(TINT_DIV).clamp(1, t.tint_extent[0]), accum_size[1].div_ceil(TINT_DIV).clamp(1, t.tint_extent[1])];
+            let padded = [size[0] as f32 * dt * 0.5, size[1] as f32 * dt * 0.5];
+            let scale = [view.zoom / padded[0], -view.zoom / padded[1]];
+            let r = SPLAT_RADIUS.max(SPLAT_MIN_TEXELS * dt / view.zoom);
+            b.begin_render_pass(clear(&t.tint), inline()).unwrap();
+            {
+                b.bind_pipeline_graphics(self.tint.clone())
+                    .unwrap()
+                    .set_viewport(0, [viewport(size)].into_iter().collect())
+                    .unwrap()
+                    .bind_descriptor_sets(PipelineBindPoint::Graphics, self.tint.layout().clone(), 0, self.splat_set.clone().unwrap())
+                    .unwrap()
+                    .push_constants(
+                        self.tint.layout().clone(),
+                        0,
+                        SplatPc {
+                            scale,
+                            offset: [-view.center[0] * scale[0] + half[0] / padded[0] - 1.0, -view.center[1] * scale[1] + half[1] / padded[1] - 1.0],
+                            radius: r,
+                            weight: (SPLAT_RADIUS / r).powi(2),
+                            exposure: EXPOSURE,
+                            inv_speed: 1.0 / fast_speed(sim),
+                            tint: 1.0,
+                        },
+                    )
+                    .unwrap();
+                // SAFETY: as the splat.
                 unsafe { b.draw(sim.slots() * 3, 1, 0, 0) }.unwrap();
             }
             b.end_render_pass(SubpassEndInfo::default()).unwrap();
@@ -846,7 +951,7 @@ impl Renderer {
             inline(),
         )
         .unwrap();
-        let fx = if self.full_composite { Features { patterns: true, film: true } } else { Features::of(sim) };
+        let fx = if self.full_composite { Features { patterns: true, film: true, spikes: true } } else { Features::of(sim) };
         let composite = self.composite[variant(steam, fx)].clone();
         b.bind_pipeline_graphics(composite.clone())
             .unwrap()
@@ -885,6 +990,7 @@ impl Renderer {
                     vapour: if steam { 1.0 } else { 0.0 },
                     film_layer: sim.film_views().2 as f32,
                     flow_layer: sim.flow_view().1 as f32,
+                    tint: if tint_live { 1.0 } else { 0.0 },
                 },
             )
             .unwrap();
