@@ -15,6 +15,11 @@ pub enum Shape {
     /// Right-triangle wedge inscribed in the box `half`, rotated by `angle`. The slope
     /// descends to the right, or to the left when `flip` is set.
     Ramp { c: [f32; 2], half: [f32; 2], angle: f32, flip: bool },
+    /// A wall from `a` to `b` with round ends, `r` thick on each side of the line.
+    Capsule { a: [f32; 2], b: [f32; 2], r: f32 },
+    /// A bowl: the lower half of a ring of mean radius `r`, `t` thick on each side of it,
+    /// open upwards and turned by `angle` radians.
+    Bowl { c: [f32; 2], r: f32, t: f32, angle: f32 },
 }
 
 fn rotate(p: [f32; 2], angle: f32) -> [f32; 2] {
@@ -24,7 +29,7 @@ fn rotate(p: [f32; 2], angle: f32) -> [f32; 2] {
 
 fn sd_segment2(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     let (pa, ba) = ([p[0] - a[0], p[1] - a[1]], [b[0] - a[0], b[1] - a[1]]);
-    let h = ((pa[0] * ba[0] + pa[1] * ba[1]) / (ba[0] * ba[0] + ba[1] * ba[1])).clamp(0.0, 1.0);
+    let h = ((pa[0] * ba[0] + pa[1] * ba[1]) / (ba[0] * ba[0] + ba[1] * ba[1]).max(1e-12)).clamp(0.0, 1.0);
     let d = [pa[0] - ba[0] * h, pa[1] - ba[1] * h];
     d[0] * d[0] + d[1] * d[1]
 }
@@ -60,6 +65,33 @@ impl Shape {
                 let top = if flip { half[0] } else { -half[0] };
                 sd_triangle(q, [[-half[0], -half[1]], [half[0], -half[1]], [top, half[1]]])
             }
+            Shape::Capsule { a, b, r } => sd_segment2(p, a, b).sqrt() - r,
+            Shape::Bowl { c, r, t, angle } => {
+                let q = rotate([p[0] - c[0], p[1] - c[1]], angle);
+                // Below the rim: distance to the ring. Above it: to the nearer end of the arc.
+                let d = if q[1] <= 0.0 { (q[0].hypot(q[1]) - r).abs() } else { (q[0].abs() - r).hypot(q[1]) };
+                d - t
+            }
+        }
+    }
+
+    /// The point the shape is placed and moved by.
+    pub fn center(&self) -> [f32; 2] {
+        match *self {
+            Shape::Circle { c, .. } | Shape::Box { c, .. } | Shape::Ramp { c, .. } | Shape::Bowl { c, .. } => c,
+            Shape::Capsule { a, b, .. } => [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])],
+        }
+    }
+
+    /// Moves the shape by `d` cells.
+    pub fn translate(&mut self, d: [f32; 2]) {
+        let shift = |p: &mut [f32; 2]| *p = [p[0] + d[0], p[1] + d[1]];
+        match self {
+            Shape::Circle { c, .. } | Shape::Box { c, .. } | Shape::Ramp { c, .. } | Shape::Bowl { c, .. } => shift(c),
+            Shape::Capsule { a, b, .. } => {
+                shift(a);
+                shift(b);
+            }
         }
     }
 
@@ -68,6 +100,8 @@ impl Shape {
         match *self {
             Shape::Circle { c, r } => (c, r),
             Shape::Box { c, half, .. } | Shape::Ramp { c, half, .. } => (c, half[0].hypot(half[1])),
+            Shape::Capsule { a, b, r } => (self.center(), 0.5 * (b[0] - a[0]).hypot(b[1] - a[1]) + r),
+            Shape::Bowl { c, r, t, .. } => (c, r + t),
         }
     }
 }
@@ -500,6 +534,28 @@ mod tests {
     }
 
     #[test]
+    fn walls_and_bowls_have_the_right_shape() {
+        let wall = Shape::Capsule { a: [10.0, 10.0], b: [30.0, 10.0], r: 2.0 };
+        assert!((wall.sdf([20.0, 10.0]) + 2.0).abs() < 1e-5 && (wall.sdf([34.0, 10.0]) - 2.0).abs() < 1e-5);
+        assert!((wall.sdf([20.0, 15.0]) - 3.0).abs() < 1e-5);
+        // A wall of no length is a disk, not a NaN.
+        let dot = Shape::Capsule { a: [5.0, 5.0], b: [5.0, 5.0], r: 3.0 };
+        assert!((dot.sdf([5.0, 5.0]) + 3.0).abs() < 1e-5 && (dot.sdf([10.0, 5.0]) - 2.0).abs() < 1e-5);
+        // A bowl is solid along its lower half ring, open inside and above.
+        let bowl = Shape::Bowl { c: [50.0, 50.0], r: 20.0, t: 2.0, angle: 0.0 };
+        assert!(bowl.sdf([50.0, 30.0]) < -1.9 && bowl.sdf([30.0, 50.0]) < -1.9 && bowl.sdf([70.0, 49.0]) < -1.9);
+        assert!(bowl.sdf([50.0, 50.0]) > 17.0 && bowl.sdf([50.0, 70.0]) > 17.0 && bowl.sdf([50.0, 40.0]) > 7.0);
+        assert!((bowl.sdf([70.0, 55.0]) - 3.0).abs() < 1e-4, "above the rim: distance to the end of the arc");
+        let mut moved = bowl;
+        moved.translate([5.0, -3.0]);
+        assert_eq!(moved.center(), [55.0, 47.0]);
+        assert!((moved.sdf([55.0, 27.0]) - bowl.sdf([50.0, 30.0])).abs() < 1e-5);
+        // Upside down it is a dome.
+        let dome = Shape::Bowl { c: [50.0, 50.0], r: 20.0, t: 2.0, angle: std::f32::consts::PI };
+        assert!(dome.sdf([50.0, 70.0]) < -1.9 && dome.sdf([50.0, 30.0]) > 17.0);
+    }
+
+    #[test]
     fn open_fraction_follows_the_crossing() {
         assert_eq!(open_fraction(1.0, 2.0), 1.0);
         assert_eq!(open_fraction(-1.0, -2.0), 0.0);
@@ -595,5 +651,26 @@ mod tests {
         assert_eq!(at(30, 30), [1.0, 1.0, 0.0, 1.0]);
         assert_eq!(field.sdf.len(), 65 * 65);
         assert!(scene.sdf([32.0, 32.0]) > 0.0 && scene.sdf([1.0, 32.0]) < 0.0);
+    }
+}
+#[cfg(test)]
+mod timing {
+    use super::*;
+
+    /// `cargo test --release rasterize_time -- --ignored --nocapture`: what handing a moved
+    /// solid to the simulation costs (`World::raster_cost`): 10 ms at 512 x 288, 47 ms at
+    /// 1024 x 576 on a Ryzen desktop, half of it the flood fill of `seal_pockets`.
+    #[test]
+    #[ignore]
+    fn rasterize_time() {
+        for grid in [[512u32, 288u32], [1024, 576]] {
+            let mut scene = Scene::new(grid);
+            scene.shapes.push(Shape::Bowl { c: [200.0, 150.0], r: 30.0, t: 2.5, angle: 0.0 });
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                std::hint::black_box(scene.rasterize());
+            }
+            println!("rasterize {grid:?}: {:.2} ms", t.elapsed().as_secs_f64() * 50.0);
+        }
     }
 }

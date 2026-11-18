@@ -1,7 +1,7 @@
 #version 460
 // The vapour field (README, "Steam"), splatted additively like the sharp field and into a
 // target of the same layout (render.rs: Targets::vapour): steam still in the liquid (table
-// row 19, material.rs: Steam), each bubble a small kernel (r) and a thin ring (b); where they
+// row 57, material.rs: Steam), each bubble a small kernel (r) and a thin ring (b); where they
 // crowd, the kernels merge into one pocket of vapour with a smooth outline (composite.frag
 // draws its rim and glint). Steam that escaped is not drawn from here but from the smoke
 // field (smoke.comp). Everything else in the particle buffer is skipped.
@@ -29,7 +29,7 @@ layout(location = 0) out vec2 v_uv;
 layout(location = 1) flat out float v_w;
 
 const vec2 CORNER[3] = vec2[3](vec2(0.0, 2.0), vec2(-1.7320508, -1.0), vec2(1.7320508, -1.0));
-const uint KIND_STEAM = 20u;  // table row 19 + 1
+const uint KIND_STEAM = 58u;  // table row 57 + 1 (common.glsl: ROW_STEAM)
 
 void main() {
     Particle p = particles[gl_VertexIndex / 3];

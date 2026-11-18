@@ -26,11 +26,12 @@ const uint KIND_PUFF = 0x40000u;
 // (params.rs: KIND_SRC); it condenses back into that liquid.
 const uint KIND_SRC = 0xff00u;
 const uint ROW_WATER = 0u;   // material.rs: Material::Water
-const uint ROW_STEAM = 19u;  // material.rs: Material::Steam
+const uint ROW_STEAM = 57u;  // material.rs: Material::Steam
+const uint MAX_MATERIALS = 96u;  // material.rs: MAX_MATERIALS
 const int GROUPS = 4;        // material.rs: GROUPS (0 aqueous, 1 oil-like, 2 liquid metal, 3 silicate melt)
 const int MAX_PRESENT = 12;  // material.rs: MAX_PRESENT
 
-const int MAX_CURRENTS = 8;  // params.rs: MAX_CURRENTS
+const int MAX_CURRENTS = 16;  // params.rs: MAX_CURRENTS
 const int MAX_MAGNETS = 8;   // params.rs: MAX_MAGNETS
 
 layout(std140, set = 0, binding = 0) uniform Params {
@@ -66,13 +67,13 @@ layout(std140, set = 0, binding = 0) uniform Params {
     vec2 tool_pos;        // cells
     vec2 tool_vel;        // cells / s
     float tool_radius;    // cells
-    int tool_mode;        // 0 none, 1 grab / stir, 2 erase, 3 push, 4 stream nozzle
+    int tool_mode;        // 0 none, 1 grab / stir, 2 erase, 3 push / pull, 4 stream nozzle, 5 heat, 6 cool, 7 whirl, 8 hold
     float tool_strength;
     uint frame;
     vec4 tol;             // relative tolerance: pressure, density correction, viscosity; density-correction time constant (s)
     vec4 ext;             // particle speed cap (cells / s, huge = off); advection order (1 Euler, 2 midpoint); CFL multiple allowed to spray; number of currents
     vec4 corr;            // density correction: largest step (cells, 0 = none), dead band; oil slip cap (1 on); explicit-viscosity diffusion number
-    vec4 current_zone[MAX_CURRENTS];  // position (cells), radius, rate (1 / s)
+    vec4 current_zone[MAX_CURRENTS];  // position (cells), radius, rate (1 / s; negative: a drain)
     vec4 current_vel[MAX_CURRENTS];   // velocity the liquid is driven towards (cells / s); unused
     vec4 mag;             // magnets; largest susceptibility in the tank; its saturation (T); Pa -> grid units
     vec4 magnet[MAX_MAGNETS];      // position (cells), radius (cells), field at the radius (T)
@@ -231,6 +232,9 @@ struct Mat {
     vec4 th2;    // latent heat as degrees; emissivity; boiling point (deg C); latent heat of vaporisation as degrees
     vec4 el;     // shear modulus / rho_water; relaxation time (s); susceptibility; residue share
     vec4 misc;   // freeze shift per unit concentration (K); load; viscosity blending exponent against the diluent; thermal expansion (1/K)
+    ivec4 ic;    // reaction: partner row (-1: none, or not in the tank); product row (-1: used up); the partner's family (-1 none); its phase group
+    vec4 rx;     // reaction rate (1 / s); its heat as degrees of this liquid; self-heating (K / s); volatility (1 / s)
+    vec4 gr;     // friction coefficient; fume; fizz; unused
 };
 layout(std430, set = 0, binding = 39) readonly buffer MatBuf { Mat mats[]; };
 // Per cell, from grid_prep.comp:
@@ -248,6 +252,11 @@ layout(std430, set = 0, binding = 59) buffer GroupRhoBuf { vec4 grho[]; };
 // xyz: share x base density of groups 1 - 3 (the drift within a group); w: share of steam.
 layout(std430, set = 0, binding = 65) buffer GroupBaseBuf { vec4 gbase[]; };
 layout(std430, set = 0, binding = 41) buffer SPropBuf { vec4 sprop[]; };
+// Per cell (when CAP_REACT; grid_prep.comp): bit j set where the tank's j-th material
+// (present_row(j)) makes up more than REACT_MIN of the cell's liquid (a concentrate: its share
+// times its concentration). particles.comp: a liquid reacts where its partner's bit is set.
+layout(std430, set = 0, binding = 89) buffer ReactBuf { uint rmask[]; };
+const float REACT_MIN = 0.02;
 layout(std430, set = 0, binding = 42) buffer MixBuf { float mixb[]; };
 layout(std430, set = 0, binding = 43) buffer Surf2Buf { vec4 surf2[]; };
 
@@ -337,12 +346,13 @@ const uint CAP_RHEO = 8u;       // a non-Newtonian liquid (or one with a skin) i
 const uint CAP_MAGNET = 16u;    // a magnet and a susceptible liquid: magnet.comp runs
 const uint CAP_ELASTIC = 32u;   // a viscoelastic liquid: particles carry a stress, elastic.comp runs
 const uint CAP_SETTLE = 64u;    // a suspension whose grains settle: settle.comp runs
+const uint CAP_REACT = 256u;    // two liquids that react with each other are in the tank (README, "Reactions")
 const uint CAP_STEAM = 128u;    // boiling aqueous liquid turns into steam (README, "Steam")
 
 // Specialisation constant 0 (sim/mod.rs: CapsPass): the CAP_* bits the pipeline was built for.
 // has_cap() of a bit outside them is constant false, so the driver drops the code behind it
 // and the registers it would hold (a pass compiled for every capability ran the particle pass
-// of a plain water-oil-syrup tank 12 % slower). An unspecialised pipeline keeps every bit.
+// of a plain water-oil-honey tank 12 % slower). An unspecialised pipeline keeps every bit.
 layout(constant_id = 0) const uint SPEC_CAPS = 0xffffffffu;
 bool has_cap(uint c) { return (P.caps & SPEC_CAPS & c) != 0u; }
 
@@ -424,10 +434,12 @@ layout(std430, set = 0, binding = 46) readonly buffer SolidTBuf { float solid_t[
 //   [2 e], [2 e + 1]  energy entry e as a 64-bit fixed-point sum (LEDGER_SCALE per K of one
 //                     water-filled cell, rounded to nearest per addition): 0 gained from air, 1 lost to air, 2 gained from
 //                     solids, 3 lost to solids, 4 added by the heat tool, 5 removed by the
-//                     cool tool, 6 carried off by evaporated liquid
+//                     cool tool, 6 carried off by evaporated liquid, 7 made inside the
+//                     liquid (self-heating, reactions)
 //   [16 + m]          particles of row m that boiled away
-//   [80 + m]          particles of row m left behind as residue
-//   [144 + m]         particles of row m that turned into steam (README, "Steam")
+//   [16 + MAX_MATERIALS + m]      particles of row m left behind as residue
+//   [16 + 2 MAX_MATERIALS + m]    particles of row m that turned into steam (README, "Steam")
+//                     energy entry 7: made inside the liquid (self-heating, reactions)
 layout(std430, set = 0, binding = 47) buffer LedgerBuf { uint ledger[]; };
 const float NO_TEMP = -1e9;
 const float LEDGER_SCALE = 65536.0;
@@ -545,6 +557,12 @@ void nn_eval(int i, vec4 q, float g, out float F, out float tau) {
     } else if (model == 3) {
         F = min(pow(1.0 + (rp.z * g) * (rp.z * g), 0.5 * (rp.y - 1.0)), rp.w);
     }
+    // A granular liquid (README, "Granular friction"): a yield stress of its friction
+    // coefficient times the pressure (Mohr-Coulomb without cohesion; a concentrate's by its
+    // concentration cubed: grains that no longer touch carry nothing). The pressure is the
+    // last projection's (pres.x is p dt).
+    float fr = mats[r].gr.x;
+    if (fr > 0.0) tau += fr * q.z * q.z * q.z * max(pres[i].x, 0.0) / max(S.dt, 1e-6);
     int W = P.grid.x;
     float skin = mats[r].temp.w;
     if (skin > 0.0 && (cell[i - 1].w <= 0.0 || cell[i + 1].w <= 0.0 || cell[i - W].w <= 0.0 || cell[i + W].w <= 0.0)) tau += skin;

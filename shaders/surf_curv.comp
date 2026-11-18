@@ -12,7 +12,7 @@
 // n_wall pointing out of the solid and t_wall the in-wall direction away from the liquid.
 // This is the minimal static-contact-angle model: no hysteresis and no contact-line
 // mobility model; how fast a contact line can move is left to the wall boundary
-// condition of the viscosity solve (no-slip, so syrup lines creep and water lines slide).
+// condition of the viscosity solve (no-slip, so honey lines creep and water lines slide).
 //
 // Curvature is only kept where the interface is resolved (a clear gradient) and is
 // limited to kappa_max: radii below about two cells are not representable on this grid,

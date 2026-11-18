@@ -55,12 +55,12 @@ OPTIONS:
     --min-fps <F>         lowest frame rate kept at real time; heavier scenes go into slow
                           motion instead (default 60, 20-240; also in the panel)
     --set <name=value>    override a parameter (repeatable; units and ranges in `sprout params`),
-                          e.g. --set viscosity_syrup=0.09 or --set speed_cap=0 (off)
+                          e.g. --set viscosity_honey=0.09 or --set speed_cap=0 (off)
 
 ENVIRONMENT (developer aids):
     SPROUT_FRAMES_CSV=<path>   with --frames: write every frame time (s) to <path>
     SPROUT_CASE=<name>         validate surface: run one case (drop, oildisc, waterdrop, oildrop,
-                               syrup, contact, bead)
+                               honey, contact, bead)
     SPROUT_TRACE=1             validate surface: print the oscillation samples
     SPROUT_RAD=<cells>         validate surface: radius of the oscillating drops (resolution
                                studies; the checks' tolerances are set for the default 20)
@@ -146,7 +146,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 let x: f32 = x.parse().ok().filter(|x: &f32| !x.is_nan()).ok_or(format!("bad value in '{v}'"))?;
                 if !sim::SimParams::default().set(k, x) {
                     let hint = match k {
-                        _ if k.starts_with("rho_") => " (densities are now density_syrup / density_oil, in kg/m³)",
+                        _ if k.starts_with("rho_") => " (densities are now density_honey / density_oil, in kg/m³)",
                         "sigma_oil" => " (use tension_oil for oil against air, tension_oil_water between oil and water)",
                         _ => "",
                     };
@@ -281,10 +281,10 @@ mod tests {
 
     #[test]
     fn options_parse() {
-        let o = parse(&["--quality", "high", "--map", "dam", "--set", "viscosity_syrup=0.09", "--no-vsync", "out.png"]).unwrap();
+        let o = parse(&["--quality", "high", "--map", "dam", "--set", "viscosity_honey=0.09", "--no-vsync", "out.png"]).unwrap();
         assert_eq!(o.grid, [768, 432]);
         assert_eq!(maps::MAPS[o.map].name, "Dam Break");
-        assert_eq!(o.overrides, vec![("viscosity_syrup".to_string(), 0.09)]);
+        assert_eq!(o.overrides, vec![("viscosity_honey".to_string(), 0.09)]);
         assert!(!o.vsync);
         assert_eq!(o.positional, vec!["out.png".to_string()]);
 
@@ -300,7 +300,7 @@ mod tests {
         assert!(parse(&["--quality", "extreme"]).is_err());
         assert!(parse(&["--grid", "8x8"]).is_err());
         assert!(parse(&["--set", "bogus=1"]).is_err());
-        assert!(parse(&["--set", "nu_syrup"]).is_err());
+        assert!(parse(&["--set", "nu_honey"]).is_err());
         assert!(parse(&["--set", "gravity=nan"]).is_err());
         assert!(parse(&["--set", "rho_oil=0.8"]).err().is_some_and(|e| e.contains("kg/m³")));
         assert!(parse(&["--frobnicate"]).is_err());

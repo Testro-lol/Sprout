@@ -720,7 +720,7 @@ fn lava_jitter(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), grid: [u32; 2]) {
     let depth = env("LAB_LAVA_DEPTH", 0.12) * gh;
     let what = match std::env::var("LAB_JITTER_MAT").as_deref() {
         Ok("water") => Material::Water,
-        Ok("syrup") => Material::Syrup,
+        Ok("honey") => Material::Honey,
         _ => Material::Lava,
     };
     let mut ps = Vec::new();

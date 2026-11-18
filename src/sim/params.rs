@@ -247,6 +247,16 @@ pub struct SimParams {
     /// size, m. A look setting: the air itself is not simulated.
     pub steam_swirl: f32,
     pub steam_eddy: f32,
+    /// How many bubbles, foam and spray the liquid makes (spray.comp; 1 the physical rate
+    /// of the sandbox, 0 none). A look setting: they ride the liquid and never push it.
+    pub bubbles: f32,
+    /// Speed of evaporation of the films liquids leave on walls and solids, relative to real
+    /// time (1 = physical: a coat of water takes minutes, of blood half an hour). A
+    /// time-scale, like `heat_rate`.
+    pub drying: f32,
+    /// Jacobi iterations per rendered frame of the light under the surface (sss.comp);
+    /// 0: light reaches the liquid only straight from above, as before 2026-11-16.
+    pub sss_iters: u32,
     /// Diameter of the oil (or water) droplets assumed inside a cell that holds both phases,
     /// in cells: a sub-grid model parameter, so it scales with the grid. Sets how fast the
     /// phases drift apart: the droplets' terminal velocity (see particles.comp).
@@ -400,6 +410,9 @@ impl Default for SimParams {
             steam_life: 2.0,
             steam_swirl: 0.1,
             steam_eddy: 0.2,
+            bubbles: 1.0,
+            drying: 100.0,
+            sss_iters: 4,
             droplet_cells: 1.0,
             cfl: 4.0,
             advection_order: 2,
@@ -597,37 +610,53 @@ pub static MAT_PARAMS: &[Param] = &[
     mat_param!("temp_model", "", [0.0, 2.0], true, |m| m.temp_model as f32, |m, v| m.temp_model = v as u32, "Viscosity against temperature: 0 none, 1 Arrhenius, 2 Vogel-Fulcher-Tammann."),
     mat_param!("temp_b", "K", [0.0, 60000.0], false, |m| m.temp_b, |m, v| m.temp_b = v, "Arrhenius / VFT B: larger means the viscosity falls faster on heating."),
     mat_param!("temp_c", "K", [0.0, 1500.0], false, |m| m.temp_c, |m, v| m.temp_c = v, "VFT C: the temperature at which the viscosity diverges."),
-    mat_param!("temp_ref", "°C", [-50.0, 1600.0], false, |m| m.temp_ref, |m, v| m.temp_ref = v, "Temperature at which `viscosity` holds."),
+    mat_param!("temp_ref", "°C", [-50.0, 1700.0], false, |m| m.temp_ref, |m, v| m.temp_ref = v, "Temperature at which `viscosity` holds."),
     mat_param!("grain", "m", [0.0, 5e-3], false, |m| m.grain, |m, v| m.grain = v, "Diameter of suspended grains: the concentrate settles through its diluent at their terminal velocity; 0 = dissolved."),
     mat_param!("load", "", [0.02, 1.0], false, |m| m.load, |m, v| m.load = v, "Concentration of freshly emitted liquid: the share that is concentrate, the rest its diluent."),
     mat_param!("heat_capacity", "J/kgK", [100.0, 6000.0], false, |m| m.heat_capacity, |m, v| m.heat_capacity = v, "Specific heat capacity."),
     mat_param!("conductivity", "W/mK", [0.01, 100.0], false, |m| m.conductivity, |m, v| m.conductivity = v, "Thermal conductivity."),
     mat_param!("expansion", "1/K", [0.0, 0.005], false, |m| m.expansion, |m, v| m.expansion = v, "Thermal expansion: the liquid's density falls by this share per kelvin above `temp_ref`, so heated liquid rises."),
-    mat_param!("melt_lo", "°C", [-1e9, 1600.0], false, |m| m.melt_lo, |m, v| m.melt_lo = v, "Solidus: frozen below it."),
-    mat_param!("melt_hi", "°C", [-1e9, 1600.0], false, |m| m.melt_hi, |m, v| m.melt_hi = v, "Liquidus: liquid above it; below -273 the material never freezes."),
+    mat_param!("melt_lo", "°C", [-1e9, 1700.0], false, |m| m.melt_lo, |m, v| m.melt_lo = v, "Solidus: frozen below it."),
+    mat_param!("melt_hi", "°C", [-1e9, 1700.0], false, |m| m.melt_hi, |m, v| m.melt_hi = v, "Liquidus: liquid above it; below -273 the material never freezes."),
     mat_param!("latent", "J/kg", [0.0, 1e6], false, |m| m.latent, |m, v| m.latent = v, "Latent heat of fusion."),
     mat_param!("emissivity", "", [0.0, 1.0], false, |m| m.emissivity, |m, v| m.emissivity = v, "Grey-body emissivity: radiative cooling at the free surface, and the glow."),
-    mat_param!("boil", "°C", [30.0, 1e9], false, |m| m.boil, |m, v| m.boil = v, "Boiling point; 1e9 = never boils."),
+    mat_param!("boil", "°C", [-270.0, 1e9], false, |m| m.boil, |m, v| m.boil = v, "Boiling point; 1e9 = never boils."),
     mat_param!("latent_vap", "J/kg", [0.0, 1e7], false, |m| m.latent_vap, |m, v| m.latent_vap = v, "Latent heat of vaporisation."),
     mat_param!("residue_share", "", [0.0, 1.0], false, |m| m.residue_share, |m, v| m.residue_share = v, "Volume share of the concentrate left behind as residue when it boils away."),
     mat_param!("freeze_shift", "K", [-100.0, 100.0], false, |m| m.freeze_shift, |m, v| m.freeze_shift = v, "Shift of the diluent's freezing range per unit concentration (brine: -21)."),
-    mat_param!("spawn_temp", "°C", [-50.0, 1600.0], false, |m| m.spawn_temp, |m, v| m.spawn_temp = v, "Temperature of newly emitted liquid."),
+    mat_param!("spawn_temp", "°C", [-270.0, 1700.0], false, |m| m.spawn_temp, |m, v| m.spawn_temp = v, "Temperature of newly emitted liquid."),
     mat_param!("shear_modulus", "Pa", [0.0, 2000.0], false, |m| m.shear_modulus, |m, v| m.shear_modulus = v, "Elastic shear modulus (upper-convected Maxwell); 0 = not elastic."),
     mat_param!("relax_time", "s", [0.0, 30.0], false, |m| m.relax_time, |m, v| m.relax_time = v, "Time over which elastic stress relaxes."),
     mat_param!("susceptibility", "", [0.0, 20.0], false, |m| m.susceptibility, |m, v| m.susceptibility = v, "Magnetic volume susceptibility (SI)."),
     mat_param!("saturation", "T", [0.001, 2.0], false, |m| m.saturation, |m, v| m.saturation = v, "Saturation magnetisation (as mu0 Ms): the most a field can magnetise it."),
     mat_param!("skin", "N/m", [0.0, 2.0], false, |m| m.skin, |m, v| m.skin = v, "Strength of a surface skin: a yield stress in free-surface cells."),
     mat_param!("opacity", "", [0.0, 1.0], false, |m| m.opacity, |m, v| m.opacity = v, "How deep its colour builds up: 0 clear (water shows its colour through 30 cells), 1 opaque (half a cell)."),
-    mat_param!("scatter", "", [0.0, 1.0], false, |m| m.scatter, |m, v| m.scatter = v, "How strongly it scatters light: 0 clear (light through it is tinted), 1 milky (it shows its own colour, lit from the front)."),
     mat_param!("metal", "", [0.0, 1.0], false, |m| m.metal, |m, v| m.metal = v, "0 dielectric, 1 mirror metal."),
     mat_param!("gloss", "", [0.0, 1.0], false, |m| m.gloss, |m, v| m.gloss = v, "Strength of the specular streak."),
-    mat_param!("body", "", [0.0, 1.0], false, |m| m.body, |m, v| m.body = v, "Fullness of the surface and width of the translucent rim (thick liquids)."),
-    mat_param!("foam", "", [0.0, 1.0], false, |m| m.foam, |m, v| m.foam = v, "1: fast, thin liquid turns to white water."),
-    mat_param!("dry_time", "s", [0.2, 120.0], false, |m| m.dry_time, |m, v| m.dry_time = v, "How long a film of it stays on a solid."),
-    mat_param!("stain", "", [0.0, 1.0], false, |m| m.stain, |m, v| m.stain = v, "How fast it leaves a lasting stain on solids and the back wall (blood 1); other liquids slowly wash it off."),
-    mat_param!("glint", "", [0.0, 1.0], false, |m| m.glint, |m, v| m.glint = v, "Fine glints and a moving sheen on its surface, carried by the flow (honey 1)."),
-    mat_param!("iridescence", "", [0.0, 1.0], false, |m| m.iridescence, |m, v| m.iridescence = v, "Thin-film colours on its surface and in thin layers (oil 1)."),
-    mat_param!("crackle", "", [0.0, 1.0], false, |m| m.crackle, |m, v| m.crackle = v, "Below a bright glow, a dark crust of plates with glowing seams (lava 1)."),
+    mat_param!("foam", "", [0.0, 1.0], false, |m| m.foam, |m, v| m.foam = v, "How readily it foams where it splashes, falls or is whipped up (water 1); `froth` is how long the foam lasts."),
+    mat_param!("self_heat", "W/kg", [0.0, 5000.0], false, |m| m.self_heat, |m, v| m.self_heat = v, "Heat the liquid makes inside itself (400 W/kg warms water-like liquid 0.1 K a second)."),
+    mat_param!("volatility", "1/s", [0.0, 2.0], false, |m| m.volatility, |m, v| m.volatility = v, "Share of the liquid at an open surface that evaporates per second at 20 °C (doubling every 10 K)."),
+    mat_param!("friction", "", [0.0, 1.2], false, |m| m.friction, |m, v| m.friction = v, "Internal friction of a granular liquid (tan of the friction angle; sand 0.65): it holds a slope instead of levelling."),
+    mat_param!("react_rate", "1/s", [0.0, 30.0], false, |m| m.react_rate, |m, v| m.react_rate = v, "How fast it turns into its product where it shares a cell with its reaction partner."),
+    mat_param!("react_heat", "J/kg", [-5e5, 2e6], false, |m| m.react_heat, |m, v| m.react_heat = v, "Heat its reaction gives off (negative: takes up)."),
+    mat_param!("froth", "s", [0.0, 300.0], false, |m| m.froth, |m, v| m.froth = v, "How long its foam lasts (water 0.6, milk 4, beer 40, soap 90)."),
+    mat_param!("fizz", "", [0.0, 1.0], false, |m| m.fizz, |m, v| m.fizz = v, "Dissolved gas: bubbles form in it (most on the solids it touches), grow as they rise and feed its foam (beer 0.6)."),
+    mat_param!("fume", "", [0.0, 1.0], false, |m| m.fume, |m, v| m.fume = v, "Visible vapour it gives off where it evaporates or boils away (liquid nitrogen 1)."),
+    mat_param!("luminous", "", [0.0, 2.0], false, |m| m.luminous, |m, v| m.luminous = v, "Light of its own, in its glow colour, at any temperature (glow-stick fluid 1)."),
+    mat_param!("glow_shear", "", [0.0, 1.0], false, |m| m.glow_shear, |m, v| m.glow_shear = v, "Share of its own light it gives only where it is stirred."),
+    mat_param!("thermo_lo", "°C", [-270.0, 1700.0], false, |m| m.thermo_lo, |m, v| m.thermo_lo = v, "Thermochromic: at and below this temperature it has its colour ..."),
+    mat_param!("thermo_hi", "°C", [-270.0, 1700.0], false, |m| m.thermo_hi, |m, v| m.thermo_hi = v, "... and at and above this one its hot colour (off unless above thermo_lo)."),
+    mat_param!("solids", "", [0.0, 1.0], false, |m| m.solids, |m, v| m.solids = v, "Volume fraction of what is dissolved in it and does not evaporate (honey 0.8, brine 0.12, blood 0.08, ink 0.05): with its particles, what a film of it leaves when it dries."),
+    mat_param!("cloud", "", [0.0, 0.7], false, |m| m.cloud, |m, v| m.cloud = v, "Cloudiness: volume fraction of fine suspended particles (milk fat 0.035, red cells 0.45, mud fines 0.25)."),
+    mat_param!("cloud_size", "m", [5e-9, 5e-5], false, |m| m.cloud_size, |m, v| m.cloud_size = v, "Diameter of the fine particles: below ~0.2 µm they scatter blue and let orange through (Rayleigh), above a few µm white and mostly forwards."),
+    mat_param!("cloud_ior", "", [1.0, 3.0], false, |m| m.cloud_ior, |m, v| m.cloud_ior = v, "Refractive index of the fine particles: the further from the liquid's own, the more they scatter (equal: they vanish)."),
+    mat_param!("cloud_shape", "", [0.01, 1.0], false, |m| m.cloud_shape, |m, v| m.cloud_shape = v, "Thickness over diameter of the fine particles: 1 spheres; platelets (mica 0.05) are lined up by the flow and show its shear in silky bands, until Brownian rotation (faster for small ones) undoes it."),
+    mat_param!("dust", "", [0.0, 0.3], false, |m| m.dust, |m, v| m.dust = v, "Volume fraction of coarse particles seen as specks: grains, flakes, glitter."),
+    mat_param!("dust_size", "m", [2e-5, 4e-3], false, |m| m.dust_size, |m, v| m.dust_size = v, "Diameter of the specks."),
+    mat_param!("dust_density", "kg/m³", [10.0, 20000.0], false, |m| m.dust_density, |m, v| m.dust_density = v, "Density of the specks: heavier than the liquid they settle (Stokes), lighter they rise; they rest on what is below and a fast enough flow stirs them up again (Shields)."),
+    mat_param!("dust_shape", "", [0.01, 1.0], false, |m| m.dust_shape, |m, v| m.dust_shape = v, "Thickness over diameter of the specks: 1 grains, small values flakes that the flow tumbles (Jeffery orbits) so they flash as they turn to the light."),
+    mat_param!("dust_reflect", "", [0.0, 1.0], false, |m| m.dust_reflect, |m, v| m.dust_reflect = v, "Mirror reflectance of a speck's face (quartz 0.05, mica 0.2, aluminised glitter 0.9)."),
+    mat_param!("ior", "", [1.0, 2.5], false, |m| m.ior, |m, v| m.ior = v, "Refractive index: how much its surface reflects (Fresnel) and how far it bends what is seen through it (water 1.33, oil 1.47, glass 1.5)."),
 ];
 
 /// Old property prefixes (`nu_oil` = `viscosity_oil`).
@@ -654,7 +683,7 @@ pub static PARAMS: &[Param] = &[
     param!("evaporation", World, "", [0.0, 1.0], None, true, |p| p.evaporation as f32, |p, v| p.evaporation = v as u32,
         "1: warm water loses heat by evaporating at its surface, and steams; 0 = off."),
     param!("rigid_viscosity", World, "m²/s", [0.05, 50.0], None, false, |p| p.rigid_viscosity, |p, v| p.rigid_viscosity = v,
-        "Viscosity at which liquid stops flowing and moves rigidly (frozen, set glass, unyielded sludge, jammed oobleck); the cap of the viscosity solve. Higher: more viscosity iterations."),
+        "Viscosity at which liquid stops flowing and moves rigidly (frozen, set glass, unyielded clay, jammed oobleck); the cap of the viscosity solve. Higher: more viscosity iterations."),
     param!("rigid_contact", World, "", [0.0, 1.0], None, true, |p| p.rigid_contact as f32, |p, v| p.rigid_contact = v as u32,
         "1: rigid bodies rest on the floor and walls they touch (no sinking in, tipping only over the edge of their support); 0 = they touch solids only through the liquid solve."),
     param!("rigid_friction", World, "", [0.05, 2.0], Some(0.0), false, |p| p.rigid_friction, |p, v| p.rigid_friction = v,
@@ -679,6 +708,12 @@ pub static PARAMS: &[Param] = &[
         "Speed of the eddies that twist escaped steam into wisps (0 = it rises straight up)."),
     param!("steam_eddy", World, "m", [0.005, 0.5], None, false, |p| p.steam_eddy, |p, v| p.steam_eddy = v,
         "Size of the eddies in the air that escaped steam rides."),
+    param!("drying", World, "×", [1.0, 5000.0], Some(0.0), false, |p| p.drying, |p, v| p.drying = v,
+        "Speed of evaporation of the films liquids leave on walls and solids, relative to real time (1 = physical: a water coat dries in a few minutes, blood in half an hour); 0 = films never dry."),
+    param!("bubbles", World, "×", [0.1, 4.0], Some(0.0), false, |p| p.bubbles, |p, v| p.bubbles = v,
+        "How many bubbles, foam and spray splashing, fizzing liquid makes (they ride the liquid; a look setting)."),
+    param!("sss_iters", World, "", [2.0, 32.0], Some(0.0), true, |p| p.sss_iters as f32, |p, v| p.sss_iters = v as u32,
+        "Iterations per frame of the light that spreads under the surface (0: light only from straight above)."),
     // ---- liquids ----
     param!("tension_oil_water", Liquid, "N/m", [0.0, 0.1], None, false, |p| p.pair_tension[0][1], |p, v| { p.pair_tension[0][1] = v; p.pair_tension[1][0] = v }, "Interfacial tension between oil-like and aqueous liquids."),
     param!("tension_metal_water", Liquid, "N/m", [0.0, 0.75], None, false, |p| p.pair_tension[0][2], |p, v| { p.pair_tension[0][2] = v; p.pair_tension[2][0] = v }, "Interfacial tension between liquid metals and aqueous liquids."),
@@ -686,7 +721,7 @@ pub static PARAMS: &[Param] = &[
     param!("tension_melt_water", Liquid, "N/m", [0.0, 0.75], None, false, |p| p.pair_tension[0][3], |p, v| { p.pair_tension[0][3] = v; p.pair_tension[3][0] = v }, "Interfacial tension between silicate melts and aqueous liquids."),
     param!("tension_melt_oil", Liquid, "N/m", [0.0, 0.75], None, false, |p| p.pair_tension[1][3], |p, v| { p.pair_tension[1][3] = v; p.pair_tension[3][1] = v }, "Interfacial tension between silicate melts and oil-like liquids."),
     param!("tension_melt_metal", Liquid, "N/m", [0.0, 0.75], None, false, |p| p.pair_tension[2][3], |p, v| { p.pair_tension[2][3] = v; p.pair_tension[3][2] = v }, "Interfacial tension between silicate melts and liquid metals."),
-    param!("mix_rate", Liquid, "1/s", [0.0, 20.0], None, false, |p| p.mat[1].mix_rate, |p, v| p.mat[1].mix_rate = v, "How fast touching water and syrup blend (the same as mix_rate_syrup)."),
+    param!("mix_rate", Liquid, "1/s", [0.0, 20.0], None, false, |p| p.mat[1].mix_rate, |p, v| p.mat[1].mix_rate = v, "How fast touching water and honey blend (the same as mix_rate_honey)."),
     param!("droplet_cells", Liquid, "cells", [0.1, 4.0], None, false, |p| p.droplet_cells, |p, v| p.droplet_cells = v,
         "Size of the oil / water droplets assumed inside a cell holding both (sub-grid model): bigger droplets separate faster."),
     // ---- time step and accuracy ----
@@ -894,7 +929,7 @@ impl SimParams {
         let mut k = 0;
         while k < rows.len() {
             let m = &self.mat[rows[k]];
-            for extra in [m.diluent, m.residue] {
+            for extra in [m.diluent, m.residue, if m.react_with >= 0 && present.contains(&(m.react_with as usize)) { m.react_into } else { -1 }] {
                 if extra >= 0 && !rows.contains(&(extra as usize)) {
                     rows.push(extra as usize);
                 }
@@ -1024,8 +1059,14 @@ pub fn describe() -> String {
 /// Speed the push tool drives liquid outwards at, cells/s (carried in `ToolState::vel[0]`).
 pub const PUSH_SPEED: f32 = 220.0;
 
-/// Most currents a world can hold (the size of the arrays in `GpuParams`).
-pub const MAX_CURRENTS: usize = 8;
+/// Speed the whirl tool turns liquid at near its rim, cells/s.
+pub const WHIRL_SPEED: f32 = 200.0;
+/// How fast a drain removes the liquid inside it, 1/s, at 100 % strength.
+pub const DRAIN_RATE: f32 = 40.0;
+
+/// Most zones a world can hold (the size of the arrays in `GpuParams`): currents (the held
+/// one and placed fans) and drains share them.
+pub const MAX_CURRENTS: usize = 16;
 /// Most magnets in the world at once.
 pub const MAX_MAGNETS: usize = 8;
 /// Magnet strengths offered by the tool, as the field at the magnet's rim, T. A strong
@@ -1074,7 +1115,8 @@ pub struct Current {
     pub radius: f32,
     /// Direction and speed the liquid is driven towards, cells/s.
     pub vel: [f32; 2],
-    /// 1/s; see `CURRENT_RATE`.
+    /// 1/s; see `CURRENT_RATE`. Negative: a drain, which removes the liquid inside it at
+    /// minus this rate (`vel` is unused).
     pub rate: f32,
 }
 
@@ -1086,6 +1128,12 @@ impl Current {
         let speed = CURRENT_SPEED * strength;
         Current { pos, radius, vel: [s * speed, -c * speed], rate: CURRENT_RATE }
     }
+
+    /// A drain at `pos`: liquid inside it leaves the tank, each particle with probability
+    /// `DRAIN_RATE * strength` per second (highest at the centre).
+    pub fn drain(pos: [f32; 2], radius: f32, strength: f32) -> Current {
+        Current { pos, radius, vel: [0.0; 2], rate: -DRAIN_RATE * strength }
+    }
 }
 
 /// What the mouse is doing to the fluid this frame.
@@ -1094,8 +1142,9 @@ pub struct ToolState {
     pub pos: [f32; 2],
     pub vel: [f32; 2],
     pub radius: f32,
-    /// 0 = idle, 1 = grab / stir, 2 = erase, 3 = push (speed in `vel[0]`), 4 = stream nozzle,
-    /// 5 = heat, 6 = cool.
+    /// 0 = idle, 1 = grab / stir, 2 = erase, 3 = push or pull (outward speed in `vel[0]`,
+    /// negative pulls), 4 = stream nozzle, 5 = heat, 6 = cool, 7 = whirl (speed in `vel[0]`,
+    /// positive turns anticlockwise), 8 = hold still.
     pub mode: i32,
     pub strength: f32,
 }
@@ -1114,6 +1163,25 @@ impl ToolState {
     /// Drives the fluid under the brush radially outwards at `PUSH_SPEED`.
     pub fn push(pos: [f32; 2], radius: f32) -> ToolState {
         ToolState { pos, vel: [PUSH_SPEED, 0.0], radius, mode: 3, strength: 40.0 }
+    }
+
+    /// Draws the fluid under the brush in towards the cursor at `PUSH_SPEED`.
+    pub fn pull(pos: [f32; 2], radius: f32) -> ToolState {
+        ToolState { pos, vel: [-PUSH_SPEED, 0.0], radius, mode: 3, strength: 40.0 }
+    }
+
+    /// Turns the fluid under the brush around the cursor, at `WHIRL_SPEED` near the rim
+    /// (`clockwise` or not), like a spoon going round a cup.
+    pub fn whirl(pos: [f32; 2], radius: f32, clockwise: bool) -> ToolState {
+        ToolState { pos, vel: [if clockwise { -WHIRL_SPEED } else { WHIRL_SPEED }, 0.0], radius, mode: 7, strength: 30.0 }
+    }
+
+    /// Brings the fluid under the brush to rest and holds it there, against gravity too:
+    /// much stiffer than Grab, since what is left of a particle's speed each substep is
+    /// what gravity adds divided by the strength (at 600 /s under a centimetre a second on
+    /// 1 cm cells, in the inner three quarters of the brush).
+    pub fn hold(pos: [f32; 2], radius: f32) -> ToolState {
+        ToolState { pos, radius, mode: 8, strength: 600.0, ..Default::default() }
     }
 
     /// Heats (or, with `cool`, cools) the liquid under the brush at `SimParams::heat_power`.
@@ -1135,6 +1203,7 @@ impl ToolState {
         match self.mode {
             1 => self.vel[0].hypot(self.vel[1]) + 4.0 * self.radius,
             3 | 4 => self.vel[0].hypot(self.vel[1]),
+            7 => self.vel[0].abs() + 2.0 * self.radius,
             _ => 0.0,
         }
     }
@@ -1240,6 +1309,7 @@ pub const CAP_MAGNET: u32 = 16;
 pub const CAP_ELASTIC: u32 = 32;
 pub const CAP_SETTLE: u32 = 64;
 pub const CAP_STEAM: u32 = 128;
+pub const CAP_REACT: u32 = 256;
 
 /// Volumetric heat capacity of water, J/(m³ K): the unit heat is counted in on the GPU.
 pub const WATER_HEAT: f32 = SimParams::WATER_DENSITY * 4182.0;
@@ -1266,10 +1336,10 @@ mod tests {
     #[test]
     fn overrides_reach_the_named_parameter() {
         let mut p = SimParams::default();
-        let (syrup, oil) = (Material::Syrup.index(), Material::Oil.index());
-        assert!(p.set("viscosity_syrup", 0.09) && p.mat[syrup].viscosity == 0.09);
-        assert!(p.set("nu_syrup", 0.08) && p.mat[syrup].viscosity == 0.08, "old names still work");
-        assert!(p.set("syrup.viscosity", 0.07) && p.mat[syrup].viscosity == 0.07, "material.property works too");
+        let (honey, oil) = (Material::Honey.index(), Material::Oil.index());
+        assert!(p.set("viscosity_honey", 0.09) && p.mat[honey].viscosity == 0.09);
+        assert!(p.set("nu_honey", 0.08) && p.mat[honey].viscosity == 0.08, "old names still work");
+        assert!(p.set("honey.viscosity", 0.07) && p.mat[honey].viscosity == 0.07, "material.property works too");
         assert!(p.set("density_oil", 800.0) && p.mat[oil].density == 800.0);
         assert!(p.set("tension_water", 0.05) && p.mat[0].tension == 0.05);
         assert!(p.set("sigma_water", 0.06) && p.mat[0].tension == 0.06);
@@ -1280,8 +1350,8 @@ mod tests {
         assert!(p.set("pressure_iters", 50.4) && p.pressure_max_iters == 50);
         assert!(p.set("substep_hz", 1.0) && p.fixed_hz == 30.0, "a fixed rate has a floor");
         assert!(p.set("fixed_hz", 0.0) && p.fixed_hz == 0.0, "0 selects the adaptive step");
-        assert!(p.set("mix_rate", -5.0) && p.mat[syrup].mix_rate == 0.0, "a negative rate would grow without bound");
-        assert!(p.set("diffuse", 2.0) && p.mat[syrup].mix_rate == 2.0);
+        assert!(p.set("mix_rate", -5.0) && p.mat[honey].mix_rate == 0.0, "a negative rate would grow without bound");
+        assert!(p.set("diffuse", 2.0) && p.mat[honey].mix_rate == 2.0);
         assert!(p.set("speed_cap", 0.0) && p.speed_cap == 0.0, "0 switches the cap off");
         assert!(!p.set("gravity", f32::NAN) && p.gravity.is_finite(), "NaN is refused");
         assert!(p.set("gravity", f32::INFINITY) && p.gravity.is_finite(), "infinity is clamped to the range");
@@ -1342,10 +1412,10 @@ mod tests {
     #[test]
     fn default_fluids_are_ordered_as_advertised() {
         let p = SimParams::default();
-        let (water, syrup, oil) = (p.rho(Material::Water), p.rho(Material::Syrup), p.rho(Material::Oil));
-        assert!(oil < water && water < syrup, "oil floats on water, syrup sinks in it");
+        let (water, honey, oil) = (p.rho(Material::Water), p.rho(Material::Honey), p.rho(Material::Oil));
+        assert!(oil < water && water < honey, "oil floats on water, honey sinks in it");
         let nu = |m: Material| p.mat[m.index()].viscosity;
-        assert!(nu(Material::Syrup) > 10.0 * nu(Material::Oil) && nu(Material::Oil) > nu(Material::Water));
+        assert!(nu(Material::Honey) > 10.0 * nu(Material::Oil) && nu(Material::Oil) > nu(Material::Water));
         assert_eq!(nu(Material::Water), 1.0e-6, "water keeps its real viscosity");
     }
 
@@ -1372,11 +1442,11 @@ mod tests {
         assert_eq!(at(Material::Water).material(), Some(Material::Water));
         assert_eq!(at(Material::Oil).pos, [1.0, 2.0]);
         assert_eq!(Particle::default().material(), None);
-        let mut blend = at(Material::Syrup);
+        let mut blend = at(Material::Honey);
         blend.s = 0.25;
-        assert_eq!((blend.share(Material::Syrup, &p), blend.share(Material::Water, &p), blend.share(Material::Oil, &p)), (0.25, 0.75, 0.0));
+        assert_eq!((blend.share(Material::Honey, &p), blend.share(Material::Water, &p), blend.share(Material::Oil, &p)), (0.25, 0.75, 0.0));
         assert_eq!(at(Material::Water).share(Material::Water, &p), 1.0);
         assert!((blend.density(&p) - 1.1).abs() < 1e-6);
-        assert_eq!(p.closure(&[1]), vec![0, 1], "syrup brings its diluent");
+        assert_eq!(p.closure(&[1]), vec![0, 1], "honey brings its diluent");
     }
 }

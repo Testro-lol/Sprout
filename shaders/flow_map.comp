@@ -16,6 +16,9 @@
 // half a period apart, each restarted (d = 0) as its weight in the composite reaches zero
 // (a flow map). Two periods, each with its two copies, one copy per channel pair: layer
 // 2 parity + 0 the short one, + 1 the long one; this update writes the other parity.
+//
+// (Until 2026-11-16 layers 4 - 5 held a foam field; foam is now made of particles of its
+// own, spray.comp.)
 
 layout(local_size_x = 16, local_size_y = 16) in;
 

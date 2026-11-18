@@ -9,8 +9,8 @@
 //   0, 1  the state of each copy there: TILE_EMPTY, TILE_DRY, TILE_WET
 //   2     1 if drops were laid into the tile since the last update (particles.comp)
 //   3     1 if the two copies are known to hold the same there
-//   4     bit 0: liquid in the tile's cells, bit 1: staining liquid (cell_optics.comp, this
-//         frame); a tile's work depends on its neighbours' too (a coat reaches up to two
+//   4     bit 0: liquid in the tile's cells, bit 1: liquid that lays a coat (cell_optics.comp,
+//         this frame); a tile's work depends on its neighbours' too (a coat reaches up to two
 //         cells, film runs in from above)
 // A tile's work:
 //   3  the full update: drops were laid into it, staining liquid is in or next to it, or it
@@ -61,7 +61,7 @@ void main() {
     uint state = full ? 3u : here == TILE_DRY ? (same ? 0u : 2u) : (other != TILE_EMPTY ? 1u : 0u);
     if (intake) ftile[2u * ntiles + tile] = 0u;
     if (state == 3u) ftile[3u * ntiles + tile] = 0u;
-    if (state == 2u) { ftile[3u * ntiles + tile] = 1u; ftile[nxt * ntiles + tile] = TILE_DRY; }
+    if (state == 2u) { ftile[3u * ntiles + tile] = 1u; ftile[nxt * ntiles + tile] = here; }
     if (state == 1u) { ftile[3u * ntiles + tile] = 1u; ftile[nxt * ntiles + tile] = TILE_EMPTY; }
     if (state != 0u) {
         uint k = atomicAdd(flist[0], 1u);

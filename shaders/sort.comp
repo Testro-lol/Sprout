@@ -17,6 +17,10 @@
 
 layout(local_size_x = 128) in;
 
+// What each particle carries for the look (look.comp), moved with it.
+layout(std430, set = 0, binding = 90) buffer LookBuf { uvec4 plook[]; };
+layout(std430, set = 0, binding = 91) buffer Look2Buf { uvec4 plook2[]; };
+
 layout(push_constant) uniform PC {
     uint stage;
 } pc;
@@ -60,5 +64,6 @@ void main() {
         int dst = acc[first * P.acc_stride + 6] + atomicAdd(acc[c * P.acc_stride + 7], 1);
         sorted[dst] = p;
         if (has_cap(CAP_ELASTIC)) pstress2[dst] = pstress[id];
+        plook2[dst] = plook[id];
     }
 }

@@ -2,12 +2,21 @@
 // liquid from how it absorbs and scatters light (README, "Look").
 
 struct Optics {
-    vec4 absorb;     // absorption coefficient (linear RGB) and scattering coefficient, 1 / cell
+    vec4 absorb;     // absorption coefficient (linear RGB: dissolved colour and particles), mean reduced scattering, 1 / cell
     vec4 solid;      // colour when frozen (linear RGB); tint depth (cells)
-    vec4 opt;        // opacity, scattering, metal, gloss
-    vec4 sty;        // body, foam, drying time (s), emissivity
+    vec4 opt;        // opacity, platelet sheen, metal, gloss
+    vec4 sty;        // fullness, foam, drying time (s), emissivity
     ivec4 idx;       // diluent row (-1 none), phase group
-    vec4 fx;         // stain, glint, iridescence, crackle
+    vec4 fx;         // stain, unused, iridescence, crackle
+    vec4 fx2;        // froth (s), fizz, specks drawn per cell, drainage time of its foam's films (s)
+    vec4 lum;        // its own light (linear RGB), the share of it that needs stirring
+    vec4 hot;        // absorption and scattering at the top of its thermochromic range
+    vec4 thermo;     // thermochromic range lo, hi (deg C; hi <= lo: none), unused, unused
+    vec4 scat;       // reduced scattering in red, green, blue over its mean (sum 3); asymmetry g
+    vec4 opt2;       // refractive index, platelets' rotational diffusion (rad^2 / s), their Bretherton constant, unused
+    vec4 dust;       // what one drawn speck stands for in the liquid's colour: absorption (rgb), scattering, 1 / cell
+    vec4 dust2;      // speck radius (m), density (kg / m^3), thickness over diameter, mirror reflectance
+    vec4 dcol;       // speck colour (linear rgb); drawn specks per cell where they lie packed
 };
 
 // Linear to sRGB (gamma) and back.
@@ -22,6 +31,13 @@ vec3 to_linear(vec3 c) {
 // Diffuse reflectance of a deep layer of a medium that absorbs `a` and scatters `s` (per
 // channel; two-stream / Hapke: albedo w, q = sqrt(1 - w), R = (1 - q) / (1 + q)).
 vec3 deep_reflectance(vec3 a, float s) {
+    vec3 w = s / max(a + s, vec3(1e-6));
+    vec3 q = sqrt(max(1.0 - w, 0.0));
+    return (1.0 - q) / (1.0 + q);
+}
+
+// The same with the scattering per channel (fine particles scatter blue more than red).
+vec3 deep_reflectance3(vec3 a, vec3 s) {
     vec3 w = s / max(a + s, vec3(1e-6));
     vec3 q = sqrt(max(1.0 - w, 0.0));
     return (1.0 - q) / (1.0 + q);
@@ -65,7 +81,7 @@ vec3 film_colour(vec4 k, float film) {
 // How fast a diluent's own tint gives way to its concentrate's: exp(-DILUENT_FADE c), c the
 // concentrate share of the aqueous liquid (cell_optics.comp). Water's blue is the look of a
 // body of clear water, many times stronger than its real absorption; kept in proportion it
-// turned a little syrup in it green, as a blue and a yellow filter do.
+// turned a little honey in it green, as a blue and a yellow filter do.
 const float DILUENT_FADE = 24.0;
 
 // The look key of liquid of coefficients `k` (cell_optics.comp layer 12, composite.frag):

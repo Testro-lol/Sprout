@@ -51,6 +51,10 @@ layout(set = 0, binding = 11) uniform sampler2DArray flow_map;
 // others', times the kernel (optics.glsl: particle_absorb).
 layout(set = 0, binding = 12) uniform sampler2D tint_c;
 layout(set = 0, binding = 13) uniform sampler2D tint_s;
+// The look field (look.vert), laid out as `accum`: what the particles of liquids with a
+// carried look lay down, times the kernel: their platelets' sheen, their carried scalar phi
+// (look.comp), which way their platelets lie in the plane, and their weight.
+layout(set = 0, binding = 14) uniform sampler2D look_map;
 
 layout(push_constant) uniform PC {
     vec2 cam;         // world position at the centre of the view, cells
@@ -74,6 +78,8 @@ layout(push_constant) uniform PC {
     float film_layer; // the copy of the film map that holds it now (0 or 1)
     float flow_layer; // the copy of the flow map that holds it now (0 or 1)
     float tint;       // 1 when the tint field is drawn (two aqueous liquids or more), else 0
+    float look;       // 1 when the look field is drawn (a liquid with a carried look), else 0
+    float sss;        // 1 when the light under the surface is solved (sss.comp: cell optics layer 20)
 } pc;
 
 layout(location = 0) out vec4 f_color;
@@ -81,7 +87,7 @@ layout(location = 0) out vec4 f_color;
 // 0 compiles the vapour field out (render.rs: composite variants, for a tank without steam).
 layout(constant_id = 0) const uint HAS_VAPOUR = 1u;
 // What else the tank can show (render.rs: `Features`): bit 0 the carried patterns (lava's
-// crackle, oil's iridescence, the sparkle of a liquid that glints above 0.5, as honey),
+// crackle, oil's iridescence),
 // bit 1 stains (the film map), bit 2 ferrofluid spikes (a magnet and a magnetisable
 // liquid; cell optics layer 13). A variant
 // without one compiles its code out: the code alone cost about 0.1 ms a 1600 x 900 frame
@@ -269,12 +275,21 @@ vec2 seek_key(vec2 x, vec3 ks, vec3 k0) {
 // where `il` of the key light reaches it, `thick` cells thick along the view where the view
 // passes (`body` cells where its body is, for how much it scatters into the view), its face
 // shaded by `shade`, with `back` (linear) behind it.
+// The spectral shape of the scattering at this pixel (cell optics layer 16 and the means): fine
+// particles scatter blue more than red (Rayleigh), so a thin cloud of them looks blue against
+// the dark and passes orange light. Set in main() before any shading.
+vec3 g_sr = vec3(1.0);
+
 vec3 liquid_lin(vec4 k, vec3 il, float thick, float body, float shade, vec3 back) {
-    vec3 ext = k.rgb + k.a;
+    vec3 sv = k.a * g_sr;
+    vec3 ext = k.rgb + sv;
     vec3 tv = exp(-ext * thick);
     float hide = 1.0 - exp(-k.a * thick);
-    vec3 front = vec3(AMB_FRONT * shade) + 0.35 * KEY * il;
-    vec3 scat = deep_reflectance(k.rgb, k.a) * (1.0 - tv) * front;
+    // (With the light under the surface solved, sss.comp, more of it comes from the light in
+    // the liquid: a body is lit where light reaches it and spreads, darker where it does not,
+    // tinted as the light is.)
+    vec3 front = pc.sss > 0.0 ? vec3(AMB_FRONT * 0.75 * shade) + 0.55 * KEY * il : vec3(AMB_FRONT * shade) + 0.35 * KEY * il;
+    vec3 scat = deep_reflectance3(k.rgb, sv) * (1.0 - tv) * front;
     // (The key light is scattered towards the viewer half way through the layer; the soft
     // light from the front crosses all of it, so deep in a pool, where only that is left, a
     // clear liquid shows its colour at its fullest.)
@@ -286,7 +301,7 @@ vec3 liquid_lin(vec4 k, vec3 il, float thick, float body, float shade, vec3 back
 // back wall is added after the conversion: it is dark, and in linear light it vanished
 // behind even a thin layer, so that clear liquids looked like paint.)
 vec3 liquid_srgb(vec4 k, vec3 il, float thick, float body, float shade, vec3 back) {
-    vec3 tv = exp(-(k.rgb + k.a) * thick);
+    vec3 tv = exp(-(k.rgb + k.a * g_sr) * thick);
     return to_srgb(liquid_lin(k, il, thick, body, shade, vec3(0.0))) + back * tv * 0.85;
 }
 
@@ -301,6 +316,7 @@ vec3 iced(vec3 c, vec2 x, float layer, float w, float f, float zoom) {
 }
 
 float total(vec4 g) { return g.x + g.y + g.z + g.w; }
+float hot_in(vec3 e) { return max(e.r, max(e.g, e.b)); }
 
 // The leading group's share less the next one's, for the groups a, b chosen at this pixel:
 // positive on a's side of an interface, zero on it.
@@ -415,6 +431,9 @@ float gnoise3(vec3 p) {
     #undef G
     return 0.5 + 0.8 * n;
 }
+
+// A hue wheel: h in turns.
+vec3 hue(float h) { return 0.5 + 0.5 * cos(6.2832 * (h + vec3(0.0, 0.33, 0.67))); }
 
 // Seams of a cell pattern (Voronoi F2 - F1, in pattern cells): small on the seams.
 float seams(vec2 p) {
@@ -596,12 +615,22 @@ float smoke_at(vec2 x) {
          + g1.y * (g0.x * textureLod(smoke_map, vec2(h0.x, h1.y), 0.0).r + g1.x * textureLod(smoke_map, vec2(h1.x, h1.y), 0.0).r);
 }
 
-// What staining liquids left on the back wall or a solid's face here (the film map,
-// film.comp), drawn over `under`: a thin coat lets the surface show, a thick run is the
-// liquid's own colour, deeper the thicker. Drying, it turns darker and browner (blood
-// oxidising) and its edge darker still (a dried drop's ring, where the solute gathered as it
-// evaporated). While it is wet, its slope catches the light: the bead at the head of a run
-// and the ridge of a drip glisten.
+// What liquids left on the back wall or a solid's face here (the film map, film.comp; README,
+// "Films, stains and drips"), drawn over `under`. The film is what it absorbs and scatters,
+// integrated through it, and how much of it is still liquid:
+//   - a layer of absorbance A and scattering S over the surface: light goes through it to the
+//     surface and back (exp(-2 (A + S))) and it sends back what it scatters (two-stream), so a
+//     thin water coat is clear, a blood stain scarlet where thin and near black where thick,
+//     a mud splat brown, a brine crust white;
+//   - while wet, it darkens the surface under it (light trapped in the liquid layer by total
+//     internal reflection, Lekner & Dorf 1988) and its slope catches the light (the bead at a
+//     run's head, a drip's ridge glisten);
+//   - dried, rigid grains sit in air instead of liquid and scatter several times as much (the
+//     refractive index step to air is larger): dried mud and salt lighten and go matte; soft
+//     particles (blood cells) coalesce into a glassy layer that scatters less: dried blood
+//     is darker (material.rs: dry_scatter).
+const float WET_DARK = 0.45;       // most a wet film darkens the surface under it
+const float FILM_LIGHT = 0.75;     // light that reaches the back wall and the solids' faces (linear)
 // The film map at a world position, filtered with a cubic B-spline (four bilinear taps): its
 // texels are a few pixels wide close up, and bilinear filtering drew drops as diamonds.
 vec4 film_sample(sampler2DArray m, vec2 x) {
@@ -628,28 +657,42 @@ vec3 draw_film(vec3 under, vec2 x, float zoom) {
     vec2 ts = 1.0 / vec2(textureSize(film_h, 0).xy);
     float any_h = textureLod(film_h, vec3(uv, pc.film_layer), 0.0).x + textureLod(film_h, vec3(uv + 1.5 * ts, pc.film_layer), 0.0).x
                 + textureLod(film_h, vec3(uv - 1.5 * ts, pc.film_layer), 0.0).x;
-    if (any_h < 0.02) return under;
+    if (any_h < 0.003) return under;
     vec4 fh = film_sample(film_h, x);
-    if (fh.x < 0.03) return under;
-    vec3 c = film_sample(film_c, x).rgb;
-    float h = fh.x, w = clamp(fh.y / max(fh.x, 1e-3) * fh.x, 0.0, 1.0);
-    w = clamp(fh.y, 0.0, 1.0);
+    if (fh.x < 0.003) return under;
+    vec4 fa = max(film_sample(film_c, x), vec4(0.0));
+    // How liquid it still is (film.comp: liquid): its volatile share against its liquid's
+    // as laid; a film of a liquid that never dries is always wet.
+    int frow = int(fh.z + 0.5) - 1;
+    float v0 = frow >= 0 ? optics[min(frow, 95)].fx.x : 1.0;
+    float h = fh.x, v = v0 > 0.0 ? clamp(fh.y / v0, 0.0, 1.0) : 1.0;
     vec2 tc = vec2(pc.grid) * ts;   // cells per texel
-    vec2 gh = 0.5 * vec2(film_sample(film_h, x + vec2(tc.x, 0.0)).x - film_sample(film_h, x - vec2(tc.x, 0.0)).x,
-                         film_sample(film_h, x + vec2(0.0, tc.y)).x - film_sample(film_h, x - vec2(0.0, tc.y)).x);
-    // A drop has an edge: the cover rises over a fraction of its thickness, not a texel.
-    float cover = smoothstep(0.05, 1.1, h) * (1.0 - exp(-h / 0.9));
-    vec3 dried = c * vec3(0.56, 0.47, 0.45);
-    float ring = smoothstep(0.25, 1.2, length(gh)) * (1.0 - w) * smoothstep(0.5, 3.0, h);
-    vec3 fc = mix(dried, c, w) * (1.0 - 0.35 * ring) * exp(-0.04 * max(h - 3.0, 0.0));
-    vec3 o = mix(under, fc, cover * pc.stain_k);
+    // (Its slope from bilinear taps a texel apart, and only where texels span pixels.)
+    float sharp = clamp(zoom * tc.x / 3.0, 0.0, 1.0);
+    vec2 gh = vec2(0.0);
+    if (sharp > 0.05) {
+        float L = pc.film_layer;
+        gh = 0.5 * vec2(textureLod(film_h, vec3(uv + vec2(ts.x, 0.0), L), 0.0).x - textureLod(film_h, vec3(uv - vec2(ts.x, 0.0), L), 0.0).x,
+                        textureLod(film_h, vec3(uv + vec2(0.0, ts.y), L), 0.0).x - textureLod(film_h, vec3(uv - vec2(0.0, ts.y), L), 0.0).x);
+    }
+    float k = pc.stain_k;
+    // The surface under it, darker where the film is wet.
+    float wet = v * (1.0 - exp(-h * v / 0.15));
+    vec3 ul = to_linear(under) * (1.0 - WET_DARK * wet * k);
+    // The layer.
+    vec3 A = fa.rgb * k;
+    float dry_k = frow >= 0 ? float(optics[min(frow, 95)].idx.z) / 1000.0 : 1.0;
+    vec3 S = vec3(fa.a * mix(dry_k, 1.0, v)) * k;
+    vec3 tv = exp(-(A + S));
+    vec3 refl = deep_reflectance3(A + 1e-4, S) * (1.0 - tv);
+    vec3 o = to_srgb(refl * FILM_LIGHT + ul * tv * tv);
     // Wet: a faint sheen and the glint of its slope (texels are a fraction of a pixel far
     // out, where the slope says nothing: faded there).
-    float sharp = clamp(zoom * tc.x / 3.0, 0.0, 1.0);
     vec3 N = normalize(vec3(-gh * 0.5 * sharp, 1.0));
     vec3 H = normalize(L3 + vec3(0.0, 0.0, 1.0));
-    float spec = pow(max(dot(N, H), 0.0), 60.0) * w * cover;
-    o += vec3(1.0, 0.94, 0.9) * (0.6 * spec + 0.04 * w * cover) * pc.stain_k;
+    float cover = 1.0 - exp(-h / 0.4);
+    float spec = pow(max(dot(N, H), 0.0), 60.0) * v * cover;
+    o += vec3(1.0, 0.94, 0.9) * (0.6 * spec + 0.03 * wet) * k;
     return o;
 }
 
@@ -928,6 +971,21 @@ void main() {
         co.sty += f * ring.sty; co.fz += f * ring.fz; co.fx += f * ring.fx; co.l9 += f * ring.l9; co.ds += f * ring.ds; co.dn += f * ring.dn;
     }
     vec4 sty = co.sty;
+    // The specks' share of the colour (layer 18: those too many to draw, where they lie) and
+    // the colour of the scattering: red and blue (layer 16) against the mean.
+    vec4 kdust = vec4(0.0);
+    if (near) {
+        // (Layer 16 holds the red and blue against the mean as ratios, which interpolate
+        // between cells without the fringes that sums read at another point than the
+        // colour gave; green is what the mean leaves. The specks scatter grey.)
+        vec2 cuv = xo / vec2(pc.grid);
+        kdust = textureLod(cellopt, vec3(cuv, 18.0), 0.0) / max(sty.w, 1e-4);
+        vec2 rb = textureLod(cellopt, vec3(cuv, 16.0), 0.0).zw;
+        float sm = (co.aq.a + co.ot.a + co.ds.a) / max(sty.w, 1e-4);
+        vec3 r3 = vec3(rb.x, max(3.0 - rb.x - rb.y, 0.0), rb.y);
+        g_sr = clamp((r3 * sm + kdust.a) / max(sm + kdust.a, 1e-5), 0.15, 3.0);
+        if (sm + kdust.a <= 1e-5) g_sr = vec3(1.0);
+    }
     // Coefficients of the aqueous liquids here, and their colour as a few cells of it in full
     // light (for rims, droplets and the wet tint).
     vec4 kaq = co.aq / max(sty.z, 1e-4);
@@ -936,7 +994,7 @@ void main() {
     // count those few as spread through each cell they pass and then smooth over 3 x 3, a
     // liquid that absorbs as strongly as blood coloured a band two or three cells wide in
     // their shapes (README, "Look").
-    kaq = mix(kaq, kaq_px, own_aq);
+    kaq = mix(kaq, kaq_px, own_aq) + kdust;
     vec3 base = near ? to_srgb(liquid_lin(kaq, light_in(kaq, 1.5), 3.0, LV_BODY, 1.0, vec3(0.0))) : vec3(0.0);
     if (near) base = iced(base, world, 5.0, co.fz.x, co.fz.x / max(sty.z, 1e-4), zoom);
     // Whether any of the other liquids is within reach of the blur. Where none is, every use
@@ -957,7 +1015,7 @@ void main() {
     float wd_sharp = (a.z + a.w) / max(a.y + a.z + a.w, 1e-4);
     float wd = oil_o < 1e-3 ? 1.0 : den_o < 1e-3 ? 0.0 : wd_sharp;
     vec4 kot = mix(oo.ot / max(oil_o, 1e-4), oo.ds / max(den_o, 1e-4), wd);
-    kot = mix(kot, kot_px, own_ot * (1.0 - mixed_ot));
+    kot = mix(kot, kot_px, own_ot * (1.0 - mixed_ot)) + kdust;
     float fz_ot = mix((oo.fz.y - oo.dn.y) / max(oil_o, 1e-4), oo.dn.y / max(den_o, 1e-4), wd);
     vec3 ob = others ? to_srgb(liquid_lin(kot, light_in(kot, 1.5), 3.0, LV_BODY, 1.0, vec3(0.0))) : vec3(0.0);
     if (others) ob = iced(ob, owld, 6.0, oo.fz.y, fz_ot, zoom);
@@ -965,22 +1023,36 @@ void main() {
     float wo = max(sty.w, 1e-4);
     vec4 opt = co.opt / wo;
     vec4 em = co.em / wo;
-    float opac = opt.x, scat = opt.y, metal = opt.z, gloss = opt.w;
-    float body = sty.x / wo, foam_k = sty.y / wo;
-    float fast = em.w;
+    float opac = opt.x, plate = opt.y, metal = opt.z, gloss = opt.w;
+    float body = sty.x / wo;
     // The effects (optics table `fx`), and how far the liquid has carried their patterns.
     vec4 fxv = co.fx / wo;
-    float glint = fxv.y, irid = FX_PATTERNS ? fxv.z : 0.0, crackle = FX_PATTERNS ? fxv.w : 0.0;
+    float irid = FX_PATTERNS ? fxv.z : 0.0, crackle = FX_PATTERNS ? fxv.w : 0.0;
+    // Cell optics layer 17: the liquid's own light.
+    vec3 lumc = near ? textureLod(cellopt, vec3(xo / vec2(pc.grid), 17.0), 0.0).rgb / wo : vec3(0.0);
     Carry ks = carry(world, false, false), kl = carry(world, true, false);
     // The key light that reaches the liquid here through the liquid above it, and the
     // quenched skin of a melt.
     vec4 l9 = co.l9 / wo;
     vec3 il = clamp(l9.rgb, 0.0, 1.0);
+    // With the light under the surface solved (sss.comp), the light at the liquid is that:
+    // it came in through every face that sees the sky and spread, each colour by how the
+    // liquid absorbs and scatters it.
+    if (pc.sss > 0.0 && near) il = clamp(textureLod(cellopt, vec3(xo / vec2(pc.grid), 20.0), 0.0).rgb, 0.0, 1.0);
+    // The refractive index (layer 17 a).
+    float ior = near && wo > 1e-3 ? textureLod(cellopt, vec3(xo / vec2(pc.grid), 17.0), 0.0).a / wo : 1.33;
+    ior = clamp(ior, 1.0, 2.5);
+    // The look field: the platelets' sheen, unused, their lie (per unit of liquid with platelets there).
+    vec4 lkf = vec4(0.0);
+    if (pc.look > 0.0 && near) {
+        vec4 lr = tint_read(look_map, min(px * pc.accum_scale, pc.accum_max));
+        if (lr.a > 1e-3) lkf = vec4(lr.rgb / lr.a, smoothstep(0.02, 0.25, lr.a));
+    }
     float skin = clamp(l9.a, 0.0, 1.0);
     vec4 glf = glow_here;
 
     if (W > 1e-3) {
-        // Thick liquid is drawn fuller: syrup holds together in fat, rounded shapes.
+        // Thick liquid is drawn fuller: honey holds together in fat, rounded shapes.
         float thick = smoothstep(0.3, 0.9, body) * (1.0 - oil);
         // A lone particle is a droplet (its weight peaks at 1). Against a body of liquid the
         // surface is taken deeper in the field, where several particles overlap: it is then
@@ -1041,7 +1113,7 @@ void main() {
             // What lies behind a clear liquid: the back wall, bent by the surface. (At most
             // 0.7 of a cell: near the edge, where the slope is steep, a larger shift made the
             // wall's joints swim and flicker as the surface moved.)
-            vec2 roff = slope * 0.9;
+            vec2 roff = slope * 0.9 * (ior - 1.0) / 0.33;
             roff *= min(1.0, 0.7 / max(length(roff), 1e-4));
             vec3 bd = backdrop(world + roff, px + vec2(roff.x, -roff.y) * zoom, zoom, glf.rgb, false) * vignette;
             // Thickness along the view: a body is a few cells thick, a droplet, film or sheet
@@ -1067,8 +1139,6 @@ void main() {
             // Ice: the frozen colour, with a crisp edge (`iced`).
             aq = iced(aq, world, 5.0, co.fz.x, co.fz.x / max(sty.z, 1e-4), zoom);
             // Fast, thin liquid that foams is white water: splashes, spray, wave lips.
-            float foam = smoothstep(0.16, 0.5, fast) * (1.0 - smoothstep(0.34, 0.72, T)) * foam_k;
-            aq = mix(aq, mix(vec3(0.86, 0.91, 0.95), vec3(1.0), up), 0.85 * foam);
 
             // -- the others: oil, metals, melts, each by its own coefficients --
             float iw = max(1.1 * px_cells, 0.17);
@@ -1089,8 +1159,15 @@ void main() {
                     // mid reflection, not the direction of a vanishing gradient.
                     float shaped = max(clamp(length(gT) * gw / 0.12, 0.0, 1.0), at_surf);
                     sky = mix(0.5, sky, shaped);
-                    vec3 env = mix(vec3(0.10, 0.11, 0.14), vec3(0.93, 0.95, 0.98), sky * sky);
-                    env += vec3(0.5) * smoothstep(0.93, 0.99, dot(nm, LIGHT));
+                    // A studio around the tank: a dark floor up to a horizon, a graded sky
+                    // above it, a soft box towards the light and a cool strip light behind.
+                    float e_l = dot(nm, LIGHT);
+                    vec3 ground = mix(vec3(0.045, 0.05, 0.065), vec3(0.24, 0.23, 0.24), smoothstep(-1.0, -0.04, nm.y));
+                    vec3 skyc = mix(vec3(0.36, 0.42, 0.56), vec3(0.95, 0.97, 1.0), sky * sky);
+                    vec3 env = mix(ground, skyc, smoothstep(-0.07, 0.05, nm.y));
+                    env = mix(vec3(0.40, 0.42, 0.47), env, shaped);
+                    env += vec3(0.55) * smoothstep(0.90, 0.985, e_l) * shaped;
+                    env += vec3(0.20, 0.24, 0.32) * smoothstep(0.72, 0.92, -e_l) * shaped;
                     vec3 mc = to_srgb(deep_reflectance(kot.rgb, kot.a));
                     oc = mix(oc, mc * env * 1.15, metal);
                 }
@@ -1159,8 +1236,25 @@ void main() {
                 oily = clamp(oily + sp_o - sp_a, 0.0, 1.0);
             }
             vec3 tint_c = mix(base, ob, oily);
-            float clear = (1.0 - smoothstep(0.02, 0.5, opac)) * (1.0 - metal);
-            float translucent = (1.0 - smoothstep(0.75, 0.97, opac)) * (1.0 - smoothstep(0.3, 0.7, scat)) * (1.0 - metal);
+            // How cloudy it is here: what its particles scatter within a few cells.
+            float cloudy = 1.0 - exp(-0.35 * mix(kaq, kot, oily).a);
+            float clear = (1.0 - smoothstep(0.02, 0.5, max(opac, cloudy))) * (1.0 - metal);
+            float translucent = (1.0 - smoothstep(0.75, 0.97, max(opac, cloudy))) * (1.0 - smoothstep(0.3, 0.7, cloudy)) * (1.0 - metal);
+
+            // -- platelets: lined up by the flow (look.comp, the look field) --
+            // Each particle carries the orientation of its platelets (cloud_shape < 1), so the
+            // pattern is the liquid's: it moves and folds as the liquid does, a still body keeps
+            // it until Brownian rotation undoes it. Platelets turned square to the half vector
+            // reflect what they scatter towards the viewer (a silky sheen); on edge they let
+            // the body show, a little darker. `plate` is how much of the liquid's look is
+            // their scattering (material.rs).
+            if (lkf.a > 0.0 && plate > 0.02) {
+                // (H.A.H: a third where the platelets lie every which way; sh 0.5 there.)
+                float sh = clamp((lkf.x - 0.333) * 2.2 + 0.5, 0.0, 1.0);
+                float pk = clamp(plate, 0.0, 1.0) * lkf.a;
+                fc *= 1.0 - 0.40 * pk * (1.0 - sh);
+                fc = mix(fc, lighten(fc, 0.55), 0.9 * pk * sh * sh * mix(0.6, 1.0, il.g));
+            }
 
             // -- the free surface --
             // A clear liquid seen from the side shows its surface as a thin bright line (light
@@ -1171,12 +1265,20 @@ void main() {
             float rim_line = 1.0 - clamp((d - rim_w) * zoom + 0.5, 0.0, 1.0);
             float topside = smoothstep(0.15, 0.6, n.y);
             fc = mix(fc, lighten(tint_c, 0.72), 0.55 * rim_line * topside * clear * (1.0 - thin) * near_surface);
+            // Light that has just come in through the top of a clear liquid: its first cells
+            // are paler (sunlit shallows), over a fine darker line where the surface's own
+            // reflection ends. An opaque liquid has a lit edge and a shaded one instead.
+            float body_k = (1.0 - thin) * near_surface * (1.0 - metal);
+            fc = mix(fc, lighten(tint_c, 0.42), 0.20 * clear * topside * (1.0 - smoothstep(0.0, 2.6, d)) * body_k);
+            fc *= 1.0 - 0.16 * band(d, rim_w, rim_w + max(1.3 * px_cells, 0.16), zoom) * body_k * mix(0.5, 1.0, clear);
+            fc = mix(fc, lighten(fc, 0.30), 0.55 * rim_line * up * (1.0 - clear) * body_k);
+            fc *= 1.0 - 0.25 * rim_line * (1.0 - up) * (1.0 - clear) * body_k;
             // Hot liquid glows from its own temperature: the glow replaces the body's colour
             // as it brightens (a white-hot melt does not show its colour underneath).
             // A droplet glows with its own heat, not the cell's average with the liquid
             // around it (the aqueous liquids are never hot enough to glow): a drop of lava in
             // water glows, a drop of water in lava does not.
-            vec3 glow = mix(em.rgb, co.em.rgb / max(sty.w - sty.z, 1e-4), sp_o) * (1.0 - sp_a);
+            vec3 glow = max(mix(em.rgb, co.em.rgb / max(sty.w - sty.z, 1e-4), sp_o) * (1.0 - sp_a) - lumc, 0.0);
             // Where a melt shares its cells with an oil-like liquid, its glow is where its
             // particles are: the cell's emission over the melt's share of the cell, times its
             // share here.
@@ -1192,6 +1294,8 @@ void main() {
             // surface reflects (at its top and in thin layers), not through the body.
             if (irid > 0.01 && oily > 0.01) {
                 // (Broad swirls that the flow draws out, drifting slowly even on still oil.)
+                // (From the scalar the oil's particles carry, look.comp: its swirls are folded by
+                // the flow and never slide over the oil.)
                 float swirl = carried_noise(world, kl, 0.11, 3.0, 0.03) * 0.7 + carried_noise(world, ks, 0.19, 8.0, 0.05) * 0.3;
                 float tnm = 180.0 + 720.0 * swirl + 160.0 * clamp(d, 0.0, 2.0);
                 vec3 film = vec3(0.0);
@@ -1219,8 +1323,11 @@ void main() {
 
             // Reflection (Fresnel): edges facing up mirror the lit top of the tank, those
             // facing down the dark floor; nearby glow too. Then the light's own highlight.
-            float shine = max(gloss, glint);
-            float fres = 0.04 + 0.96 * pow(1.0 - N.z, 5.0);
+            float shine = gloss;
+            // Fresnel (Schlick) from the refractive index: water reflects 2 % head on, glass 4 %.
+            float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+            float fres = f0 + (1.0 - f0) * pow(1.0 - N.z, 5.0);
+            fres *= 1.0 + 0.5 * (ior - 1.33);
             float sky_up = smoothstep(-0.6, 0.9, N.y / max(length(N.xy), 1e-3));
             vec3 env = mix(vec3(0.04, 0.05, 0.07), vec3(0.62, 0.68, 0.78), sky_up) + 1.2 * glf.rgb;
             fc = mix(fc, env, 0.75 * fres * (1.0 - metal) * (0.35 + 0.65 * shine));
@@ -1231,19 +1338,23 @@ void main() {
             float shin = mix(30.0, 420.0, shine) * zk;
             float nh = max(dot(N, Hh), 0.0);
             float spec = pow(nh, shin) * mix(0.2, 1.15, shine) * mix(0.6, 1.0, zk) * (1.0 - 0.4 * metal);
-            // A liquid that glistens (honey: `glint`) breaks its highlight into a few brighter
-            // points, carried by its flow, and holds a broad soft gloss around it: a viscous
-            // surface is never quite smooth. Only inside the highlight, never over the body.
-            if (FX_PATTERNS && glint > 0.5 && nh > 0.6) {
-                float gf = detail(1.2, zoom);
-                float sp = carried_noise(world, ks, 1.2, 5.0, 0.0);  // (moving with the liquid; still on still honey)
-                float sparkle = smoothstep(0.62, 0.8, sp) * gf;
-                spec *= 1.0 + 2.5 * sparkle * (glint - 0.5) * 2.0;
-                spec += 0.18 * glint * pow(nh, 0.25 * shin) * (1.0 - 0.6 * metal);
-            }
             fc += vec3(1.0, 0.97, 0.92) * spec;
+            // The soft box's broad reflection around the highlight, on a glossy liquid.
+            fc += vec3(0.95, 0.97, 1.0) * 0.10 * shine * pow(nh, 7.0) * near_surface * (1.0 - metal) * (1.0 - thin);
+            // (Glitter is drawn as sprites over the shaded liquid: sprite.vert.)
             // Liquid metal mirrors the glow around it.
             fc += metal * ob * glf.rgb * 1.5;
+
+            // (Bubbles of dissolved gas, foam and spray are particles of their own, drawn as
+            // sprites over the shaded liquid: spray.comp, sprite.vert.)
+
+            // -- ice: fine veins of trapped air and cracks through it, a frosted edge --
+            float ice_k = smoothstep(0.5, 0.62, mix(co.fz.x / max(sty.z, 1e-4), fz_ot, oily)) * (1.0 - metal) * (1.0 - smoothstep(0.02, 0.3, hot_in(em.rgb)));
+            if (ice_k > 0.01) {
+                float vein = 1.0 - carried_seams(world, kl, 0.17, 0.05, zoom, 71.0);
+                fc = mix(fc, lighten(fc, 0.55), 0.30 * vein * ice_k * detail(0.17, zoom));
+                fc = mix(fc, vec3(0.96, 0.98, 1.0), 0.40 * rim_line * ice_k);
+            }
 
             // -- molten rock: the glow churns, and as it cools a crust forms in plates --
             // The crust: where the melt has cooled into its freezing range (a glow of about
@@ -1306,6 +1417,10 @@ void main() {
             }
             float hot = clamp(max(glow.r, max(glow.g, glow.b)), 0.0, 1.0);
             fc = fc * (1.0 - 0.85 * hot) + glow * (1.0 - 0.3 * thin);
+            // The liquid's own light (`luminous`): from within, fuller where the body is
+            // deep, so its surface, bubbles and edges still read against it.
+            float lum_l = max(lumc.r, max(lumc.g, lumc.b));
+            if (lum_l > 1e-3) fc = fc * (1.0 - 0.3 * min(lum_l, 1.0)) + to_srgb(lumc) * (0.30 + 0.38 * smoothstep(0.0, 4.0, d)) * (1.0 - 0.3 * thin);
             // Bubbles of steam (README, "Steam"). The bubbles are part of the body in the sharp
             // field (splat.vert), so the liquid stays whole around them; here the vapour field
             // draws them: crowded bubbles merge into one pocket with a smooth wall. Inside,
@@ -1374,7 +1489,7 @@ void main() {
         vec3 tint = liquid_at(against, mix(base, ob, smoothstep(0.2, 0.6, oil_w)));
         float wet = smoothstep(0.10, 0.42, T);
         // ... and of the liquid that has run off it, until it dries: each liquid in its own
-        // time (water in a moment, oil slowly, syrup hardly at all). The map is read just
+        // time (water in a moment, oil slowly, honey hardly at all). The map is read just
         // outside the surface, bilinearly over the texels that have been wet.
         vec2 mp = against - 0.5;
         ivec2 m0 = ivec2(floor(mp));

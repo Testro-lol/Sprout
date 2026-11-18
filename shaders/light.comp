@@ -31,9 +31,11 @@ const int MAX_STRETCH = 32;    // cells per thread (grids up to 2048 cells tall)
 
 shared vec3 s_sum[64];
 
-// Attenuation per cell of what is in cell q (occupancy-weighted coefficients).
+// Attenuation per cell of what is in cell q (occupancy-weighted coefficients for light,
+// cell_optics.comp layer 19: clear plain liquids such as water attenuate it without colour,
+// their tint being the look of a deep body, not their real absorption).
 vec3 alpha_at(ivec2 q) {
-    vec4 k = imageLoad(raw, ivec3(q, 0)) + imageLoad(raw, ivec3(q, 1)) + imageLoad(raw, ivec3(q, 11));
+    vec4 k = imageLoad(raw, ivec3(q, 19));
     // (optics.glsl: attenuation)
     vec3 a = sqrt(max(k.rgb * (k.rgb + 3.0 * k.a), 0.0));
     // An opaque liquid stops the light within a cell; above a pool it shades as a body of
@@ -66,11 +68,11 @@ void main() {
         ivec2 q = ivec2(x, y);
         vec3 a = alpha_at(q);
         vec4 l10 = imageLoad(raw, ivec3(q, 10));
-        // Neutral: only how much light is left, not its colour. (Coloured, the blue light
-        // under a deep pool turned syrup or blood in it green and black: each liquid's hue
-        // comes from its own absorption along the view, the depth only darkens it.)
-        float tl = dot(tau + 0.5 * a, vec3(0.3, 0.45, 0.25));
-        vec3 il = vec3(exp(-LIGHT_PATH * tl));
+        // Coloured by what it came through: under blood the light is red, under honey amber.
+        // (Until 2026-11-16 neutral: water's blue, which is a look and not its absorption,
+        // turned honey or blood under a deep pool green and black. Clear plain liquids now
+        // take no colour out of the light, layer 19.)
+        vec3 il = exp(-LIGHT_PATH * (tau + 0.5 * a));
         imageStore(raw, ivec3(q, 10), vec4(l10.x, il));
         tau += a;
     }

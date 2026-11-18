@@ -1,13 +1,16 @@
 # Sprout
 
 A fast, interactive 2D multi-fluid sandbox in Rust and Vulkan (via Vulkano). Pour any of
-18 liquids (water, syrup, oil, mud, ink, molten chocolate, sludge, blood, mercury, lava,
-molten glass, milk, slime, ferrofluid, brine, molten wax, oobleck, liquid gallium) or your
-own, heat and cool them, stir them, drop obstacles and magnets in, and watch them splash,
-layer, blend, freeze, set, boil away and settle. The whole simulation runs in compute
+56 liquids, 27 real ones (water, honey, olive oil, mud, ink, molten chocolate, clay slip,
+blood, mercury, lava, molten glass, milk, slime, ferrofluid, brine, candle wax, oobleck,
+gallium, beer, liquid soap, rubbing alcohol, liquid nitrogen, battery acid, lye,
+glow-stick fluid, molten iron, glitter polish) and 29 simple ones that each show one
+property, or your own; heat and cool them, stir them, drop obstacles and magnets in, and
+watch them splash, layer, blend, foam, fizz, react, freeze, set, boil away, evaporate and
+settle. The whole simulation runs in compute
 shaders on the GPU. See [Liquids](#liquids) for the materials and the editor.
 
-![Playground map with the control panel](docs/playground.png)
+![Playground map with the interface](docs/playground.png)
 
 The fluid solver, its tools and maps; see [Look](#look) for how the liquids are drawn,
 [Physics](#physics) and [Validation](#validation) for the solver. The code is laid out so
@@ -27,8 +30,8 @@ You need:
 cargo run --release
 ```
 
-A clean build takes under a minute. The window opens on the Playground map; the panel in
-the corner has everything, and every control also has a key.
+A clean build takes under a minute. The window opens on the Playground map; the dock at
+the bottom has the tools, and `F1` lists every control.
 
 Useful options (run `sprout --help` for all of them):
 
@@ -38,32 +41,111 @@ Useful options (run `sprout --help` for all of them):
 | `--quality low\|medium\|high\|ultra` | Grid of 384x216, 512x288 (default), 768x432 or 1024x576 cells |
 | `--no-vsync` | Uncapped frame rate |
 | `--min-fps <F>` | Lowest frame rate kept at real time before heavy scenes go into slow motion (default 60) |
-| `--set name=value` | Override any parameter, e.g. `--set viscosity_syrup=0.09`, `--set cell_size=0.001` or `--set speed_cap=0` (off); `sprout params` lists them all |
+| `--set name=value` | Override any parameter, e.g. `--set viscosity_honey=0.09`, `--set cell_size=0.001` or `--set speed_cap=0` (off); `sprout params` lists them all |
 | `--frames N` | Run N frames, print frame timings, exit |
 
 ## Controls
 
+![The interface: bars at the top, the liquid palette on the left, the tool dock below the tank](docs/interface.png)
+
+The interface floats around the tank (overhauled 2026-11-16; the old single panel in the
+corner is gone):
+
+- **The dock** at the bottom holds the tools in six groups, one row of groups and under
+  it the tools of the open group. Above it a strip shows the selected tool, its options
+  (sliders, an aim dial, choices) and one line on how to use it.
+- **The palette** down the left edge holds eight liquids as portholes onto a drop of each
+  (keys `1` to `8`). Right-click a slot to put the selected liquid there or to edit it; the
+  shelf icon under it opens the library of every liquid, the pencil the liquid editor.
+- **Top left**: the map (click its name for the list), pause, single step, the time scale
+  (click steps through ¼×, ½×, 1×, 2×), reload, undo and redo.
+- **Top right**: the pulse (the last two seconds of frame times, the frame rate, the
+  particle count; click for the details), clear the liquid, fit the view, the settings
+  drawer (World, Display, Solver; see [Settings](#settings)), the controls page, hide.
+
+While the interface is shown the tank is fitted into the window above the dock, so no tool
+is ever blocked by it; `H` hides everything and the tank glides out to fill the window.
+Everything eases: the selection slides between tools as a leaf, sliders and the dial follow
+with a short glide, tools rise into the dock when a group opens.
+
+### Tools
+
+| Group (key) | Tools |
+|---|---|
+| **Pour** (`Q`) | Pour, Jet (`J`), Spray (`B`), Drop (`C`), Rain |
+| **Move** (`W`) | Grab, Push (`V`), Pull, Whirl, Current (`Z`), Hold |
+| **Edit** (`E`) | Erase, Remove (`X`), Move, Pipette (`I`) |
+| **Build** (`A`) | Circle, Box, Ramp, Bowl, Wall, Draw |
+| **Devices** (`S`) | Faucet, Drain, Pump, Magnet (`M`) |
+| **Heat** (`D`) | Heat (`Y`), Cool (`U`) |
+
+A group's key opens it on the tool it was last left on; pressed again it steps to the next
+tool of the group (with Shift, the one before). The tools used most also have a key of
+their own (in brackets). `Tab` swaps back to the tool before.
+
 | Input | Action |
 |---|---|
 | Left mouse | Use the selected tool |
-| Right mouse | Grab / stir, whatever tool is selected |
-| Middle drag, wheel | Pan, zoom about the cursor (with Jet or Current selected the wheel aims; Alt + wheel zooms) |
-| Shift + wheel, `[` `]` | Brush size |
-| `-` `=` | Flow of the liquid tools, or strength of Grab / Push / Current |
-| `1` `2` `3` `4` | Favourite liquids (water, oil, syrup, lava); the *Liquids…* button opens the picker, *Edit* the editor |
-| `Q` `B` `J` `C` | Pour, spray, jet, drop |
-| `W` `V` `Z` `E` | Grab / stir, push, current, erase |
-| `Y` `U` `M` | Heat, cool (brushes), place a magnet (`X` removes it) |
-| `A` `S` `D` `X` | Place a circle, box, ramp; remove a solid |
-| `T` `G` `F` | Turn the jet, the current or the box / ramp by 15°, flip the ramp |
-| `Space` `N` `R` | Pause, single step, reset the map |
+| Right mouse | Grab / stir, whatever tool is selected; during a drag, back out of it |
+| Middle drag | Pan |
+| Wheel | Zoom about the cursor, always |
+| Shift + wheel, `[` `]` | Brush size (thickness, for Wall and Draw) |
+| Ctrl + wheel, `T` `G` | Aim or turn by 15° (jet, current, faucet, pump, magnet, box, ramp, bowl) |
+| Alt + wheel, `-` `=` | Flow, strength, speed or field of the selected tool |
+| Alt + click | Pipette with any tool |
+| `F` | Flip the ramp, reverse the whirl |
+| `Delete` | Remove the solid or device under the cursor, with any tool |
+| Ctrl + `Z`, Ctrl + Shift + `Z` | Undo, redo (solids and devices; never the liquid) |
+| `1` … `8`, `L` | Liquids of the palette; the library |
+| `Space` `N` `R` | Pause, single step, reload the map; Shift + `R` clears the liquid and keeps the rest |
 | `PgUp` `PgDn` | Previous / next map |
-| `Home` `H` `F11` `Esc` | Reset view, hide panel, fullscreen, quit |
+| `Home` `H` `F1` `F11` | Fit the view, hide the interface, the controls page, fullscreen |
+| `Esc`, Ctrl + `Q` | Back out of a drag or close the topmost window; quit |
 
-Below the tools the panel has three collapsed sections (see [Settings](#settings)):
-**Physics** (gravity, the cell size, and per liquid its density, viscosity, tension and
-contact angle), **Display** (quality, time scale, wet edge width and tint, vsync) and **Solver** (CFL number, speed
-cap, tolerances, and the current substep and iteration counts).
+Changed from before the overhaul: the wheel no longer changes meaning with the tool (it
+aimed the jet and the current; that is Ctrl + wheel now); `S` and `D` open groups (Box and
+Ramp are in Build); `Esc` no longer quits; solids are placed when the button comes up.
+
+**Placing by dragging.** A click places a solid at the brush size and the set angle. Press
+and drag instead and it is pulled out from where the button went down: the distance is its
+size, and for a ramp the direction is its angle (a label shows the size in cm as you go). A
+box is spanned like a selection instead: the corner where the button went down stays put and
+the opposite corner follows the cursor, upright (or in the box's set turn); Shift makes it a
+square. A wall runs from press to release; Shift snaps angles to 15°. A faucet, a pump or a
+magnet dragged the same way points along the drag. The right button or `Esc` backs out.
+
+New tools (2026-11-16):
+
+- **Rain** drops sparse droplets (30 % of the flow, at 200 cells/s ± 20 %) from a cloud
+  three brush radii to either side of the cursor.
+- **Pull** is Push reversed: liquid under the brush is drawn in at 220 cells/s. **Whirl**
+  turns it around the cursor (200 cells/s outside 0.4 of the radius, like a rigid body
+  inside, with a slight pull inwards); `F` or the ↺ ↻ choice reverses it. **Hold** brings
+  it to rest and keeps it there against gravity. All three share the strength of Grab and
+  Push, and their guard against packing a cell (`tool_crowd_max`).
+- **Pipette** picks the liquid nearest the click as the one to pour and reports its
+  temperature and speed (it reads the particles back once: up to 34 ms at Ultra).
+- **Move** drags a solid or a device. A solid has no velocity: it is rasterised anew where
+  it is, at most 60 times a second and for at most half the time (rasterising costs 10 ms
+  at 512 × 288 and 47 ms at 1024 × 576), while its outline follows the cursor at once. Moved
+  slowly (under half its thickness per update, about 50 cells/s for a bowl at Medium) it
+  carries the liquid resting in it; moved fast it passes through the liquid.
+- **Bowl** is the lower half of a ring (tip it half a turn for a dome); **Wall** a straight
+  wall with round ends; **Draw** a freehand line of such walls, one undo step per stroke.
+- Solids can be **Plain**, **Hot** (40 to 1400 °C) or **Cold** (−150 to 15 °C): the last
+  two are held at their temperature for good and heat or chill the liquid touching them
+  (what the maps' hot plates are); their outline glows warm or cold.
+- **Faucet** is a source that keeps pouring the liquid it was placed with, at the flow and
+  aim it was placed with, while time runs (up to 6; each costs the 0.3 ms read-back of the
+  cells around its spout per frame). It has no nozzle holding its liquid at the launch
+  velocity (there is one tool force per substep, the brush's): aimed sideways its stream
+  bends inside the spout and it delivers a few per cent less than its flow.
+- **Drain** removes the liquid that reaches it: each particle inside leaves with
+  probability 40 /s × rate (highest at the centre) per second.
+- **Pump** is a Current that stays where it is placed (the placed zones the simulation
+  always had; pumps and drains share 15 of its 16 zones, the held Current takes the last).
+
+Remove (or `Delete`) takes any of them away; everything placed can be undone.
 
 The liquid tools add the selected liquid; all of them stop with the simulation while it is
 paused (single steps still emit), except Drop.
@@ -98,8 +180,8 @@ both are kept in cells and particles internally, and the hover text gives those 
   from 0.5 to 8 times that and starting at 2, separately from the Grab / Push strength; at
   up to 20 /s in the centre, fading to nothing at the rim) and leaves everything else
   alone: liquid that is already faster is not braked, motion across the current is
-  untouched, and no liquid is added or removed. Aim it with `T` / `G`, the wheel or the
-  Aim slider; chevrons show where it points and how fast while it is held. Near the top of
+  untouched, and no liquid is added or removed. Aim it with `T` / `G`, Ctrl + wheel or the
+  Aim dial; chevrons show where it points and how fast while it is held. Near the top of
   the range the particle speed cap (`speed_cap`, about 750 cells/s in a 288 cell tall tank)
   binds before the current's own speed does. The constants are `CURRENT_SPEED`,
   `CURRENT_RATE` and `CURRENT_STRENGTH` in `src/sim/params.rs`. (Until 2026-11-11 a click
@@ -115,24 +197,24 @@ counted on the GPU (`count.comp`) for just the window around the
 brush, and only those counts are read back: 0.3 ms per frame at 512 × 288 and 0.4 ms at
 1024 × 576, where reading back every particle cost 1.7 and 34 ms.
 
-Strokes stop at the panel, outside the window, and when the window loses focus. The camera
+Strokes stop at the panels, outside the window, and when the window loses focus. The camera
 eases zoom about the cursor (the point under it stays put), pans one to one, and glides
 back on Home. The brush cursor takes the tool's colour (the liquid's for liquid tools),
 tightens while held and eases to a new size or jet aim; placing or removing a solid and
-dropping a blob ring out briefly, and changes of tool, liquid, map or quality are announced
-in a short toast.
+dropping a blob ring out briefly, and changes of map or quality (and, with the interface
+hidden, of tool or liquid) are announced in a short toast under the top bars.
 
 ## Maps
 
 | # | Name | What it shows |
 |---|---|---|
-| 0 | Playground | A pool, a few obstacles, and oil and syrup about to fall in |
+| 0 | Playground | A pool, a few obstacles, and oil and honey about to fall in |
 | 1 | Dam Break | A tall column of water collapses across the floor and over a step |
-| 2 | Upside Down | Syrup over water over oil: the layers overturn into their stable order |
-| 3 | Three Columns | Oil, water and syrup side by side: syrup slides under, oil rides over |
+| 2 | Upside Down | Honey over water over oil: the layers overturn into their stable order |
+| 3 | Three Columns | Oil, water and honey side by side: honey slides under, oil rides over |
 | 4 | Cascade | Three reservoirs drain down a zig-zag of ramps into a shared basin |
 | 5 | Empty Tank | Nothing but walls |
-| 6 | Terrace Falls | Stepped spill pools and a slow syrup tributary feed a plunge pool |
+| 6 | Terrace Falls | Stepped spill pools and a slow honey tributary feed a plunge pool |
 | 7 | Pinball Garden | Three fluid showers weave through staggered pegs into scalloped pools |
 | 8 | Hourglass | A layered reservoir drains through a narrow throat onto a splitting crown |
 | 9 | Twin Spillways | Opposing torrents collide and flow around a central island |
@@ -142,13 +224,13 @@ in a short toast.
 | 13 | Lava Meets Water | Lava at 1200 °C runs into a pool and spreads under the water as a molten sheet; water that boils on it turns to steam; the lava crusts and sets over minutes |
 | 14 | Density Tower | Mercury, water, oil and molten wax sort themselves by density (13.5 : 1), in a tower kept at 70 °C so the wax stays molten |
 | 15 | Glass and Slime | Glass droops in strands and sets as it cools; slime stretches over a peg and springs back |
-| 16 | Mud Flats | Mud slumps and settles out, sludge holds its shape, oobleck takes a falling ball of mercury |
+| 16 | Mud Flats | Mud slumps and settles out, clay holds its shape, oobleck takes a falling ball of mercury |
 | 17 | Ferrofluid | 1 mm cells: a dish of ferrofluid over a magnet heaps up and spikes |
 | 18 | Kitchen | Chocolate sets on a cold plate; milk, ink and blood sink through water in plumes |
 | 19 | Cold Snap | Air at −15 °C: water freezes over, brine does not; wax on a hot plate stays molten |
 | 20 | Gallium | 1 mm cells: gallium's oxide skin holds lumpy shapes |
 
-Maps are written in resolution-independent units in [src/maps.rs](src/maps.rs); the six detailed maps reuse the existing stone shapes and water, oil and syrup materials.
+Maps are written in resolution-independent units in [src/maps.rs](src/maps.rs); the six detailed maps reuse the existing stone shapes and water, oil and honey materials.
 Try `cargo run --release -- --map canopy`, or use the map menu / PgUp and PgDn.
 
 The six new maps in motion (0.8 simulated seconds, low quality grid):
@@ -196,7 +278,7 @@ the air for SETTLE seconds and prints its mean temperature and the heat it has g
 (evaporation, Heat). `LAB_LAVA_STEAM=1` pours lava into a pool of water at 20 °C and
 prints the steam (how many bubbles, how many lie against the lava, how high the highest
 rises), the water's temperature in five bands from floor to surface and the lava's.
-`LAB_LAVA_JITTER=1` lets a pool of lava (`LAB_JITTER_MAT=water` or `syrup`) settle under oil
+`LAB_LAVA_JITTER=1` lets a pool of lava (`LAB_JITTER_MAT=water` or `honey`) settle under oil
 (`LAB_BARE=1`: under air; `LAB_FULL=1`: wall to wall, at rest from the start; `LAB_NOHEAT=1`:
 isothermal) for `LAB_SETTLE` seconds, then prints the velocity deep inside it frame by frame
 for 2 s: its mean, how much it varies and turns back; `LAB_MAP=1` a map of it in blocks,
@@ -222,8 +304,8 @@ Defaults are unchanged from before this overhaul.
 
 | Group | Where | Parameters |
 |---|---|---|
-| World | Physics panel | `gravity` (m/s²), `cell_size` (m; the panel shows mm and the tank size) |
-| Liquids | the liquid editor (per liquid); pair tensions and heat in the Physics panel | every material property as `<property>_<liquid>` or `<liquid>.<property>` (see [Liquids](#liquids); old names such as `density_oil`, `nu_syrup` still work), the six `tension_<group>_<group>` pair tensions, `droplet_cells`; heat: `ambient_temp`, `heat_rate`, `air_cooling`, `contact_heat`, `eddy_heat`, `evaporation`, `heat_power`, `rigid_viscosity`; magnets: `magnet_demag`; steam: `steam` (on/off, in the panel), `steam_boil`, `steam_condense`, `steam_mixing`, `steam_rise`, `steam_life`, `steam_swirl`, `steam_eddy` |
+| World | Settings drawer, World | `gravity` (m/s²), `cell_size` (m; the panel shows mm and the tank size) |
+| Liquids | the liquid editor (per liquid); pair tensions and heat in the Physics panel | every material property as `<property>_<liquid>` or `<liquid>.<property>` (see [Liquids](#liquids); old names such as `density_oil`, `nu_honey` still work), the six `tension_<group>_<group>` pair tensions, `droplet_cells`; heat: `ambient_temp`, `heat_rate`, `air_cooling`, `contact_heat`, `eddy_heat`, `evaporation`, `heat_power`, `rigid_viscosity`; magnets: `magnet_demag`; steam: `steam` (on/off, in the panel), `steam_boil`, `steam_condense`, `steam_mixing`, `steam_rise`, `steam_life`, `steam_swirl`, `steam_eddy` |
 | Time step and accuracy | `cfl`, `pressure_tol`, `viscosity_tol` in the Solver panel; the rest `--set` only | `cfl`, `advection_order`, `dt_max`, `fixed_hz`, `pressure_tol`, `pressure_max_iters`, `iters_margin`, `correction_tol`, `viscosity_tol`, `viscosity_max_iters`, `implicit_viscosity_min`, `viscous_projection`, `viscous_warm`, `viscosity_warm`, `viscosity_precond`, `viscosity_mg_levels`, `viscosity_mg_sweeps` |
 | Stabilisation | `speed_cap` in the Solver panel (with an off box); the rest `--set` only | see [Numerical stabilisation](#physics) |
 
@@ -268,39 +350,126 @@ residual reached 0.11.
 
 ## Liquids
 
-### The 18 liquids
+### The liquids
 
-Values at their reference temperature; every one is a field of the definition in
-[src/sim/material.rs](src/sim/material.rs), with its source next to it, and editable (see
-below). "Sandbox" marks a choice made for the look or the pace of the sandbox, not a
-measurement.
+The table every tank starts with was rebuilt on 2026-11-16: the 18 presets were removed and
+replaced by three sets, all in [src/sim/presets.rs](src/sim/presets.rs). (Wet sand was
+removed again the same day: sand is to come as a solid of its own. Liquid files that use it
+as a base load it as mud.)
+
+- **27 real liquids**: liquids one meets, with measured values where there are any, each
+  with its source next to it in the code.
+- **29 simple liquids**: the neutral liquid (as dense and thin as water, clear, never
+  freezes or boils: `MatProps::default()`) with one to five properties changed, its colour
+  among them. No two change the same set of properties (a unit test checks both rules), so
+  each shows what one property, or one small combination, does.
+- **3 by-products** the picker does not offer: salt (left by boiling brine), steam (made by
+  boiling water) and resin (what Part A and Part B set into).
+
+"Sandbox" marks a choice made for the look or the pace of the sandbox, not a measurement.
+Values are at each liquid's reference temperature.
+
+**Real liquids**
 
 | Liquid | Group | Density (kg/m³) | Viscosity | Other | Source |
 |---|---|---|---|---|---|
-| Water | aqueous | 998 | 1.0 mPa s, VFT in T | freezes 0 °C (334 kJ/kg, ice 917), boils 100 °C | standard data; IAPWS-fit VFT |
-| Syrup | aqueous, in water | 1397 | 84 mPa s, Arrhenius B = 10 500 K | mixes with water (1.5 /s) | sandbox (honey-like) |
-| Oil | oil-like | 898 | 54 mPa s, Arrhenius B = 3900 K | freezes −8 … −4 °C | olive oil |
+| Water | aqueous | 998 | 1.0 mPa s, VFT in T | freezes 0 °C (334 kJ/kg, ice 917), boils 100 °C; white water lasts 0.6 s | standard data; IAPWS-fit VFT |
+| Honey | aqueous, in water | 1397 | 84 mPa s, Arrhenius B = 10 500 K | mixes with water (1.5 /s); glistens | sandbox (honey-like) |
+| Olive oil | oil-like | 898 | 54 mPa s, Arrhenius B = 3900 K | freezes −8 … −4 °C; thin-film colours | olive oil |
 | Mud | aqueous, in water | 1500 fresh (silt paste 2000 at 0.5) | Carreau n = 0.6 | 50 µm grains settle ~1 mm/s | Coussot 1997 range; sandbox grain |
-| Ink | aqueous, in water | 1050 | 2 mPa s | plumes (mixing 0.25 /s) | India ink density; sandbox mixing |
-| Molten chocolate | oil-like | 1250 (solid 1290) | Bingham 6 Pa s, τy 10 Pa at 45 °C, Arrhenius | sets 27–32 °C, 45 kJ/kg | Afoakwa 2007; cocoa butter form V |
-| Sludge | aqueous, in water | 1450 | Herschel–Bulkley τy 60 Pa, n 0.5 | dilution collapses it (exponent 2) | Eshtiaghi 2013 range |
-| Blood | aqueous, in water | 1060 | Carreau μ0 56, μ∞ 3.45 mPa s, λ 3.313 s, n 0.357 | | Cho & Kensey 1991 |
+| Ink | aqueous, in water | 1050 | 2 mPa s | plumes (mixing 0.25 /s), stains | India ink density; sandbox mixing |
+| Molten chocolate | oil-like | 1250 (solid 1290) | Bingham 6 Pa s, τy 10 Pa at 45 °C, Arrhenius | sets 27–32 °C, 45 kJ/kg; faint marbling | Afoakwa 2007; cocoa butter form V |
+| Clay slip | aqueous, in water | 1450 | Herschel–Bulkley τy 60 Pa, n 0.5 | dilution collapses it (exponent 2) | Eshtiaghi 2013 range |
+| Blood | aqueous, in water | 1060 | Carreau μ0 56, μ∞ 3.45 mPa s, λ 3.313 s, n 0.357 | stains and runs | Cho & Kensey 1991 |
 | Mercury | metal | 13 534 | 1.53 mPa s | 0.485 N/m, 140°, freezes −38.8 °C, boils 357 °C | CRC Handbook |
-| Lava | silicate | 2700 (solid 2900) | 135 Pa s at 1200 °C, Arrhenius B = 56 000 K | crystallises 1000–1150 °C, ε 0.95 | Giordano 2008, Harris 2013 |
+| Lava | silicate | 2700 (solid 2900) | 135 Pa s at 1200 °C, Arrhenius B = 56 000 K | crystallises 1000–1150 °C, ε 0.95; crust | Giordano 2008, Harris 2013 |
 | Molten glass | silicate | 2450 | VFT B = 10 406 K, C = 536 K (650 Pa s at 1100 °C) | sets by viscosity, no latent heat | soda-lime (Lakatos-type fit) |
-| Milk | aqueous, in water | 1030 | 2 mPa s | opaque by scattering; creaming (hours) left out | Fox & McSweeney |
-| Slime | aqueous | 1030 | 10 Pa s solvent | Maxwell G = 100 Pa, λ = 1 s | Cassagnau; solvent as thick as white PVA glue (sandbox choice) |
-| Ferrofluid | oil-like | 1210 | 6 mPa s | χ = 2.64, μ0Ms = 44 mT | Ferrotec EFH1 datasheet |
+| Milk | aqueous, in water | 1030 | 2 mPa s | white by scattering; froth lasts 4 s | Fox & McSweeney |
+| Slime | aqueous | 1030 | 10 Pa s solvent | Maxwell G = 100 Pa, λ = 1 s | Cassagnau; solvent as thick as white PVA glue (sandbox) |
+| Ferrofluid | oil-like | 1210 | 6 mPa s | χ = 2.64, μ0Ms = 44 mT; spikes | Ferrotec EFH1 datasheet |
 | Brine | aqueous, in water | 1200 saturated | 1.9 mPa s | freezing point −21 K × s; boiling leaves salt (14 % by volume) | CRC |
-| Molten wax | oil-like | 780 (solid 900) | 3.8 mPa s at 70 °C | melts 52–62 °C, 200 kJ/kg | paraffin, Sharma 2009 |
+| Candle wax | oil-like | 780 (solid 900) | 3.8 mPa s at 70 °C | melts 52–62 °C, 200 kJ/kg | paraffin, Sharma 2009 |
 | Oobleck | aqueous, in water | 1550 | 3 Pa s at rest, thickening (1 + (0.5 γ̇)²), jams above ~45 /s | starch grains settle | sandbox fit to Fall 2008, Brown & Jaeger 2014 |
-| Liquid gallium | metal | 6095 (solid 5904: expands) | 1.98 mPa s | melts 29.8 °C, 0.708 N/m, oxide skin 0.5 N/m | CRC; Dickey et al. 2008 |
+| Gallium | metal | 6095 (solid 5904: expands) | 1.98 mPa s | melts 29.8 °C, 0.708 N/m, oxide skin 0.5 N/m | CRC; Dickey et al. 2008 |
+| Beer | aqueous, in water | 1010 | 1.6 mPa s | **fizz** 0.6; **froth** 40 s (a head) | Bamforth 2004; foam half-life 20–60 s (Rudin, NIBEM) |
+| Liquid soap | aqueous, in water | 1030 | 3 Pa s at rest, Carreau n = 0.6 | 0.028 N/m, wets (30°); 0.3 % glycol distearate platelets (10 µm, 1:20) that show the flow; lather lasts 90 s | wormlike-micelle surfactant solutions; sandbox numbers |
+| Rubbing alcohol | aqueous, in water | 870 | 2.4 mPa s | 0.024 N/m, wets (20°), boils 80 °C; **volatility** 0.03 /s | CRC (70 % isopropanol); sandbox rate |
+| Liquid nitrogen | oil-like (non-polar) | 807 | 0.16 mPa s | poured at −196 °C, its boiling point (199 kJ/kg): boils away in a **fume** | NIST |
+| Battery acid | aqueous, in water | 1260 | 2.8 mPa s | **reacts** with lye → brine, 180 kJ/kg | CRC (35 % H2SO4); neutralisation 57 kJ/mol; sandbox colour |
+| Lye | aqueous, in water | 1330 | 13 mPa s | **reacts** with battery acid → brine, 180 kJ/kg | CRC (30 % NaOH); sandbox colour |
+| Glow-stick fluid | oil-like | 1080 | 13 mPa s | **luminous** (chemical light, green) | phthalate ester carrier |
+| Molten iron | metal | 7000 (solid 7300) | 6 mPa s | poured at 1620 °C, freezes 1538 °C (247 kJ/kg), ε 0.35; tension 0.75 N/m (real 1.8: the top of the solver's range) | Iida & Guthrie |
+| Glitter polish | oil-like | 1050 | 0.4 Pa s | 0.3 µm pigment (3 %), 0.4 mm aluminised flakes (0.4 %); stains | nitrocellulose lacquer; sandbox numbers |
 
-Salt (2165 kg/m³) is a nineteenth row, only ever left behind by boiling brine; steam
-(0.6 kg/m³) a twentieth, only ever made by boiling (Heat, "Steam"). All values of the liquids
-lie inside the parameter ranges (`sprout params`). Interfacial tensions between phase
-groups are their own table (`tension_oil_water`, `tension_metal_water` 0.375 N/m (CRC),
-`tension_metal_oil` 0.36, the melts' sandbox 0.2–0.4).
+**Simple liquids** (the neutral liquid plus the listed changes; every one also has its own
+colour, which counts as one of its changes)
+
+| Liquid | Changes | What it shows |
+|---|---|---|
+| Blank | none | the neutral liquid itself |
+| Thick | viscosity 20 Pa s | folding, coiling, slumping |
+| Heavy | density 5000, opacity | sinks through everything but metal |
+| Light | density 450, oil-like group | floats on everything |
+| Beady | tension 0.4 N/m, contact angle 150° | pulls itself into beads |
+| Creeper | contact angle 15° | spreads over solids, climbs corners |
+| Putty | shear modulus 150 Pa, relaxation 2 s, viscosity | bounces and strings, then flows |
+| Paste | Bingham, yield stress 40 Pa, viscosity, opacity | holds its shape until pushed |
+| Thinner | power law n = 0.4, consistency | thick at rest, runny where stirred |
+| Jammer | thickening n = 3, viscosity, ratio 2000 | runny at rest, solid where hit |
+| Magnetic | susceptibility 3, cloud 5 %, particle colour | magnets pull it and raise spikes |
+| Glowing | luminous 1.2, glow colour | light of its own |
+| Fizzy | fizz 1, foam, froth 3 s | bubble streams, a short-lived foam |
+| Sudsy | foam, froth 60 s, tension 0.03 | lather that lasts a minute |
+| Vanishing | volatility 0.15 /s, fume | evaporates in a mist |
+| Grainy | friction 0.6, viscosity, cloud 55 %, particle colour | pours like a liquid, piles like sand |
+| Warming | self-heat 400 W/kg | warms itself 0.1 K a second |
+| Setting | melts 28–32 °C, latent 60 kJ/kg, poured at 60 °C | sets solid as it cools |
+| Mirror | metal, opacity, gloss | a mirror surface |
+| Pearly | opacity, cloud 0.2 % of 15 µm platelets (1:20) | rheoscopic: silky bands that follow the flow |
+| Glitter | 0.06 % mirror flakes 1 mm across (1:20, reflectance 0.9) | flakes that tumble, flash and settle into a glinting layer |
+| Snow globe | viscosity 20 mPa s, 0.2 % white grains 1.5 mm | a shake lifts a flurry that settles over many seconds |
+| Mood | hot colour, 22–45 °C, opacity | blue when cool, pink when warm (Heat brush) |
+| Dye | dissolves in water, mixing 0.5 /s, opacity | colours water; as water dries off a film of it, the dye stays |
+| Silt | dissolves in water, density 2200, grain 0.1 mm, load 0.4 | clouds water, then settles |
+| Part A | reacts with Part B → Resin, 2 /s, 60 kJ/kg | two-part resin: sets on contact |
+| Part B | reacts with Part A → Resin, 2 /s | the other half |
+| Ember | poured at 1100 °C, freezes 850–1000 °C | glows, crusts and cracks as it cools (a melt: its crust follows) |
+| Sheen | oil-like group, tension 0.03 N/m, index 1.47 | spreads on water: thin-film colours |
+
+All values lie inside the parameter ranges (`sprout params`); three ranges were widened for
+the new liquids (boiling point and pour temperature down to −270 °C, temperatures up to
+1700 °C). The table holds 96 rows (64 before), so 36 are left for your own liquids.
+Interfacial tensions between phase groups are their own table (`tension_oil_water`,
+`tension_metal_water` 0.375 N/m (CRC), `tension_metal_oil` 0.36, the melts' sandbox 0.2–0.4).
+Liquid files saved before the overhaul still load: `builtin.syrup` and `builtin.sludge` are
+read as honey and clay slip, `builtin.marbled` (removed 2026-11-17) as the snow globe.
+
+### New properties
+
+Before the overhaul a liquid had: a phase group and a diluent; density; viscosity with four
+rheologies and two temperature laws; surface tension and contact angle; mixing rate, grain
+size and load; heat capacity, conductivity, expansion, a melting range with latent heat,
+emissivity, a boiling point with latent heat and residue; elasticity; magnetism; an oxide
+skin; and the look: colour, frozen colour, opacity, scatter, metal, gloss, body, foam,
+drying time, stain, glint, iridescence, crackle. The overhaul adds thirteen:
+
+| Property | Kind | What it does | Where |
+|---|---|---|---|
+| `friction` | physics | Granular liquid: a yield stress of `friction` × pressure (Mohr–Coulomb, no cohesion), so it holds a slope up to its friction angle and piles up. A concentrate's scales with its concentration cubed: watered-down sand flows. Uses the last projection's pressure; submerged sand is held by the total pressure, not the effective one (it is a little too strong under water). | `nn_eval` in common.glsl, with the yield machinery of the rheology |
+| `react_with`, `react_into`, `react_rate`, `react_heat` | physics | A reaction: a particle whose cell also holds its partner (more than 2 % of the cell) turns into the product with probability rate × dt and warms by its heat of reaction. Both partners carry the reaction, so both are used up. A product that is a concentrate keeps the particle's dilution. Not stoichiometric: each side converts at its own rate while the other is present. | particles.comp; per-cell presence bits from grid_prep.comp |
+| `self_heat` | physics | Heat made inside the liquid, W/kg, counted in the heat ledger (new entry "made"). | particles.comp |
+| `volatility` | physics | Evaporation below the boiling point: liquid in a cell open to the air leaves with probability rate × dt, doubling every 10 K; a concentrate's by its concentration. The heat it carried leaves with it; the cooling of what stays behind is not modelled. | particles.comp |
+| `fume` | physics + look | What evaporates or boils away leaves a puff of mist in the air (the steam's puffs and smoke field), `fume` times a steam puff's vapour. | particles.comp, smoke.comp |
+| `froth` | look | Seconds the foam on the liquid lasts (a parcel alone at the surface bursts sooner). | spray.comp |
+| `fizz` | look | Dissolved gas: bubbles form in the liquid, five times as often where it touches a solid, grow as they rise and feed its foam. They are particles of their own (below); the liquid never goes flat. | spray.comp |
+| `luminous`, `glow_color`, `glow_shear` | look | Light of its own at any temperature, which also blooms and lights the tank as hot liquid does; `glow_shear` is the share given only where the liquid moves (above ~2 cells/s). | cell_optics.comp, composite.frag |
+| `color_hot`, `thermo_lo`, `thermo_hi` | look | Thermochromic: the absorption blends from that of `color` to that of `color_hot` between the two temperatures (the phase group's own temperature in the cell). | cell_optics.comp |
+| ~~`pearl`, `sparkle`, `marble`, `color_marble`~~ | look | Removed on 2026-11-17 with `scatter`, `body`, `glint` and `flake_size`: replaced by the physical description of the particles in a liquid ([Particles in the liquid](#particles-in-the-liquid-2026-11-17)). Platelets and flakes now follow from a particle's size and shape, not from a strength knob; the marble is gone (pour two liquids). | |
+| (`foam`) | look | Kept, with a new meaning: whether the bubbles that reach its surface stay there as foam, and the white water of a splash (`froth` is how long that lasts). Any liquid traps air where it is churned. | spray.comp |
+| `ior` (2026-11-16, second round) | look | Refractive index: Fresnel reflection (Schlick, 2 % head-on for water, 4 % for glass) and how far the surface bends what is seen through it. | composite.frag |
+
+Each is a field of `MatProps` with a neutral default (0, or "none"), listed by `sprout
+params`, editable in the liquid editor (three new groups) and saved in the liquids file.
 
 ### Materials as data
 
@@ -319,7 +488,7 @@ a side buffer that exists only while an elastic material is in the tank. Shaders
 property up in the GPU material table (`GpuMat`) each substep, so editing a liquid moves
 every particle of it at once. Each property is a `--set` key, `<property>_<liquid>` or
 `<liquid>.<property>` (`density_mercury`, `lava.temp_b`, `mat21.viscosity` for a custom
-row); every old name (`density_oil`, `nu_syrup`, …) still works.
+row); every old name (`density_oil`, `nu_honey`, …) still works.
 
 **Phase groups** replace the old water/oil kind: aqueous, oil-like, liquid metal, silicate
 melt. Liquids of different groups keep an interface (the ghost-fluid pressure jump and the
@@ -328,7 +497,7 @@ one group share cells without one.
 
 **Mixing rules**, so a custom liquid's interactions are predictable:
 
-- A concentrate (a liquid with a diluent, e.g. syrup in water) blends with it through the
+- A concentrate (a liquid with a diluent, e.g. honey in water) blends with it through the
   concentration `s`: every particle relaxes towards the local mean of its family at the
   material's mixing rate, with scatter and gather weights equal, so each component is
   conserved to round-off (checked: < 0.001 %). A particle carries one concentrate; pure
@@ -337,15 +506,15 @@ one group share cells without one.
   linearly with `s` (`freeze_shift`), colour follows opacity (a pigment colours clear water
   more than its share) unless the material gives a mid-blend colour.
 - Across groups, dynamic viscosities average by volume and nothing exchanges.
-- Exceptions are table entries (`MIX_OVERRIDES`), never code: sludge and oobleck blend their
+- Exceptions are table entries (`MIX_OVERRIDES`), never code: clay and oobleck blend their
   viscosity with `s²` and `s³`.
 
 ### Picker, editor and the liquids file
 
-The panel's *Liquids…* opens a searchable picker grouped by category (Everyday, Earth,
-Kitchen, Body, Metal, Hot, Strange, My liquids); every swatch is a small drop rendered by
-the real renderer (read back once when its look changes). Number keys 1–4 hold favourites.
-*Edit* opens the editor: colour, thickness, density, temperature and opacity first; the rest
+The shelf icon under the palette (or `L`) opens a searchable library grouped by category
+(Everyday, Earth, Kitchen, Body, Metal, Hot, Strange, My liquids); every swatch is a small
+drop rendered by the real renderer (read back once when its look changes). Number keys 1–8
+pick the palette's liquids. The pencil opens the editor: colour, thickness, density, temperature and opacity first; the rest
 (rheology, surface, heat and freezing, mixing and suspension, elastic and magnetic, look,
 phase) behind disclosure, with the parameter table's units and ranges.
 
@@ -608,7 +777,7 @@ plume hid the tank behind it like smoke), and none over solids or past the tank'
 
 Other liquids (mercury at 357 °C, lava at 2400 °C) still leave at once at x = 1, and so does
 everything with `steam=0`. Steam remembers the liquid it boiled from and its concentration
-(syrup, brine, milk: bits 8 – 15 of the particle's kind, `KIND_SRC`, and `s`) and condenses
+(honey, brine, milk: bits 8 – 15 of the particle's kind, `KIND_SRC`, and `s`) and condenses
 back into it, so a solution does not lose what it has dissolved to bubbles that never leave;
 what it had dissolved is left behind only when the vapour escapes (brine leaves one salt
 particle per `residue_share` of concentrate, as before; leaving it whenever brine turned to
@@ -672,7 +841,7 @@ viscosity: period +2.9 → +6.8 %, decay −8.9 → −5.1 %.
 ![Before and after: slime dropped into a cup](docs/look/steam-slime/slime_drop.jpg)
 ![Before and after: Glass and Slime at 1 s](docs/look/steam-slime/slime_peg.jpg)
 
-**Suspensions** (mud, sludge, oobleck) settle by the same drag law as the oil droplets
+**Suspensions** (mud, clay, oobleck) settle by the same drag law as the oil droplets
 (`C_d = 24/Re + 0.44` at the grain diameter, in the diluent) as a flux of concentration
 between vertically adjacent cells, the hindered (Kynch) flux `s(1 − s)v_t`, shared out to
 particles by room and content so the concentrate is conserved exactly. Moving particles
@@ -745,29 +914,30 @@ with them.
 ![Before and after: three liquids meeting](docs/look/playground.jpg)
 
 **Light and colour from absorption** (2026-11-14, third round; reported: steam too opaque,
-syrup and water turning purple, a stylised texture on every liquid, a look still too
+honey and water turning purple, a stylised texture on every liquid, a look still too
 cartoonish; honey should glisten, oil show its colours, blood paint its surroundings).
 Each liquid now has an absorption coefficient per colour channel and a scattering
-coefficient, worked out from its `color`, `opacity` and `scatter` (`absorption` in
-material.rs): a clear liquid (`scatter` 0) absorbs so that `tint_depth` = 0.5 + 30 (1 −
-opacity)² cells of it pass `color` (water 30 cells, honey 6.6, oil 17); a scattering one
-scatters 3 `scatter` / `tint_depth` per cell and absorbs what makes a deep layer of it
-reflect `color` (two-stream: albedo w = 1 − ((1 − R) / (1 + R))²); in between the absorption
-blends by `scatter`. Per cell they add up by share, as a dye's absorbance does by
+coefficient, worked out from its `color`, `opacity` and (since 2026-11-17) the particles in it
+(`coefficients` in material.rs; [Particles in the liquid](#particles-in-the-liquid-2026-11-17)):
+what is dissolved absorbs so that `tint_depth` = 0.5 + 30 (1 − opacity)² cells of it pass
+`color` (water 30 cells, honey 6.6, oil 17); the fine particles scatter as Mie and Rayleigh
+say and absorb what makes a deep layer of them their own colour (two-stream: albedo
+w = 1 − ((1 − R) / (1 + R))²). (Until 2026-11-17 a `scatter` knob from 0 to 1 stood in for the
+particles.) Per cell they add up by share, as a dye's absorbance does by
 concentration (Beer's law), and the composite works out the colour from them:
 
-- *Mixtures take the colour real ones do.* Syrup in water passes from blue through pale gold
+- *Mixtures take the colour real ones do.* Honey in water passes from blue through pale gold
   to amber, blood in water is a red cloud, ink a grey-blue plume, milk a white haze. Until
   now colours were averaged in OKLab with their chroma kept, and a hue between blue and
-  amber is violet: syrup and blood in water had a purple and magenta fringe. Water's blue
+  amber is violet: honey and blood in water had a purple and magenta fringe. Water's blue
   is the look of a body of clear water, thirty times its real absorption; kept in
-  proportion it turned a little syrup green (a blue and a yellow filter), so it gives way
+  proportion it turned a little honey green (a blue and a yellow filter), so it gives way
   far faster than its share, by exp(−24 c), c the concentrate share of the cell's aqueous
   liquid (dissolved, or in particles of their own beside it).
 - *Depth.* The key light comes from above and is absorbed on its way down by the liquid in
   each cell above (`light.comp`: one workgroup per column, a scan; spread sideways over a
   6-cell Gaussian, as light from a broad sky; as a share of its brightness only, so each
-  liquid keeps its own hue: a coloured one turned syrup under deep water olive). Water is
+  liquid keeps its own hue: a coloured one turned honey under deep water olive). Water is
   pale under its surface and deep blue at the floor; honey is gold where it is thin and
   dark amber in a mass. A body is 16 cells thick along the view (`LV_BODY`), rounding off
   to nothing at its outline as a cylinder's chord does, so the edge of honey glows gold, of
@@ -798,7 +968,9 @@ concentration (Beer's law), and the composite works out the colour from them:
   the water then really freeze within seconds (Heat).
 - *Stains that run* (`film.comp`, below). *Steam* veils instead of hiding (Heat, "Steam").
 
-**Stains and runs** (`film.comp`, `film_tiles.comp`; 2026-11-14, third round). The stain map
+**Stains and runs** (`film.comp`, `film_tiles.comp`; 2026-11-14, third round; superseded on
+2026-11-17 by [Films, stains and drips](#films-stains-and-drips-2026-11-17-second-round), which
+keeps the map, its tiles and its runs and replaces `stain` and `dry_time`). The stain map
 was one texel per cell, laid down as a colour and "run" down walls by drawing streaks of
 random length. It is now a film map at 4 texels per cell (2 above the medium grid; 2.4 M
 texels at most) on the back wall and the faces of solids, with a thickness (0.1 mm units),
@@ -837,7 +1009,7 @@ profile --map N --at 3`, 300 runs each, old and new builds interleaved three tim
 Playground 0.296 → 0.284 ms, Lava Meets Water 0.358 → 0.411 ms, Kitchen 0.383 → 0.473 ms.
 
 ![Before (top) and after: Playground](docs/look/light/playground.jpg)
-![Before (top) and after: syrup poured into water, no violet fringe](docs/look/light/syrup_water.jpg)
+![Before (top) and after: honey poured into water, no violet fringe](docs/look/light/honey_water.jpg)
 ![Before (top) and after: blood poured over a plank runs down its face](docs/look/light/blood_plank.jpg)
 ![Before (top) and after: blood sprayed at a wall](docs/look/light/blood_spray.jpg)
 ![Before (top) and after: honey over a ball, close](docs/look/light/honey.jpg)
@@ -858,7 +1030,7 @@ liquids (oil stays gold droplets in clear water, never milky), opacity, scatteri
 gloss, body, foam, glow from the temperature (Planck at three wavelengths, brightness on a
 log scale from 800 K), and speed. Concentrates blend with their diluent by concentration. The wet map remembers which material
 last wetted each solid and when, and dries it at that material's own rate. Every rule below
-still holds; the water/syrup/oil look matches the hand-written shader it replaces (side by
+still holds; the water/honey/oil look matches the hand-written shader it replaces (side by
 side in the gallery), and the flicker metric is equal or lower (Playground 0.29 → 0.19 %,
 Upside Down 0.12 → 0.04 %, Dam Break 0.82 → 0.88 %; the new Lava, Ferrofluid and Kitchen
 motion sets 0.05, 0.19, 0.04 %).
@@ -871,7 +1043,7 @@ smooths every layer over 3 × 3 cells (binomial, σ 0.7 cell) after `cell_optics
 layers are premultiplied by occupancy and share and the composite divides by the matching
 weight, so nothing bleeds into air and aqueous and other colours stay apart, and a neighbour
 behind a solid is left out (no colour through thin walls). A 5 × 5 kernel also blurred
-unmixed edges (a syrup stream in water) over two cells, so it was not kept. Ice no longer
+unmixed edges (a honey stream in water) over two cells, so it was not kept. Ice no longer
 fades into the liquid: its colour and frozen share go into layers of their own (5 – 7), and
 the composite switches to the frozen colour where the smoothed share passes a half, a step
 about 2 px wide at any zoom, along a smooth curve (`iced` in composite.frag). Gallery:
@@ -902,7 +1074,7 @@ stirred into oil as black squares two cells across. Two changes:
   out is more than a tenth of what stays, the particles' colour gives way to the cells' (fully
   at four tenths, `TINT_TRUST`). Without that, ferrofluid stirred into the Playground's pool,
   which also holds oil, was taken out as mostly oil, and every speck drew a black ring with a
-  pale rim round it in the syrup and water. The field is read with a cubic B-spline (four
+  pale rim round it in the honey and water. The field is read with a cubic B-spline (four
   bilinear taps, `tint_read`): its texels are 2 – 4 pixels and its kernels about one and a half
   texels when zoomed out, and the sharp ownership cut on a bilinear read drew every edge of
   blood in honey in pixel steps until zoomed in. The pass is
@@ -979,7 +1151,7 @@ the optics table and the live fields, with no code for any one liquid:
   highlight only): the surface was rippled with noise carried by the flow, which broke its
   highlight into glints that move with the liquid; a slow shimmer of light moved through
   the body. Thick liquids that are not opaque (honey) glow golden
-  just inside their lit surface. Syrup is now golden amber (0.74, 0.36, 0.03) rather than
+  just inside their lit surface. Honey is now golden amber (0.74, 0.36, 0.03) rather than
   dark caramel, opacity 0.85 → 0.7.
 - *Thin films* (`iridescence`, oil 1): colour bands that follow the surface and drift (Newton's
   colours of a real film since the third round, above).
@@ -1014,10 +1186,10 @@ float hash, cells sharing a corner were now and then given different values and 
 
 | New material property | Built-in values |
 |---|---|
-| `stain` | blood 1, ink 0.8, sludge 0.5, chocolate 0.45, wax 0.4, mud 0.35, lava 0.3, slime 0.3, oobleck 0.2, ferrofluid 0.12 |
-| `glint` | syrup 1, slime 0.85, glass 0.8, chocolate 0.7, ferrofluid 0.7, mercury and gallium 0.6, blood 0.55, oil 0.5, wax 0.4, water, brine and ink 0.3; default 0.25 |
-| `iridescence` | oil 1, ferrofluid 0.15 |
-| `crackle` | lava 1 |
+| `stain` | (removed 2026-11-17: what a film leaves follows from `solids` and the particles) |
+| `glint` | (removed 2026-11-17) |
+| `iridescence` | (2026-11-17: worked out from spreading and refractive index, `iridescence` in material.rs) |
+| `crackle` | (2026-11-17: any melt that freezes above ~500 °C crusts, `crust` in material.rs) |
 
 They are under *Look* in the editor and are `--set` keys like the rest (`lava.crackle=0`).
 Display gains **Glow** (0 – 2) and **Stains** (0 – 1, with **Clean**). (A **Heat haze**
@@ -1035,7 +1207,7 @@ mercury beside lava).
 ![Before and after: Lava Meets Water](docs/look/effects/lava_water.jpg)
 ![Before and after: mercury, without the stripes](docs/look/effects/mercury.jpg)
 ![Before and after: water](docs/look/effects/water.jpg)
-![Before and after: honey (syrup)](docs/look/effects/honey.jpg)
+![Before and after: honey (honey)](docs/look/effects/honey.jpg)
 ![Before and after: blood on the plank, stained](docs/look/effects/blood_plank.jpg)
 
 Cost. Off-screen at 1920 × 1080, grid 512 × 288 (`sprout bench --at 2 --size 1920x1080
@@ -1062,7 +1234,7 @@ on Lava Meets Water and from 6.9 to 8.2 – 14.4 ms on Upside Down, and the runs
 points of the scenes, which is part of the higher simulated rate.)
 
 **One rule runs through it: an edge is as sharp as the physics behind it.** Liquid against
-air and oil against water are real interfaces and are drawn as crisp lines. Water and syrup
+air and oil against water are real interfaces and are drawn as crisp lines. Water and honey
 are miscible, so their boundary is a soft gradient of colour and never a line. What the grid
 cannot resolve (oil finely stirred through water) only warms the water's colour a little;
 clusters of a few oil particles and more are drawn as gold droplets in clear water.
@@ -1087,7 +1259,7 @@ Lava Meets Water 0.054 → 0.024 %, Kitchen 0.014 → 0.013 %.
 |---|---|---|---|---|
 | **Water** | Clear: pale aqua under its surface, deep blue at the floor of a deep pool; the back wall shows through, bent by the surface; a droplet is nearly transparent | A thin bright line where it faces up (light reflected inside it); edges mirror the tank (Fresnel) | Thin: the surface follows fine detail | Fast *and* thin is white: spray, splashes, the lip of a wave. Warm water steams |
 | **Oil** | Clear pale gold | A highlight, and Newton's thin-film colours along the surface and in thin layers | Medium | Stays gold: it never foams; its film colours drift with it |
-| **Syrup (honey)** | Gold where thin, dark amber in a mass, glowing gold where light leaves it on the far side | Sharp highlights broken into a few glistening points that move with it | Thick: its surface is drawn fuller and rounder, and it coats what it runs over | |
+| **Honey (honey)** | Gold where thin, dark amber in a mass, glowing gold where light leaves it on the far side | Sharp highlights broken into a few glistening points that move with it | Thick: its surface is drawn fuller and rounder, and it coats what it runs over | |
 | **Lava** | Molten: a glow that swells slowly at rest and is drawn into bright streaks where it flows; cooling: dark plates with glowing seams that tear open where it spreads | A rind of dark glassy rock with dim cracks where it meets air or water; a steady, soft bloom | Thick | Lights walls and liquids near it (water beside it turns orange); boils the water it meets; scorches what it touches |
 | **Blood** | Deep red, opaque, glossy; scarlet where thin | A wet highlight | Medium | Spatters the back wall and what it hits; coats solids, and the coat runs down their faces in drips with beads at their heads; dries darker and browner |
 | **Mercury, gallium** | A smooth mirror of the tank (and of any glow nearby) | A hard highlight | Medium | |
@@ -1099,17 +1271,17 @@ Lava Meets Water 0.054 → 0.024 %, Kitchen 0.014 → 0.013 %.
 | Oil dispersed in water | Gold droplets suspended in clear water, which takes a faint warm tint from oil too fine to draw; they gather into drops and layers. (This was a pale "milky" emulsion until 2026-11-11; any stirred tank then looked cloudy white.) |
 | A small drop inside another liquid | A bead of its own colour with a darker rim, down to two particles: lava or oil in water, water in lava or oil |
 | A trail of one liquid in another of its kind (blood in honey or water, ink in water, ferrofluid in oil) | Drops at the particles' own size and place: a few particles of blood are a few red drops, not the cells they pass through |
-| Water – syrup mixing | No line: from blue through pale gold to amber, as syrup dissolving in water does (until the third round of 2026-11-14 it ran through violet and rose) |
+| Water – honey mixing | No line: from blue through pale gold to amber, as honey dissolving in water does (until the third round of 2026-11-14 it ran through violet and rose) |
 | Spray and droplets | Each lone particle is a droplet, drawn stretched back along its path, so spray is streaks. Far out, where a droplet is smaller than a pixel, spray becomes a haze instead of sparkling. The Spray tool scatters its droplets (up to 14° off straight outwards, speed ± 25 %, positions off its lattice by up to 0.3 of the spacing): launched exactly outwards from a lattice at one speed, every frame's droplets flew along the same rays, a regular sunburst |
 | Splashes and impacts | White water: liquid that is both fast and thin |
-| Wetting, sliding off solids | The lit bevel of a solid takes the colour of the liquid lying against it, and keeps a film of it after the liquid has run off: water dries in about 2 s, oil in 12 s, syrup in 30 s |
-| Stains | What a staining liquid touched stays marked for as long as the tank runs: blood, ink, sludge, chocolate, mud, wax, slime; lava leaves scorch marks. Thick coats and big drops run down in drips; other liquids slowly wash stains off |
+| Wetting, sliding off solids | The lit bevel of a solid takes the colour of the liquid lying against it, and keeps a film of it after the liquid has run off: water dries in about 2 s, oil in 12 s, honey in 30 s |
+| Stains | What a staining liquid touched stays marked for as long as the tank runs: blood, ink, clay, chocolate, mud, wax, slime; lava leaves scorch marks. Thick coats and big drops run down in drips; other liquids slowly wash stains off |
 
 **How it is drawn** ([src/render.rs](src/render.rs), nothing read back):
 
 1. *Splat.* Every particle is one triangle around a smooth kernel 1.5 cells in radius,
    added into a half-float target that ends up holding, per pixel, the weight of aqueous
-   liquid, of oil, of syrup, and weight × speed. A moving particle is drawn over the path it
+   liquid, of oil, of honey, and weight × speed. A moving particle is drawn over the path it
    covers in 1/160 s.
    *The tint field* (only with two liquids of one phase group): the particles again, at half
    that resolution, into two more targets: how they absorb and scatter (Which liquid is
@@ -1196,12 +1368,301 @@ top of `composite.frag` and `render.rs`; the film's (coat, pin) at the top of `f
 More before / after pairs, all from `sprout gallery`:
 
 ![Water: dam break](docs/look/water.jpg)
-![Syrup and oil, each alone](docs/look/syrup_oil.jpg)
+![Honey and oil, each alone](docs/look/honey_oil.jpg)
 ![Oil and water overturning; the settled layers](docs/look/overturn.jpg)
-![Syrup poured into water; a current through three layers](docs/look/mixing.jpg)
+![Honey poured into water; a current through three layers](docs/look/mixing.jpg)
 ![Spray; a jet under an oil layer](docs/look/spray_jet.jpg)
 ![Liquid on solids](docs/look/solids.jpg)
 ![Zoom: far out, 8 ×, 20 ×; the coarsest and finest grids](docs/look/zoom.jpg)
+
+### Materials that move with the liquid (2026-11-16, second round)
+
+Reported on the first overhaul: the new materials looked like static images behind the
+liquid; they did not flow with it, did not follow its properties, and bubbles and foam were
+poor. The cause was the flow map those patterns were drawn from: a displacement per cell
+that restarts every 4 or 12 s, carried at the smoothed cell velocity, so a pattern at rest
+was fixed to the tank and liquid arriving at a place showed the pattern already "there".
+Pearl, glitter, marble, an oil film, fizz and foam are now carried by the particles
+themselves, or are particles of their own, and every one of them is driven by the liquid's
+physical properties and its flow. Lava's crust, ice veins and honey's glints still use the
+flow map.
+
+**Carried by the particles** (`look.comp`, `look.vert`). Each particle of a liquid with
+platelets, flakes, a marble or a film keeps a little state in a side buffer that the
+periodic sort permutes with it (a slot whose stored id differs holds a new particle, which
+is given its state then, however it came in):
+
+- *Platelets* (`pearl`): the second moment A = <n n> of the normals of the many fine
+  platelets the particle stands for, isotropic when it enters. It evolves by Jeffery's
+  equation for discs (Bretherton constant −0.96) averaged with the quadratic closure,
+  dA/dt = W A − A W + B (E A + A E − 2 (A:E) A) − 6 D_r (A − I/3), from the particle's own
+  velocity gradient (its APIC matrix; its divergence, which is numerical, left out). Shear
+  turns platelets on edge and lines them up, stretching turns them to face the viewer,
+  Brownian rotation (`look_brownian`, slower in more viscous liquids) slowly evens them out.
+  The look field carries their sheen H·A·H (H the half vector between the light and the
+  viewer) and which way they lie in the plane; the composite darkens where they stand on
+  edge, lays a pearl highlight where they face the light, and turns its interference colour
+  with their direction. A whirled liquid soap draws its eddies and keeps them for seconds
+  after it stops, as a rheoscopic fluid does; a still one has an even sheen.
+- *Flakes* (`sparkle`): one particle in four at sparkle 1 carries a flake, a unit normal
+  turned by the same equation (Jeffery orbits: eddies tumble flakes). Each is drawn as a
+  sprite: a hexagon foreshortened along its normal, at least a pixel and a half across, that
+  reflects the room around the tank (a dark floor, a lit sky, the soft box) by its normal
+  and flashes where it is the half vector to the key light; holographic, its colour turns
+  with the angle. Only the flakes in the layer the eye sees into are drawn (all of a clear
+  liquid, the face of an opaque one), each dimmed by the liquid in front of it.
+- *A carried scalar* (`marble`, `iridescence`): given by a smooth pattern of where and when
+  the particle entered (a body laid down by a map in veins, a pour in bands a few times a
+  second and in streaks across the nozzle), then only moved by the flow and evened out with
+  the particles of its cell (at the liquid's mixing rate and at least 0.5 /s, so what is
+  folded finer than a cell goes to the blend instead of a speckle). The marble's second
+  colour is drawn where it is high, with a soft edge; an oil film's thickness follows it.
+  Stirring folds a marble into spirals that stay where the flow leaves them.
+
+**Bubbles, foam and spray** (`spray.comp`, `sprite.vert`) are secondary particles (Ihmsen et
+al. 2012), a pool of 65 536 entries that ride the liquid and never push it:
+
+- *Made* where liquid traps air: at the meeting of streams that close on each other
+  (Ihmsen's trapped-air potential, from the velocity differences between neighbouring
+  cells, times how fast it moves), where the surface folds into the liquid (a stream
+  plunging into a pool, a whirl drawing the surface down; this works at low speed too, so
+  stirred honey takes in air), and, in a liquid that foams, at a crest moving out of the
+  surface. Their size follows the liquid's surface tension (Laplace: soap makes a fine
+  lather). Where a liquid fizzes, dissolved gas comes out everywhere in it and five times as
+  often where it touches a solid (nucleation sites), and those bubbles grow as they rise.
+- *Bubbles* inside the liquid are carried by it and rise at their terminal velocity through
+  it (Stokes to Newton drag, from the liquid's own density and viscosity at their cell): a
+  millimetre bubble crosses a water tank in seconds, one stirred into honey stays for
+  minutes. Drawn as a clear disc with a thin wall bright towards the light, a glint, and a
+  darker crescent opposite, dimmed by the liquid in front of it (in milk only the ones at
+  the front show).
+- *Foam*: a bubble that reaches the surface of a liquid that foams becomes a parcel of foam
+  (otherwise it bursts), carried along the surface, pushed apart where parcels crowd
+  (sideways freely, upwards only off foam or liquid that holds it, so a head builds up),
+  falling onto what is under it when nothing holds it, and bursting after the liquid's
+  `froth` time (sooner alone). Where the foam is already full, a bubble that comes up joins
+  it. Each parcel is drawn as a soft patch of small bubbles (a cell pattern in its own
+  frame, so the bubbles travel with it), tinted a little by the liquid.
+- *Spray* in the air flies ballistically and lands as foam (or merges into a liquid that
+  does not foam).
+
+`bubbles` (World settings, 0 off) scales how many are made.
+
+**Light under the surface** (`sss.comp`). The key light reaches each cell straight from
+above (`light.comp`), now coloured by what it passed through: light under blood is red,
+under honey amber. (Clear plain liquids such as water, brine and alcohol take no colour out
+of it: their tint is the look of a deep body, many times their real absorption; coloured, it
+turned honey under water green.) Under the surface the light also scatters. Per channel, the
+diffusion approximation −∇·(D∇φ) + σ φ = σ E is solved on the cells (Jacobi, `sss_iters`
+iterations a frame warm-started from the last frame), with E the light arriving straight,
+D = 1/(3(a + s)) from the liquid's absorption and scattering (capped at 1.6 cells for clear
+liquids), and the air around the liquid held at the light that falls there. Light thus comes
+in through every face of a body that sees the sky, spreads and fades, each colour at its own
+rate; the composite lights the liquid with φ (and weights it more against the soft front
+light than before). The effect is strongest on drops, streams and thin parts.
+
+**Refraction** (`ior`): the backdrop seen through a clear liquid is shifted in proportion to
+(n − 1), and the Fresnel reflection at its surface follows the refractive index.
+
+Removed: the foam field of the flow map (layers 4–5), fast thin water drawn white, the
+drawn streams of fizz, and the flow-map pearl, glitter and marble.
+
+### Particles in the liquid (2026-11-17)
+
+Asked for: remove the individual made-up looks (glitter, sparkle, pearl, marble) and describe
+instead what a liquid really holds, so that cloudiness, dust, what both look like, how specks
+shine through the liquid, and the colour of foam and bubbles all follow from physical
+settings and change the way they would in real life when those are changed.
+
+**Removed:** `pearl`, `sparkle`, `flake_size`, `marble`, `color_marble`, `glint` (the glints
+honey's highlight was broken into), `scatter` (a 0–1 milkiness) and `body` (a 0–1 fullness of
+the drawn shape: now worked out from viscosity and contact angle, `fullness` in material.rs),
+and the world setting `look_brownian`. Files that have them load and ignore them.
+
+**Added** (each in SI units, editable in the liquid editor's *Cloudiness* and *Specks* groups,
+listed by `sprout params`, saved in the liquids file):
+
+| Property | What it is | What follows from it |
+|---|---|---|
+| `cloud` | volume fraction of fine particles (colloids, droplets, pigment) | how cloudy the liquid is |
+| `cloud_size` | their diameter, m | the colour and direction of what they scatter: below ~0.2 µm Rayleigh (∝ 1/λ⁴): a bluish haze that lets orange light through (watered-down milk, smoke); above a few µm white and mostly forwards (asymmetry up to 0.98) |
+| `cloud_ior` | their refractive index | how strongly they scatter against the liquid's own `ior`; equal to it, they vanish (index matching) |
+| `cloud_color` | their own colour (a deep layer, a powder of them) | how much they absorb, per channel |
+| `cloud_shape` | thickness over diameter (1 spheres) | platelets are lined up by shear (Jeffery orbits, Bretherton constant from the shape) and undone by Brownian rotation, Dr = 3kT / (4 η d³): 15 µm mica keeps the flow's pattern for minutes (rheoscopic), 1 µm platelets lose it at once |
+| `dust` | volume fraction of coarse particles | specks seen one by one, and the haze of those too many to draw |
+| `dust_size` | their diameter, m | their size on screen, how many show, how fast they settle |
+| `dust_density` | kg/m³ | they settle at their terminal velocity (Stokes to Newton drag on the sphere of their volume), or rise if lighter, lagging the flow by ρ_p d² / (18 μ) |
+| `dust_color` | their colour | their diffuse colour, and the tint of what a shiny one reflects |
+| `dust_shape` | thickness over diameter | flakes tumble in the flow (Jeffery) and flash where they face the half vector to the light; grains do not |
+| `dust_reflect` | mirror reflectance of a speck's face | matte mineral (0.05) to aluminised glitter (0.9) |
+
+*Cloudiness.* `coefficients` (material.rs) works out, per colour channel at 610, 550 and
+465 nm, the fine particles' scattering efficiency: Rayleigh's (8/3) x⁴ ((m² − 1)/(m² + 2))²
+where that is the smaller, van de Hulst's anomalous diffraction 2 − (4/ρ) sin ρ +
+(4/ρ²)(1 − cos ρ), ρ = 2x(m − 1), for large ones (x = π d n / λ, m the particles' index over the
+liquid's); their cross-section per volume from their shape (a quarter of the surface over
+the volume, Cauchy); an asymmetry that grows with size and with how close m is to 1; and
+the reduced scattering φ (A/V) Q (1 − g), per metre, times the cell size. Absorption is what
+makes a deep layer of them `cloud_color`, plus the dissolved colour. Milk (3.5 % fat
+globules, 3 µm, n 1.46) comes to ~2.5 per mm, the measured value; blood (45 % red cells,
+7.5 µm discs, n 1.40 in plasma) is opaque within a millimetre in haemoglobin's colour and
+turns into a pink cloud in water. The shaders carry the scattering's spectral shape (cell
+optics layer 16) so the composite scatters each channel by its own coefficient: dilute fine
+particles look blue against the dark back wall and pass warm light.
+
+*Specks* are entries of spray.comp's pool (131 072 of them after the 65 536 bubbles), brought
+in by every new particle of a dusty liquid (look.comp): as many as the liquid shows per cell,
+(1 − e^−τ) / A for a column `LV_BODY` cells deep of optical depth τ and specks of projected
+area A, at most `DUST_DRAW_MAX` = 4. Each moves as one of them: carried and settling,
+resting on a solid or on the specks packed below it (a sediment builds up at the packing of
+grains, 0.6), stirred up again where the flow a cell above passes the Shields threshold
+(θ = 0.05, u* ≈ u / 8), falling out of the air, left behind where the liquid drains (30 s).
+Those too many to draw are still part of the liquid's colour: each drawn speck adds its
+share where it lies (the dust field, cell optics layer 18), so a settled tank clears above
+a sediment of its specks' colour. Drawn, a speck has its real size (never under a pixel; a
+smaller one adds its light over the pixel, so a flake's flash twinkles far below the eye's
+resolution), lies at a depth within the layer the eye sees into, is lit by the light that
+reaches that depth, and is tinted and hidden by the liquid in front of it.
+
+*Foam and bubbles* take their colour from their liquid, which every bubble, foam parcel and
+spray droplet now remembers. A bubble's ring is the light around it totally reflected
+beyond 1/n of its radius (wider in oil than in water), its inside a window brighter by what
+the liquid would have absorbed. Foam reflects as a layer absorbing ε × its liquid's
+absorption with a scattering of √ε / (3.5 r): beer foam is cream, cola foam tan, blood foam
+pink. As it ages its liquid fraction drains, ε = 0.25 / (1 + 8 age)², and its bubbles
+coarsen, so every foam whitens. Its films thin, h = 2 µm / √(1 + t / τ), τ = 0.02 s × the
+liquid's viscosity over water's: a long-lived soap lather shows interference colours on
+bubbles a few pixels across and its films go black before they burst; a short-lived foam
+bursts while they are still thick and white.
+
+Gallery: `sprout gallery DIR particles` (dilute clouds, platelets, glitter, snow and polish
+stirred and left, foam of beer, blood, milk and soap fresh and aged).
+
+### Films, stains and drips (2026-11-17, second round)
+
+Asked for: the stains and runs of blood for every liquid that would stain, drip, splotch or
+wash a wall, overhauled for more detail and feedback; the temperature looks brought up to
+the standard of [Particles in the liquid](#particles-in-the-liquid-2026-11-17); and effects
+that sometimes did not start for a while after a reset or a pour.
+
+**What a film is.** The film map (`film.comp`, 4 texels per cell on the back wall and the
+faces of solids) now holds, per texel, what the film absorbs and scatters integrated through
+its thickness (so films and drops add up as dyes do), its thickness, its volatile share and
+the liquid it is mostly of. Every liquid that wets lays one, worked out from what it is
+(material.rs; no knobs):
+
+| Behaviour | From | Examples |
+|---|---|---|
+| The coat it leaves where it drains off a surface | Landau–Levich: 0.94 ℓ_c Ca^(2/3), Ca = μU/σ (U = 5 cm/s), at most the capillary length, × (1 + cos θ)/2 | water ~10 µm, blood ~0.15 mm, honey millimetres; mercury almost none |
+| How fast it dries | evaporation of water's 1e-7 m/s (thin films and drops, diffusion-limited) × its vapour pressure, Clausius–Clapeyron with Trouton's rule from its boiling point; × `drying` (World, default 100, 1 = real time) | nitrogen at once, alcohol fast, water, blood; oil, glycerol-like simple liquids never |
+| What stays when it dries | its volatile share: all but its dissolved solids (`solids`, new: honey 0.8, brine 0.12, blood 0.08, ink 0.05 ...) and particles | water leaves nothing, brine a white crust, mud a brown one, blood a dark stain, a dye its colour |
+| How a dried deposit looks | rigid grains (dust, minerals: index ≥ 1.5) are left in air and scatter ((n−1)/(n−n_liquid))² as much, up to 6×; soft particles (cells, fat) coalesce into a glassy layer that scatters a third as much (`dry_scatter`) | dried mud and salt lighten and go matte; dried blood is a darker, deeper red |
+| What washes it | liquid against a film exchanges with it at 0.06 /s × (0.25 + 2 × speed), fully if it is of the same phase group, 5 % if not, unless the liquid is soapy (aqueous, tension < 0.04 N/m); a dry crust re-dissolves more slowly | water rinses blood and ink; water does not wash off oil; soap washes anything |
+| Spatter and splats | airborne drops of any wetting liquid mark the back wall and splat on solids (particles.comp); spray droplets and drips that land splat as a disc twice their width, a third of their radius thick (spray.comp) | water spots that dry, mud splotches that stay |
+
+**How it moves.**
+- *Draining.* A continuous coat thicker than what its contact line pins (0.1 mm, varying
+  with the wall's roughness from column to column) drains at the lubrication speed
+  u = g h² / (3ν) (Huppert 1982), slower as it dries (its viscosity climbs as its solvent
+  goes): coats thin at their top and gather at their foot (Jeffreys drainage), and tide marks
+  stay where a level paused. Film under liquid it touches does not run on its own; what
+  runs into a pool merges with it.
+- *Drips.* Where a run reaches the lower edge of a solid's face (an overhang, the underside
+  of a ledge) it gathers into a pendant drop, which falls past 2.2 mm (about the capillary
+  length) as a drop of that liquid in spray.comp's pool, and splats where it lands.
+- *Coffee rings.* A drying film carries its solute to its thinner edge (capillary flow to
+  the pinned contact line, Deegan et al. 1997): dried drops have darker rims.
+
+**How it is drawn** (composite.frag `draw_film`): a layer of the film's absorbance A and
+scattering S over the surface (light through it and back, exp(−2(A + S)), plus what it
+scatters back, two-stream), lit by the room; while wet it darkens the surface under it
+(light trapped in the liquid layer by total internal reflection, Lekner & Dorf 1988) and its
+slope glints. The fixed "blood oxidising" tint of dried stains is gone.
+
+**Temperature.** The glow of a hot liquid keeps its black-body colour (Wien at 610, 550 and
+465 nm) but its brightness is now Planck's at red against that at 1300 K, seen through a
+logarithmic exposure (as the eye adapts), instead of a made-up ramp: 800 K is just visible,
+1000 K a dull red, 1300 K bright orange. `crackle` is gone: any liquid that freezes from
+incandescence (solidus above ~500 °C) crusts where its surface cools below its solidus; such
+melts leave no film on a cold wall (they skin over against it). `iridescence` is gone: thin
+film colours show on a clear liquid that spreads over water (spreading coefficient
+σ_water − σ − σ_against_water > 0) and bends light differently from it (oil; not ferrofluid,
+whose index is water's).
+
+**Effects that started late.** The pool of bubbles, foam, spray and specks handed out entries
+round a ring and dropped a new bubble when its entry was still alive: once long-lived foam
+and bubbles trapped in a viscous liquid held much of the ring, new pours made few or none
+for seconds. Each part of the pool now has a free stack of returned entries
+(`shaders/pool.glsl`): an emitter takes from it, then from entries never used; only a pool
+that is really full drops anything. (In a headless reset-and-pour run the effects start on
+the first frame in both builds; the starvation showed in longer sessions.)
+
+**Effects after a reset, and smears left in the air (2026-11-18).** Two more causes, both
+found in the window, not headless:
+- *Simulated time stood still after a reset.* The app polled the step read-backs after
+  recording the frame, before submitting it: the read-back it had just asked for was not
+  held by any submission yet, so reading its host copy succeeded early, the slot was taken
+  as done and its data lost, and the next request into that slot read what an earlier copy
+  had left. Read-backs were therefore about three requests stale. After a reset the stale
+  copy was the old tank's time, so simulated time jumped ahead by the time since the last
+  reset and then stood still until the new tank caught up (1.4 s in a measured run). The
+  bubbles, foam, specks, films and flow map, which run on simulated time, were neither made
+  nor moved meanwhile. The app now polls before recording. Scripted reset-and-pour in the
+  window: bubbles from the first frames of the pour (1477 after 22 frames) instead of none
+  for 110 frames.
+- *Pours left their path hanging in the air.* The back wall took a quarter of a pool's coat
+  from liquid going past, and liquid just out of the nozzle is slow: a pour swept across
+  the tank left an opaque smear of mud along its path (thin-film colours at its edges) that
+  stayed after the liquid had fallen. The back wall now takes its coat only from a body of
+  liquid at rest against it: slower than 10 cm/s (none from 40 cm/s) and with liquid in at
+  least 55 % (fully 85 %) of a 5 × 5-cell neighbourhood sampled every other cell. Pools
+  still stain where they stood and drained (gallery `films`); streams and falling blobs
+  leave only the spatter of their drops.
+
+Frame times unchanged (Playground, `--no-vsync --frames 2000`, three runs each past the
+warm-up: p50 1.36 → 1.33 ms, p99 5.79 → 5.53 ms, 0.99 → 1.00× real time).
+
+Gallery: `sprout gallery DIR films` (blood, honey, mud, water, oil, brine, milk and ink filled
+into a funnel that drains onto the floor, sprayed, and left to dry; lava cooling).
+
+### The look after the liquids overhaul (2026-11-16)
+
+(Superseded in part by the section above: foam, fizz, pearl, glitter and marble are no
+longer drawn as described here.)
+
+The overhaul redrew the effects that were a single tint or gradient, and drew the new
+properties to the same standard. Everything is still a continuous function of the fields
+(nothing pops), and patterns move only as the liquid does (the flow map).
+
+- **Foam is a field, not a tint.** Fast, thin water used to be mixed towards white and was
+  clear again the moment it slowed. Now `flow_map.comp` keeps how much foam the liquid
+  carries (layer 4 of the flow map, one texel per cell): made where a foaming liquid is
+  fast at a free surface and where dissolved gas comes out, carried along semi-Lagrangian,
+  rising at 16 cells/s to the surface, and bursting at the liquid's own `froth` time. The
+  composite draws it as a mass of bubbles in two sizes (cell patterns carried by the flow),
+  paler towards the light, tinted by the liquid, a lace where it is thin. Water keeps half a
+  second of white water behind a wave; beer keeps a head; soap lathers for minutes. Spray
+  and wave lips are still white at once.
+- **Surfaces.** A clear liquid's first cells under its surface are paler (light that has
+  just come in), over a fine darker line where the surface's reflection ends; an opaque
+  liquid has a lit edge and a shaded one. Glossy liquids carry the broad reflection of a
+  soft box around their highlight.
+- **Liquid metal** mirrors a studio instead of one gradient: a dark floor up to a horizon,
+  a graded sky, a soft box towards the light and a cool strip light behind, flattened to an
+  even grey where the body is flat (deep inside).
+- **Ice** has fine veins (cracks and trapped air, carried with the ice) and a frosted
+  edge; its crisp outline is unchanged.
+- **Own light** (`luminous`) is drawn from within: fuller where the body is deep, so
+  surface, edges and bubbles still read against it; it blooms and lights the tank as heat
+  does.
+- **Fizz**: streams of bubbles rising from fixed points, evenly spaced with gaps, swaying;
+  each a pale disc with a bright rim towards the light.
+- **Pearl, glitter, marble**: see [New properties](#new-properties); all three ride the
+  flow map, so stirring shears and folds them and still liquid keeps them still.
+
+Glitter, pearl, marble and fizz are compiled only into the composite variants of tanks
+that hold such a liquid (the `FX` patterns bit); foam and the surface work are in every
+variant. The cell optics have three more layers (19).
 
 ## Physics
 
@@ -1236,7 +1697,7 @@ low-dissipation particle-in-cell scheme). Four particles per cell at rest. Each 
    (2026-11-14). On the surface of liquid that does not move (a yield-stress pile, a crust),
    the midpoint had cancelled such a particle's motion every substep while the gravity of
    each piled up in the velocity it gathered from the air faces around it, which its own
-   scatter kept feeding: it sat on the surface at the speed cap (sludge at rest: fastest
+   scatter kept feeding: it sat on the surface at the speed cap (clay at rest: fastest
    particle 752 cells/s, now 11), was drawn as white water, and launched itself when nudged.
 3. Surface tension: curvature of smoothed liquid and oil indicators, turned into pressure
    jumps at liquid–air and oil–aqueous interfaces (below).
@@ -1339,7 +1800,7 @@ cut into substeps follows the wall clock.
 **Viscosity** is implicit (backward Euler) in the variational form of Batty & Bridson (2008):
 the new velocities minimise kinetic energy change plus `dt * mu * D:D`, D the strain rate.
 That is `div(mu (grad u + grad u^T))`, not `mu lap(u)`: it is consistent across viscosity
-jumps (water next to syrup), gives traction-free free surfaces and does not slow a rigid
+jumps (water next to honey), gives traction-free free surfaces and does not slow a rigid
 rotation. Solid walls are no-slip, with the wall where it is (half a cell from the first
 tangential sample). The system is symmetric positive definite, solved by conjugate
 gradients to a relative residual of 1e-3, so no viscosity is too large for the time step.
@@ -1366,14 +1827,14 @@ last substep's pressure without that viscous part. With one solve after the visc
 along every wall and the pressure pushed that layer up: every resting viscous pool
 circulated along its walls at about 6 cells/s. Gravity added after the viscosity instead
 stops that but lets gravity-driven flows slip by `g dt` per substep at the walls (the
-sludge slump never stopped); the viscosity after a single projection leaves a divergent
+clay slump never stopped); the viscosity after a single projection leaves a divergent
 velocity (slump 65 cells against 47). Only the implicit tiles run between the two solves:
 tiles too weakly viscous for the implicit solve take their explicit step before the first,
 as a tank of water alone always has. There the step moves a wall face by `nu dt / dx²` of
 `g dt`, so a resting water pool shows no wall flow, and a tank with no implicit tile (water
 in a heated tank, which counts as implicit only because it could freeze) leaves the second
 solve nothing to do. Explicit tiles stepped after the first solve slowed the end of the
-three-liquid overturn (water/syrup above the oil floor at 40 s 1.9 – 6.8 % instead of
+three-liquid overturn (water/honey above the oil floor at 40 s 1.9 – 6.8 % instead of
 0.01 – 0.09 %) and let more steam bubbles escape (103 of 1928 instead of 87 – 95).
 
 **Surface tension** uses the ghost-fluid method (Kang, Fedkiw & Liu 2000) for both kinds of
@@ -1381,11 +1842,11 @@ interface, so the jump is as sharp as the free surface and is balanced exactly b
 pressure gradient:
 
 - *Liquid–air:* the air side of a surface face takes the Laplace pressure `sigma * kappa` at
-  the interface's sub-cell position. `sigma` is that of the liquid there (water, syrup or oil
+  the interface's sub-cell position. `sigma` is that of the liquid there (water, honey or oil
   against air, blended by composition).
 - *Oil–aqueous:* where the oil fraction crosses 1/2 between two cells, the pressure jumps by
   `sigma_oil * kappa` across that face.
-- *Water–syrup:* miscible, one aqueous phase, no interfacial tension (the weak transient
+- *Water–honey:* miscible, one aqueous phase, no interfacial tension (the weak transient
   Korteweg stress of a fresh miscible interface is neglected).
 
 Curvature is the divergence of the unit normal of a 5 × 5 binomially smoothed occupancy
@@ -1407,18 +1868,18 @@ lets it.
 | | Density | Kinematic viscosity | Tension vs air | Contact angle |
 |---|---|---|---|---|
 | Water | 998 kg/m³ | 1.0e-6 m²/s | 0.072 N/m | 90° |
-| Syrup | 1.4 × water | 0.06 m²/s | 0.076 N/m | 90° |
+| Honey | 1.4 × water | 0.06 m²/s | 0.076 N/m | 90° |
 | Oil | 0.9 × water | 6.0e-5 m²/s | 0.032 N/m | 90° |
 
-Oil against water or syrup: 0.025 N/m. Water's values are the standard 20 °C ones; oil's are
+Oil against water or honey: 0.025 N/m. Water's values are the standard 20 °C ones; oil's are
 typical of olive or sunflower oil (50–90 mPa·s, 0.03 N/m against air, 0.02–0.03 N/m against
-water). Syrup is a choice, not a measured product: a thick golden syrup or honey. The
+water). Honey is a choice, not a measured product: a thick golden honey or honey. The
 contact angles are a neutral default because the scene does not say what the solids are.
 The previous version tuned oil to 50 × and water to zero viscosity "for feel"; water now has
 its real viscosity, and it changes almost nothing at this scale (see Validation).
 
-- **Water and syrup are miscible.** Each aqueous particle carries a syrup fraction.
-  Neighbours exchange it at a set rate, conserving total syrup exactly. Density blends
+- **Water and honey are miscible.** Each aqueous particle carries a honey fraction.
+  Neighbours exchange it at a set rate, conserving total honey exactly. Density blends
   linearly with the fraction and viscosity logarithmically.
 - **Oil is a separate phase.** Where oil and water share a cell, below what the grid
   resolves, they would otherwise move as one fluid. Sub-cell droplets therefore drift at
@@ -1427,7 +1888,7 @@ its real viscosity, and it changes almost nothing at this scale (see Validation)
   phase's density and viscosity), with drag `C_d = 24/Re + 0.44`, driven by the difference
   between the local mean densities of the particle's phase and of the others (phases drift,
   not single particles). This follows the cell size and the
-  viscosity of the fluids (a droplet barely drifts through syrup). Whether an interface
+  viscosity of the fluids (a droplet barely drifts through honey). Whether an interface
   sheds such droplets at all depends on the Bond number of one cell, `Δρ g dx² / σ`: 3.9 on
   1 cm cells (buoyancy tears pieces off; the drift acts everywhere), 0.04 on 1 mm cells
   (tension holds the interface together; where the smoothed oil fraction shows a resolved
@@ -1478,7 +1939,7 @@ parameter in [src/sim/params.rs](src/sim/params.rs) with a value that switches i
 | Longest substep `dt_max` = 1/80 s (was 1/60) | At CFL 4 a slow pool otherwise takes 1/60 s steps, in which converging particles travel three cells before the density correction sees them | Fullest cell after refilling a hole: 13–21 particles → 10. Resting 1 M pool: 371 → 486 substeps in 6 s (3.75 → 4.07 s wall) |
 | No sliver substeps (`min_substep_share` 0.02: blocking helpers never record a substep shorter than 2 % of a full one; 0 = off) | Momentum travels through the grid as fixed-point displacement per substep; a microsecond step rounds slow flow away | On 1 mm cells such slivers stopped a capillary oscillation dead after 2 s. Sample times are met to 2 % of a substep. Only head-less runs (validate, probe, shot, bench). Off: 394 substeps and 336 of them with an unconverged viscosity solve (residual 0.36), against 17 with it on |
 | Vent of a sealed, full region (`sealed_vent` 1; 0 = off) | A pressure reference where there is no free surface (see Method) | Closed box of water, 3 s: 0 unconverged solves of 240 (off: 31 of 248, rms speed 0.016 √(gh), then liquid outside the box); tank filled to the lid: rms 0.00004 (off: 0.018). No effect on any region that holds air: all other validation numbers unchanged |
-| Rigid at the viscosity cap (`rigid_viscosity` 1 m²/s; not switchable: it is the regularisation of the yield stress and of solidification) | The viscosity solve stops here; a cell that would need more (frozen, glass or lava cooled past it, an unyielded plug, jammed oobleck) moves as a rigid body | Sludge slump run-out 53 cells against 47 from yield-stress theory; Bingham slot profile 4.3 % (L2); ice keeps its shape (39.4 × 19.5 of 40 × 20 cells after 6 s). No effect on water, syrup or oil (no rigid pass runs: Playground and Dam Break numbers unchanged) |
+| Rigid at the viscosity cap (`rigid_viscosity` 1 m²/s; not switchable: it is the regularisation of the yield stress and of solidification) | The viscosity solve stops here; a cell that would need more (frozen, glass or lava cooled past it, an unyielded plug, jammed oobleck) moves as a rigid body | Clay slip slump run-out 53 cells against 47 from yield-stress theory; Bingham slot profile 4.3 % (L2); ice keeps its shape (39.4 × 19.5 of 40 × 20 cells after 6 s). No effect on water, honey or oil (no rigid pass runs: Playground and Dam Break numbers unchanged) |
 | Rigid bodies rest on solids (`rigid_contact` 1, `rigid_friction` 0.6; off: `rigid_contact=0`, frictionless: `rigid_friction=0`) | A porous rigid body (a heap of frozen lumps) slumps in the liquid solve; the rigid average turned that into motion into the floor, undone by the collision every substep | Heap of frozen lava under water (`LAB_FROZEN=1 LAB_WAIT=15 LAB_POUR_S=3 LAB_DROP=lava sprout lab --set heat_rate=0 --set spawn_temp_lava=500`): body rms speed 2 – 7 → 0.000 cells/s; water shake (`LAB_SHAKE`) at 30 s 5. Lava cooled ×100 in water: frozen lava shake 65 → 4, water 119 → 19. No effect where no rigid pass runs; thermal checks unchanged (ice floats, keeps shape, melts) |
 | Viscoelastic stress cap (`elastic_stress_max` 10 × G; 0 = none, then the time step assumes 50 G) | Upper-convected Maxwell stress grows without bound in strong stretching | Slime shear mode: period 2.00 s against 1.94 s, decay 0.505 /s against 0.555 /s with it on. Halves the elastic time step it implies (√11 G instead of √51 G) |
 | Elastic deformation per substep (`elastic_step_max` 0.25; 0 = none) | At an impact the velocity gradient across one cell grows the stress exponentially within a few substeps | Without it a slime blob dropped into a cup exploded into spray (gallery `liquid_slime`); with it, it lands and rings. Inactive in the shear-mode check (0.1 per substep) |
@@ -1504,7 +1965,7 @@ not applicable to that version.
 | Same: mean height | swung by 1.7 cells | +0.016 | +0.017 | constant |
 | Same: unconverged pressure solves | — (fixed 30 sweeps) | 0 of 367 | 0 of 486 | 0 |
 | Resting pool 512 × 288, 10 s: level, rms / √(gh) | −0.51 %, 0.00007 | −0.57 %, 0.00018 | −0.55 %, 0.00013 | level, still |
-| Syrup slump vs Huppert (1982) at 16 s: ratio, exponent | 1.13, 0.192 | 1.02, 0.204 | 1.02, 0.205 | 1.0, 0.2 |
+| Honey slump vs Huppert (1982) at 16 s: ratio, exponent | 1.13, 0.192 | 1.02, 0.204 | 1.02, 0.205 | 1.0, 0.2 |
 | Shear decay, free slab (traction-free surfaces) | — | −4.4 % | −3.9 % | exact rate |
 | Shear decay on a no-slip floor | — | −1.7 % | −1.8 % | exact rate |
 | Rigid rotation, ν = 0.01 m²/s, angular momentum after 1 s | 0.919 (Laplacian form) | 1.011 | 0.975 | 1 |
@@ -1513,7 +1974,7 @@ not applicable to that version.
 | Oil disc in water: pressure jump / (σ_oa/R) | — | 1.002 | 1.002 | 1 |
 | Water drop n = 2 oscillation vs Rayleigh | — | +0.6 % | +0.6 % | 0 |
 | Oil drop in water, n = 2 oscillation period | — | unmeasurable (see below) | 2.220 s, +6.3 % | 2.087 s (viscous normal mode) |
-| Syrup blob in water (miscible): shape change | — | 0.000 | 0.000 | none |
+| Honey blob in water (miscible): shape change | — | 0.000 | 0.000 | none |
 | Contact angle 60° / 90° / 120°, old chord measure | none | 73° / 86° / 132° | 71° / 87° / 132° | as set |
 | Same, from cap area and apex height | — | — | 77° / 89° / 144° (before the second fixes round: 76° / 87° / 146°) | as set |
 | Oil square in water, 0.5 s: R_max / R_equal-area | — | 0.99 (1.19 without tension) | 1.00 (1.19 without) | 1 = disc |
@@ -1591,7 +2052,7 @@ What the numbers say about the originally reported problems:
   residual. Travelling with a bilinear midpoint velocity re-created a slow version of this
   (kinetic energy 0.1 after 6 s); the midpoint rule therefore only adds the *change* of the
   grid velocity along the half step to the gathered velocity.
-- **"Syrup front 13 % fast"** was the viscosity solve; it now reads 1.02.
+- **"Honey front 13 % fast"** was the viscosity solve; it now reads 1.02.
 - **"Dam break 8–16 % fast"** is not a solver error: it converges under grid refinement and
   its speed sits inside the spread of published experiments (1.14–1.74, Lobovský et al.
   2014, table 1).
@@ -1624,7 +2085,7 @@ bug-fix round, 2026-11-14: `validate` 25 tests, 233 checks, all pass in 9.5 minu
 | Stefan melting front (ice on a 40 °C plate, 1 mm cells) | 5.48 / 7.76 / 11.06 cells at 2.5 / 5 / 10 s, melted volume (worst −2.1 %). Before the in-cell exchange: 5.26 / 7.51 / 10.95, particles past half melted (−5.9 %); with it the particles of a front cell melt together, so the check now sums melted shares | similarity solution 5.59 / 7.91 / 11.18 (λ = 0.466), within 10 % |
 | Energy through the phase change | content change 1.9163e5 J/m vs heat from the plate 1.9161e5 (+0.01 %); latent share 80 % | equal within 1 %; 1/(1 + St/2) ≈ 80 % |
 | Ice block in water | keeps its shape (39.4 × 19.5 of 40 × 20), 10.7 % above water, melts under the heat brush | 8.1 % ± 4 |
-| Sludge slump (Herschel–Bulkley, τy 60 Pa) | run-out 53.4, height 5.0 cells, stops | yield-stress theory 47.4 and 6.3 cells (Liu & Mei 1989) |
+| Clay slip slump (Herschel–Bulkley, τy 60 Pa) | run-out 53.4, height 5.0 cells, stops | yield-stress theory 47.4 and 6.3 cells (Liu & Mei 1989) |
 | Slot flow, Bingham / Carreau | L2 error 4.3 % / 2.6 %, viscosity solves converged | plug + parabola / numerically integrated Carreau profile, < 10 % |
 | Sediment settling (mud, 10 %, 50 µm) | 1.18 cells/s (−4.4 %), clear layer, concentrate conserved to 0.0000 % | hindered Stokes 1.23 |
 | Brine vs water in air at −15 °C | water 100 % frozen; brine 0 % frozen at −14.9 °C | brine freezes at −21 °C |
@@ -1637,10 +2098,10 @@ bug-fix round, 2026-11-14: `validate` 25 tests, 233 checks, all pass in 9.5 minu
 | Mercury bead (zero gravity, 1 mm) | 159° | 140°, model bias ≈ +12° (accepted 135–160) |
 | Ferrofluid towards a magnet | 1491 cells/s² (0.12 without) | 530–1579 (Kelvin force, N between 1 and 0) |
 | Gallium oxide skin | aspect 4.77 with skin, 0.64 without (from 5) | > 4, < 3 |
-| Mixing ink, mud, blood, milk, syrup, brine into water | every component within 0.0002 %, particles equal | < 0.1 % |
+| Mixing ink, mud, blood, milk, honey, brine into water | every component within 0.0002 %, particles equal | < 0.1 % |
 
 At the end of the materials round two of the original 84 checks failed: the refilled pool's
-fullest cell (14 particles, < 12) and the 40 s overturn (3.25 % of the water/syrup above the
+fullest cell (14 particles, < 12) and the 40 s overturn (3.25 % of the water/honey above the
 oil layer's floor, < 3 %). Both pass after the second fixes round (below). `--selftest` (42
 checks, including the liquid workflow: duplicate, edit, apply, save, reload, pour, apply in
 place, read-only built-ins, delete; the heat brush; magnets) passes; `cargo test` (41) and
@@ -1656,20 +2117,20 @@ generalised drift between phase groups (particles.comp), both absent from the ol
 water/oil-only code:
 - Its density difference was the particle's own density against the mixture's, divided by
   the share of the other groups. That is right only for a particle as dense as its phase's
-  mean: a water particle in syrup-rich water with a trace of oil around it read as far
+  mean: a water particle in honey-rich water with a trace of oil around it read as far
   lighter than its phase, with a drift amplified by 1 / the trace, so the immiscible drift
-  started to unmix water and syrup. It is now the difference between the local mean
+  started to unmix water and honey. It is now the difference between the local mean
   densities of the particle's group and of the others (a new per-cell field of each group's
   share × density, `GroupRhoBuf`, written by grid_prep.comp where groups meet; only
   particles with another group around them gather it, in a second pass over their 3 × 3
   cells, so pure regions pay nothing for it).
 - The continuous phase the droplet drifts through was the majority of the particle's own
-  cell. For a film or droplet one cell thick that is the droplet itself: syrup-rich water
-  inside oil sank as if through syrup, a thousand times too slowly, and stayed on the wall.
+  cell. For a film or droplet one cell thick that is the droplet itself: honey-rich water
+  inside oil sank as if through honey, a thousand times too slowly, and stayed on the wall.
   It is now the group that leads over the 3 × 3 cells the shares are gathered from, with
   that group's density and viscosity.
 
-Water/syrup left above the oil floor after 40 s: 0.46 / 0.46 / 0.35 / 0.30 % for water's
+Water/honey left above the oil floor after 40 s: 0.46 / 0.46 / 0.35 / 0.30 % for water's
 viscosity × 1, 1.001, 0.999, 1.0005 (before: 2.24 / 2.20 / 0.49 / 1.43 % with only the first
 error fixed, 0.44 % or 3–9 % with neither; before the materials round 0.34 – 0.38 %).
 
@@ -1697,7 +2158,7 @@ puddle walk 48 cells. The same changes moved
 the contact angles towards their settings: 60° / 90° / 120° settle at 77° / 89° / 144° (were
 76° / 87° / 146°) and mercury's 140° at 153° (was 159°).
 
-**Water, syrup and oil scenes were 3–5 % slower per frame.** The particle pass was 12 %
+**Water, honey and oil scenes were 3–5 % slower per frame.** The particle pass was 12 %
 slower on the three-liquid overturn (2.03 → 2.27 ms per substep at 768 × 432) although a
 plain tank runs none of the new code: every optional path (heat, rigid bodies, elasticity,
 settling, magnetism) was compiled in behind a runtime test, and the registers they hold cost
@@ -1828,7 +2289,7 @@ particle above the speed cap; at most 3 % of pressure solves at their iteration 
 | S2 | A solid laid over a full pool | The sealed region's vent is the only place the correction potential is held: all surplus drained into it | No density correction in a sealed, full region (Physics, Method) | 3 996 → 13 particles in the fullest cell |
 | S3 | Currents into the floor pack liquid | Not bounded by `tool_crowd_max` like Push and Grab | Same bound | 75 → 21 |
 | S4 | Slime shatters into mist | Detached droplets kept their elastic stress, acting on the faces around them | A particle with less than a cell's worth of liquid around drops its stress | fewer, larger droplets (it still splashes, as it does with no elasticity) |
-| S5 | Particles at the speed cap on resting liquid | Midpoint rule cancelled a surface spray particle's motion while it banked gravity | A spray particle stopped by still liquid takes its travelled velocity (Physics, Method) | fastest particle: sludge at rest 752 → 11, slime at rest 70 → 12, Mud Flats 752 → 188, Cold Snap 752 → 255, Lava Meets Water 752 → 245 cells/s (the last three still splashing at 4 s) |
+| S5 | Particles at the speed cap on resting liquid | Midpoint rule cancelled a surface spray particle's motion while it banked gravity | A spray particle stopped by still liquid takes its travelled velocity (Physics, Method) | fastest particle: clay at rest 752 → 11, slime at rest 70 → 12, Mud Flats 752 → 188, Cold Snap 752 → 255, Lava Meets Water 752 → 245 cells/s (the last three still splashing at 4 s) |
 | — | Particles stuck inside solids (seen while fixing S5: 1.3 cells inside Canopy's crown, 18 cells inside a Terrace Falls block) | Minimum of the shapes' distances has internal seams; the push beyond the surface could cross a narrow gap | Distance to the union's outline (`Scene::union_depth`); a final surface-only push for a particle still more than a cell inside | none inside at any check; new unit test |
 | V1 | (Reported) Animated glow over hot liquid looks low quality | Haze displaced the picture with noise tied to a half-resolution field; the wavering bloom went negative | Haze and embers removed; bicubic sampling of the glow (Look, Effects) | 0.12 → 0.00 % of a lava cup's pixels darkened by the glow |
 | V2 | Stains: speckle in floors, an asterisk in every peg | A band 2.4 × the wet film deep, ragged with fine noise under a hard threshold | 1.3 × the film, broad soft patches (Look, Effects) | see the pictures below |
@@ -1913,9 +2374,9 @@ Every resting pool of a viscous liquid circulated along the walls (Physics, Visc
 viscosity solve held the wall layer back against the whole pull of gravity, and the
 pressure pushed it up. The implicit viscosity now runs between two pressure solves. A
 wall-to-wall layer at rest, 2 s after 8 s of settling (`LAB_LAVA_JITTER=1 LAB_FULL=1
-LAB_BARE=1 LAB_NOHEAT=1 LAB_WALL=1 sprout lab`, `LAB_JITTER_MAT=syrup` for syrup):
+LAB_BARE=1 LAB_NOHEAT=1 LAB_WALL=1 sprout lab`, `LAB_JITTER_MAT=honey` for honey):
 
-| | Lava: rise next to the left wall in 2 s | Lava: mean particle speed | Syrup: rise | Syrup: speed | Water: speed |
+| | Lava: rise next to the left wall in 2 s | Lava: mean particle speed | Honey: rise | Honey: speed | Water: speed |
 |---|---|---|---|---|---|
 | before | 11.63 cells | 0.415 cells/s | 11.68 cells | 0.407 cells/s | 0.634 cells/s |
 | after | 0.02 | 0.066 | 0.02 | 0.063 | 0.634 (unchanged) |
@@ -1927,10 +2388,10 @@ What is left, 0.04 – 0.07 cells/s, sits in the top cells (`LAB_MAP=1`; below t
 
 **Test change: the three-liquid overturn starts from a seeded interface and is judged at
 48 s** (`validate layers`). It used to start from flat layers and pass at 40 s, but the
-overturn was started by the spurious wall flow: on Upside Down at 1.5 s the syrup already
+overturn was started by the spurious wall flow: on Upside Down at 1.5 s the honey already
 slid down both side walls, while with the fix the interfaces stay flat and a Rayleigh-Taylor
 instability can grow only from particle noise. From flat layers the fixed solver left
-11.4 % of the water/syrup above the oil floor at 40 s (81 / 71 / 47 / 27 / 11 % at 8 – 40 s,
+11.4 % of the water/honey above the oil floor at 40 s (81 / 71 / 47 / 27 / 11 % at 8 – 40 s,
 before: 68.5 / 41 / 13.6 / 0.26 / 0.34 %). Both interfaces now carry a one-cell sine bump
 of wavelength 64 cells, as Rayleigh-Taylor set-ups do, and the check reads 48 s (6 × 8 s).
 Share above the oil floor at 8, 16, 24, 32, 40, 48 s, with oil viscosity at its default and
@@ -1944,7 +2405,7 @@ Share above the oil floor at 8, 16, 24, 32, 40, 48 s, with oil viscosity at its 
 Seeded, both orders overturn at the same pace; the fixed one finishes separating sooner and
 more reliably (before, one of three runs was above 3 % at 40 s).
 
-Other checks the order touches, before → after: sludge slump run-out 53.4 cells (theory 47.4)
+Other checks the order touches, before → after: clay slump run-out 53.4 cells (theory 47.4)
 unchanged; Bingham slot 4.3 % L2; Stefan front +2.0 %; rigid ice at rest (fastest frozen
 particle 0.00 cells/s); steam bubbles escaping from 20 °C water 87 → 95 of 1928 (limit 5 %,
 96); viscosity solves left unconverged in 4 s of Playground at 1024 × 576 92 → 44.
@@ -1978,7 +2439,7 @@ prints the per-row diagnosis):
 The depths that end on a full row of particles (23.0, 28.8, 43.2) never form such a cell
 and are unchanged; their slow rise from about 0.04 is the same in both builds. At 34.6
 cells: water viscosity +0.1 % gives 0.013 (before 1.66); the correction off gives 0.012
-(before 0.1). Water under oil 0.032 → 0.032; a bare syrup pool 0.41 → 0.39 (its wall
+(before 0.1). Water under oil 0.032 → 0.032; a bare honey pool 0.41 → 0.39 (its wall
 circulation, Limitations).
 
 Tried before this and set aside:
@@ -2019,7 +2480,7 @@ liquids too; ferrofluid should spike near a magnet, and that interaction should 
 | Symptom | Cause | Fix | Measured |
 |---|---|---|---|
 | Blood in honey a red band 2 – 3 cells wide in cell-sized steps; ferrofluid in oil black squares | Colour from the cells alone within a phase group: a few particles of a strong absorber count as spread through each cell, then over 3 × 3 | Colour from the particles (the tint field) and the rest of the look from the matching cells (Look, "Which liquid is where") | `gallery DIR mix`: a dotted trail of drops instead of a band (`docs/look/fixes/blood_ferrofluid.jpg`) |
-| Ferrofluid in the Playground pool (syrup, water and oil): a black ring with a pale rim round every speck | The tint field took the other side's few percent out with the cells' blend of it (oil and ferrofluid), and ferrofluid absorbs so strongly that the error dominated | The particles' colour gives way to the cells' where what is taken out is large against what stays (`TINT_TRUST`, composite.frag) | `gallery DIR ferro_pool`: rings gone; liquids of one side only (`mix`) unchanged |
+| Ferrofluid in the Playground pool (honey, water and oil): a black ring with a pale rim round every speck | The tint field took the other side's few percent out with the cells' blend of it (oil and ferrofluid), and ferrofluid absorbs so strongly that the error dominated | The particles' colour gives way to the cells' where what is taken out is large against what stays (`TINT_TRUST`, composite.frag) | `gallery DIR ferro_pool`: rings gone; liquids of one side only (`mix`) unchanged |
 | Blood and other liquids in pixel steps when zoomed out, sharp when zoomed in | The tint field (4-pixel texels, kernels 1.5 texels wide zoomed out) read bilinearly under a sharp 95 – 99.5 % ownership cut: the edge followed the texel grid | Cubic B-spline read of the tint field (`tint_read`, composite.frag) | `gallery DIR mix`, `mix_blood_honey_mid` (1.5x): stepped edges and square drops → smooth edges and round drops; close-up unchanged |
 | A dish over a magnet never comes to rest | The face's share of the force was susceptibility × occupancy (particle noise times tens of g, not a gradient); a surface face got half the force | The liquid's susceptibility (Physics, Magnetism) | Ferrofluid map, kinetic energy after 10 s (`probe --map 17 --at 10`): ~9000 → ~3500 |
 | ... and still not | The local shape-dependent demagnetisation is not the force of an energy | `magnet_demag` (default 0) | ~3500 → ~380 (the same dish without a magnet: ~350) |
@@ -2041,6 +2502,71 @@ Flicker (motion frames, `gallery DIR motion`, before → after): Kitchen 0.073 �
 chocolate now drawn as moving drops rather than smoothed cells), Ferrofluid 0.037 → 0.051 %
 (the spikes' outline rides the moving surface); Dam Break, Playground, Upside Down, Lava Meets
 Water and the droplets unchanged.
+
+### Interface overhaul (2026-11-16)
+
+New `validate devices` (20 checks) for the tools that came with the new interface:
+
+| Check | Measured |
+|---|---|
+| Pull: liquid under the brush moves inwards, nothing lost or packed | −38 cells/s radially; fullest cell 16 particles (rest 4) |
+| Whirl: turns the liquid, either way | +188 and −187 cells/s around the cursor (whirl speed 200) |
+| Hold: a block in mid-air for 1.5 s; released | sinks 0.0 cells, rms 0.0 cells/s; then falls 124 cells in 0.5 s |
+| Drain: in the air; on the floor of a pool; removed | takes nothing; 121 440 → 68 747 particles in 2 s; takes no more |
+| Faucet, 6000 particles/s for 2 s: aimed down; aimed sideways | 11 925 of 12 000; 11 319 (no nozzle: see [Controls](#controls)) |
+| Rain at 12 000 /s | 3458 drops in 1 s (30 %: 3600), from −26 to +26 cells of the cursor (cloud ± 27), all falling |
+
+The shader changes behind them: tool modes 7 (whirl) and 8 (hold) in `tool_target`
+(`air.glsl`), Pull as Push with a negative speed, and drains as zones with a negative rate
+(`particles.comp`; `MAX_CURRENTS` 8 → 16). None is a stabilisation device and none acts
+unless its tool is used, so the stabilisation table is unchanged. With them in:
+`validate` all 262 checks pass (26 tests), `--selftest` 80 checks pass (it now drives the
+group keys, Tab, undo and redo, Delete, the modifier wheels, the pipette, every new tool,
+dragging out, backing out of a drag, and the view making room for the dock), `cargo test`
+47 pass, clippy clean.
+
+One thing the self-test found: with the dock at the bottom of a tank that filled the
+window, tools did nothing on the middle of the floor (strokes stop at the panels). The
+tank is now fitted above the dock (`View::fit_above`, `Camera::set_below`).
+
+### Liquids overhaul (2026-11-16)
+
+`validate`: 379 checks, all pass (241 before; the robustness run `validate liquids` now
+drops, pours and settles each of the 57 liquids: 171 checks). `--selftest`, `cargo test
+--release` (50, three of them new: the rows match the constants, the simple liquids are
+simple, reactions and residues point at rows that exist) and `cargo clippy --release` pass.
+The physics checks run on the same liquids as before under their new names (honey, clay
+slip); none of their limits was changed.
+
+What the first run found, and what was done:
+
+- **Grainy raced** (752 cells/s, the speed cap; rms speed 48 cells/s and not falling):
+  friction on a liquid as thin as water. Grainy was given a viscosity of 2 Pa s, as wet
+  sand has (which passed from the start: fastest 11 cells/s, rms 4.0 -> 1.3). The cause, a
+  yield stress that follows the last substep's pressure, is not fixed (Limitations).
+- **A pour aimed wholly past the grid's edge panicked** (`World::admission` clamped an
+  inverted window). The stress test that pours every liquid across the tank placed the
+  19th and later ones outside it; both the window and the test were fixed.
+
+The new physics has no analytic checks yet: friction (the pile's slope against the
+friction angle), the reaction's heat budget and the evaporation rate are covered only by
+the robustness runs and the gallery scenes (`sprout gallery DIR new`).
+
+![The new properties](docs/liquids-overhaul.png)
+
+Beer (fizz, froth), liquid soap in water (pearl, lather), glitter polish, the marbled and
+pearly liquids, glow-stick fluid in water, lye poured into battery acid, the Grainy liquid.
+
+### Materials that move with the liquid (2026-11-16, second round)
+
+`validate`: 376 checks, all pass (379 before, less the three of wet sand in `validate
+liquids`); `validate render` and `validate liquids` re-run on the final build (after the
+refractive indices and `sss_iters` 4) pass. `--selftest` (with the Box tool now spanned
+from a corner), `cargo test --release` (50; the placement test now checks the corner span,
+the square, and a turned box) and `cargo clippy --release` pass. Nothing checks the look
+against theory: the new systems were judged in `sprout gallery DIR look` (pearl, marble,
+glitter and honey still, whirled and after; a splash, beer, and five liquids side by side
+in the light) and `gallery DIR new`.
 
 ## Performance
 
@@ -2101,7 +2627,7 @@ Reading these honestly:
   one dispatch and one pass fewer per iteration; speed cap + CFL 4 + spray relaxation,
   4741 → 1563 substeps over the first 10 s of Dam Break 768. Not adopted: pressure tolerance
   1e-3 (11 → 8 iterations in a resting pool, all checks pass, but the tolerance was left
-  alone); viscosity tolerance 1e-2 (syrup front 1.02 → 1.03). Measured and rejected:
+  alone); viscosity tolerance 1e-2 (honey front 1.02 → 1.03). Measured and rejected:
   dropping the barriers between dispatches (the solve diverges), a narrower work group for
   the coarse levels (4 × slower).
 - **Frame pacing is even.** Dam Break 1600 × 900 used to alternate between one and two
@@ -2162,7 +2688,7 @@ and the new build, interleaved, three rounds each, 600 frames, `--no-vsync`, win
 | Density Tower, high | new | 8.69 | 13.67 | 15.25 | 0.56 |
 | Glass and Slime, high | new | 11.64 | 13.29 | 13.79 | 0.79 |
 
-Water, syrup and oil scenes are 3–5 % slower per frame (Playground's light frames more).
+Water, honey and oil scenes are 3–5 % slower per frame (Playground's light frames more).
 Per substep the simulation is within 1 % (`profile`, minimum of three: Dam Break 1024 × 576
 4.83 → 4.88 ms, Upside Down 768 × 432 11.29 → 11.39 ms; the particle pass is 1 % slower on
 the dam break, 13 % on the three-liquid overturn, grid preparation 0.16 → 0.19 ms); the
@@ -2255,7 +2781,7 @@ dish of liquid to simulate and draw instead of a crushed film. Head-less the sol
 on it, not slower (`probe --map 17 --at 4`: 3 120 substeps either way, the capillary limit;
 5.07 → 4.88 s wall; `profile`: 1.45 → 1.40 ms per substep, the particle pass 0.23 → 0.07 ms
 without the per-particle field lookups, the magnet passes 0.012 → 0.033 ms for the second
-dispatch). Isothermal water, oil and syrup scenes run none of the changed code apart from the
+dispatch). Isothermal water, oil and honey scenes run none of the changed code apart from the
 spray-landing test and the collision rescue, which only runs after a second push.
 
 ### Steam and slime (2026-11-14)
@@ -2661,7 +3187,7 @@ second after warm-up):
 
 | Map | Before | After |
 |---|---|---|
-| Playground (water and syrup: the tint field is drawn) | 7.16 / 8.15 / 10.17, 4.77 / 8.12 / 11.19; 1.00×, 0.99× | 7.67 / 8.41 / 8.79, 5.01 / 8.39 / 8.71; 0.99×, 1.00× |
+| Playground (water and honey: the tint field is drawn) | 7.16 / 8.15 / 10.17, 4.77 / 8.12 / 11.19; 1.00×, 0.99× | 7.67 / 8.41 / 8.79, 5.01 / 8.39 / 8.71; 0.99×, 1.00× |
 | Ferrofluid | 12.39 / 12.89 / 13.37, 12.38 / 12.83 / 13.49; 1.00× | 8.16 / 8.51 / 9.41, 7.91 / 8.40 / 9.44; 1.00× |
 | Oil Drops (1 mm cells) | 11.82 / 12.39 / 12.95, 11.72 / 12.28 / 12.91; 0.25× | 12.05 / 12.59 / 13.33, 12.05 / 12.59 / 13.14; 0.25× |
 
@@ -2672,8 +3198,135 @@ step is longer. Render passes per 1080p frame (`SPROUT_PROFILE_SIZE=1920x1080 sp
 by its triangles, not its pixels (three full-resolution targets on the main splat instead
 cost 1.0 ms), hence it is drawn only where two liquids share a phase group.
 
+### Interface overhaul (2026-11-16)
+
+The new interface draws more (vector icons, the palette's swatches, animated selection)
+and costs a little more CPU per frame. `sprout --map 0 --no-vsync --frames 2500`, old and
+new builds interleaved three times each, 1600 × 900, 512 × 288:
+
+| Build | p5 | p50 | p75 | p95 | p99 | mean | simulated / wall after warm-up |
+|---|---|---|---|---|---|---|---|
+| before | 0.98 – 1.00 ms | 1.13 – 1.14 | 1.27 – 1.28 | 5.27 – 5.37 | 5.48 – 8.37 | 1.85 – 1.95 | 0.98 – 0.99 × |
+| after | 1.08 – 1.09 ms | 1.26 – 1.30 | 1.42 – 1.50 | 5.33 – 5.35 | 5.52 – 5.58 | 2.03 – 2.16 | 0.98 – 0.99 × |
+
+So about 0.13 ms more per frame at the median (2 % of a 165 Hz frame), nothing at the
+95th percentile (frames with substeps), and the same simulated time per wall second. The
+simulation itself is unchanged when no new tool is in use. Costs that come only with use:
+each faucet reads back the cells around its spout (0.3 ms per frame); the pipette reads the
+particles back once per click; drawing or moving a solid rasterises the solids at most 60
+times a second (10 ms at 512 × 288, 47 ms at 1024 × 576: frames stretch while dragging).
+
+### Liquids overhaul (2026-11-16)
+
+Old and new builds, identical commands, interleaved, RTX 3060 Ti with the desktop at
+15 - 35 % GPU load. No stabilisation was added or changed.
+
+| | old | new |
+|---|---|---|
+| Playground window, `--no-vsync --frames 900`: frame time p50 / p95 / p99 (two runs each) | 1.44 / 8.97 / 9.36 and 1.43 / 9.40 / 12.54 ms | 1.48 / 8.99 / 12.26 and 1.49 / 9.16 / 12.21 ms |
+| Map 2, same: p50 / p95 / p99 | 1.70 / 5.06 / 5.76 and 1.66 / 5.00 / 5.32 ms | 1.75 / 5.29 / 6.06 and 1.72 / 5.21 / 5.70 ms |
+| Simulated time per wall second after warm-up (both maps) | 0.99 - 1.00 | 0.99 - 1.00 |
+| `bench --at 2 --size 1920x1080 --grid 512x288 --map 0`: simulation alone | 2.12, 2.07 x real time | 2.11, 2.10 x real time |
+| same: render per 1080p frame | 1.229, 1.256 ms | 1.318, 1.294 ms |
+
+The simulation costs the same in tanks without the new physics (the reaction pass is
+behind `CAP_REACT`; friction rides the rheology pass). Rendering costs about 5 % more
+(0.06 - 0.09 ms a 1080p frame; the median window frame 0.04 - 0.06 ms): three more cell
+optics layers, the foam update in the flow map pass, and the foam and surface work in
+every composite variant. This round adds features; it is not a speed-up.
+
+### Materials that move with the liquid (2026-11-16, second round)
+
+Old and new builds, identical commands, interleaved, RTX 3060 Ti, desktop idle. No
+stabilisation was added or changed; the simulation is untouched (the new passes run once
+a rendered frame, after the substeps).
+
+| | old | new |
+|---|---|---|
+| Playground window, `--no-vsync --frames 900`: frame time p50 / p95 / p99 (two runs each) | 1.30 / 8.53 / 8.77 and 1.33 / 8.60 / 8.98 ms | 1.33 / 8.62 / 8.84 and 1.32 / 8.44 / 8.83 ms |
+| Map 2, same | 1.59 / 4.84 / 4.95 and 1.59 / 4.83 / 4.94 ms | 1.67 / 5.05 / 5.27 and 1.68 / 5.04 / 5.17 ms |
+| Simulated time per wall second after warm-up (both maps) | 0.99 - 1.00 | 0.99 - 1.01 |
+| `bench --at 2 --size 1920x1080 --grid 512x288 --map 0`: simulation alone | 2.22, 2.23 x real time | 2.22, 2.22 x real time |
+| same: render per 1080p frame (no per-frame passes) | 1.229, 1.226 ms | 1.278, 1.289 ms |
+| `profile --map 2`, 1080p: per-frame optics passes | 0.451, 0.447 ms | 0.61 - 0.63 ms (`sss_iters` 4; 0.54 at 0, 0.68 at 8) |
+| same: composite pass, this tank's variant / every effect compiled in | 0.887 / 1.339 ms | 0.835 / 0.993 ms |
+
+Where the cost went: the light under the surface ~0.017 ms per Jacobi iteration at 512 x 288
+(default 4 a frame, warm-started, so it settles over a few frames); bubbles, foam and spray,
+the look state and the coloured light ~0.09 ms together; the look splat and the sprites only
+in tanks that have such a liquid or bubbles. The composite is cheaper: the drawn fizz, foam,
+glitter and flow-map pearl and marble are gone from it. The median frame is unchanged on the
+Playground and 5 % slower on Map 2; this round adds features, it is not a speed-up.
+
+
+### Particles in the liquid (2026-11-17)
+
+Old build (the tree before this round, rebuilt in a scratch copy) against new, each run
+alternately with identical commands, `SPROUT_FRAMES_CSV=… sprout --no-vsync --frames 1500
+--map M` (frame times after the first 100 frames, ms; both simulate 0.98–1.00 s per wall
+second in every run):
+
+| Map | old p50 / p95 / p99 | new p50 / p95 / p99 |
+|---|---|---|
+| Playground | 1.18 / 5.22–5.33 / 5.36–8.07 | 1.20 / 5.17–5.24 / 5.37–8.04 |
+| Mud Flats (mud now has specks) | 1.04–1.05 / 5.06–5.17 / 5.18–5.37 | 0.98 / 5.14–5.15 / 5.29–5.31 |
+| Kitchen (milk, blood) | 1.52–1.56 / 9.04–9.13 / 9.42–9.82 | 1.52–1.56 / 9.10–9.45 / 9.40–9.88 |
+
+No measurable change: the particle model is worked out once per table upload on the CPU, the
+composite reads two more cell-optics layers, and the specks share the pool's existing pass
+(its dispatch covers three times the entries; free entries return at once). One Kitchen run of
+the new build had a p50 of 5.3 ms; four more runs of each build gave 1.52–1.56 for both.
+Checks: `validate` 376 passed, `--selftest` passed (three runs; a fourth, while another
+Sprout window held the GPU, failed four checks), `cargo test --release` 54, clippy clean.
+
+
+### Films, stains and drips (2026-11-17, second round)
+
+Old build (before both rounds of 2026-11-17) against new, alternately, identical commands
+(`SPROUT_FRAMES_CSV=… sprout --no-vsync --frames 1500 --map M`, two runs each, ms):
+
+| Map | old p50 / p95 / p99 | new p50 / p95 / p99 |
+|---|---|---|
+| Playground | 1.19–1.20 / 5.21–5.23 / 8.15–8.17 | 1.33–1.38 / 5.55–5.56 / 5.76–6.01 |
+| Mud Flats | 1.04–1.05 / 5.13–5.14 / 5.30–5.32 | 1.03 / 5.18–5.20 / 5.37–5.38 |
+| Kitchen | 1.53–1.54 / 9.21–9.25 / 9.49–9.58 | 1.61 / 9.44–9.52 / 9.72–9.94 |
+
+All simulate 0.98–1.00 s per wall second. The cost is the film map, which now runs wherever
+liquid is (until now only after a staining liquid had been in the tank; Playground holds
+only water). `sprout profile --map 0` at 1600 × 900: per-frame optics passes 0.54 → 0.66 ms
+(0.50 with the film map off), composite 0.46 → 0.59 ms (0.47 off). Before the composite was
+trimmed (the scattering colour read once per pixel, the film's slope from bilinear taps:
+composite 0.78 → 0.59 ms) Playground's p50 was 1.58–1.61 ms. Tried and dropped: skipping
+the film under a settled pool (no measurable gain, and tiles frozen mid-coat drew blocks).
+Checks: `validate` 376 passed, `--selftest` passed, `cargo test --release` 55, clippy clean.
+
 ## Limitations
 
+- **The new properties are simple models** (2026-11-16, Liquids, "New properties").
+  Reactions are not stoichiometric (each partner converts at its own rate while the other
+  is in its cell). Evaporation removes liquid and its heat but does not cool what stays.
+  Fizz never goes flat. Fumes are white mist that rises like steam: liquid
+  nitrogen's fog does not sink. Friction uses the total pressure of the last projection,
+  so submerged sand is a little too strong, and on a liquid as thin as water it races
+  (the yield stress follows a pressure that follows the motion): the Grainy liquid has a
+  viscosity of 2 Pa s for that reason. A thermochromic liquid shows its
+  hot colour through the cells, not through the particles' own tint where two liquids of
+  one phase group share a pixel. Molten iron's surface tension is 0.75 N/m, the top of
+  the solver's range, not its real 1.8.
+- **Bubbles, foam and the carried look are one-way** (2026-11-16, second round): bubbles and
+  foam ride the liquid and never push it (a head of foam weighs nothing, a bubble does not
+  lift the liquid), and the pool holds 65 536 at once (beyond that new ones are not made).
+  Foam has no volume of its own: its parcels are kept apart by a crowding push, not by
+  packing. Platelets and flakes turn by the particle's velocity gradient of the last
+  substep, integrated once a rendered frame; in this plane flow they leave the plane only
+  through the stretch of the flow. The light under the surface is a diffusion solve on the
+  cells: it resolves nothing finer than a cell and catches up over a few frames after fast
+  motion; clear liquids are not diffusive at all, and their light is capped at a diffusion
+  length of a few cells. A reload or a new scene gives every particle a fresh look state.
+- **Simple liquids of the aqueous group do not sort by density among themselves**: Heavy
+  poured into Blank sinks as a body and then stays blended where the two have stirred
+  together, as miscible liquids without diffusion (the drift within a group acts in the
+  other three groups only).
 - **Some pressure solves run out of recorded iterations in Lava Meets Water** (found
   2026-11-15, Performance, "Performance pass"): the iterations a substep records follow
   what recent ones needed, and a sudden jump (16 of the first 395 substeps of Lava Meets
@@ -2719,7 +3372,7 @@ cost 1.0 ms), hence it is drawn only where two liquids share a phase group.
   film map lasts while the tank runs; it is not saved with it.
 - **Water's blue is stylised**: about thirty times its real absorption, so that a tank of it
   is blue. Mixtures are made to look as if water were clear (its tint gives way to whatever
-  is dissolved in it, by exp(−24 c)); a trace of syrup or blood at the very edge of a plume
+  is dissolved in it, by exp(−24 c)); a trace of honey or blood at the very edge of a plume
   can still show a narrow teal fringe.
 - **The quenched skin of lava is drawn, not simulated.** Its face temperature comes from a
   steady balance across half a cell, so the rind is drawn from the first moment, while the
@@ -2731,7 +3384,7 @@ cost 1.0 ms), hence it is drawn only where two liquids share a phase group.
   for mercury); nothing known reaches that now (see Validation, "Brush clumps"), but a
   wrapped cell still runs away rather than failing safely.
 
-- **Water, syrup and oil scenes are 2–3 % slower per frame than before the materials round**
+- **Water, honey and oil scenes are 2–3 % slower per frame than before the materials round**
   (see Performance, "Second fixes round"): the solver is back to its old cost; the
   generalised renderer's composite and per-cell optics are not (about 0.15 ms per 1080p
   frame), and part of the difference is not accounted for.
@@ -2763,7 +3416,7 @@ cost 1.0 ms), hence it is drawn only where two liquids share a phase group.
   hard.
 - **No gas phase** besides steam bubbles: there is no air to push, steam that escapes leaves
   the simulation (reported as boiled); salt residue does not redissolve; suspensions do not cream (milk fat); a particle holds one concentrate, so
-  ink in syrup-water mixes with the water only.
+  ink in honey-water mixes with the water only.
 - **Fast flows at high resolution are still slower than the original** (see Performance): the
   step follows the fastest liquid, and each substep solves pressure to a tolerance.
 - **Contact angles are biased towards non-wetting**: 60° settles at 77°, 120° at 144° (90° at
@@ -2818,15 +3471,18 @@ cost 1.0 ms), hence it is drawn only where two liquids share a phase group.
 | [shaders/](shaders/) | All GPU code. `common.glsl` documents the grid layout and every buffer; `reduce_tail.glsl` the scalar steps of the Krylov solves (run in the last work group of the kernel before them), `visc_iter.comp` one Jacobi-preconditioned viscosity iteration (and, specialised, its warm start), `vmg.glsl` the viscosity multigrid and its iteration (`visc_mgu.comp`, `visc_mgz.comp`, `vmg_*.comp`). |
 | [src/render.rs](src/render.rs), [src/gui.rs](src/gui.rs) | The renderer (see [Look](#look)): splatting, the wide field, the wet map, shading; a small egui painter |
 | `shaders/splat.*`, `tint.frag`, `down.frag`, `blur.frag`, `wet.frag`, `composite.frag` | The render passes (`tint.frag`: the aqueous liquids' colour from their particles); `composite.frag` holds the whole look, ferrofluid spikes included |
-| [src/app.rs](src/app.rs), [src/ui.rs](src/ui.rs), [src/camera.rs](src/camera.rs), [src/pacing.rs](src/pacing.rs) | Window and input; panel and canvas overlays; eased camera; substep pacing |
+| [src/app.rs](src/app.rs), [src/camera.rs](src/camera.rs), [src/pacing.rs](src/pacing.rs) | Window, input and the gestures of the placing tools; eased camera; substep pacing |
+| [src/ui/](src/ui/mod.rs) | The interface: tools and groups (`mod.rs`), colours and fonts (`theme.rs`), vector icons (`icons.rs`), controls and their motion (`widgets.rs`), the dock (`dock.rs`), bars, palette and drawer (`chrome.rs`), canvas overlays (`overlay.rs`). The display face is Comfortaa (SIL OFL, [assets/fonts](assets/fonts/)) |
 | [src/brush.rs](src/brush.rs) | Brush strokes, the stream of the pour and the jet, and the admission of new liquid (CPU only) |
 | [src/maps.rs](src/maps.rs) | Built-in maps |
-| [src/sim/material.rs](src/sim/material.rs) | Material definitions (`MatProps`), the 18 built-ins with sources, phase groups, pair tensions, mixing overrides, the GPU material and optics tables |
+| [src/sim/presets.rs](src/sim/presets.rs) | The built-in liquids: 27 real ones with their sources, 29 simple ones, 3 by-products; the test that keeps the simple ones simple |
+| [src/sim/material.rs](src/sim/material.rs) | Material definitions (`MatProps`), phase groups, pair tensions, mixing overrides, the GPU material and optics tables |
 | [src/library.rs](src/library.rs), [src/editor.rs](src/editor.rs) | Custom-liquid file (versioned, validated); liquid picker, editor (draft / live / saved) and swatches |
 | [src/checks.rs](src/checks.rs) | The materials' validation scenarios |
 | [src/stress.rs](src/stress.rs) | Robustness runs with bounds instead of answers: every map, every liquid, tools at their limits, parameter extremes, the renderer (`validate maps liquids abuse extremes render`) |
 | `shaders/heat.comp`, `rigid.comp`, `rheo.comp`, `elastic.comp`, `settle.comp`, `magnet.comp`, `cell_optics.comp`, `optics_blur.comp` | Conduction (with eddy mixing and evaporation), rigid bodies, non-Newtonian viscosity, viscoelastic force, settling, magnetic energy, per-cell optics and their 3 × 3 smoothing |
-| `shaders/optics.glsl`, `light.comp`, `film.comp`, `film_tiles.comp`, `flow_map.comp`, `glow.comp`, `smoke.comp` | The render side of the simulation: colour from absorption and scattering, the light from above, the film map of stains and runs (and its list of tiles), how far the liquid has carried its patterns, the glow field, the smoke field |
+| `shaders/optics.glsl`, `light.comp`, `sss.comp`, `film.comp`, `film_tiles.comp`, `flow_map.comp`, `glow.comp`, `smoke.comp` | The render side of the simulation: colour from absorption and scattering, the light from above and the light under the surface, the film map of stains and runs (and its list of tiles), how far the liquid has carried its patterns, the glow field, the smoke field |
+| `shaders/look.comp`, `look.vert`, `spray.comp`, `sprite.vert`, `sprite.frag` | What the particles carry for the look (platelets, flakes, the marble's and the film's carried scalar) and its splat; bubbles, foam and spray and the sprites that draw them and the flakes (README, "Look", "Materials that move with the liquid") |
 | [src/validate.rs](src/validate.rs), [src/selftest.rs](src/selftest.rs), [src/headless.rs](src/headless.rs) | Checks, benchmarks, screenshots |
 | [tools/drop_modes.py](tools/drop_modes.py) | Reference periods for the oil-drop oscillation check (viscous normal modes; plain Python) |
 

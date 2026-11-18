@@ -25,9 +25,14 @@ float sample_sdf(vec2 x, out vec2 grad) {
 // cursor. Grab (1) carries liquid along with the cursor and pulls it in; push (3) drives it
 // radially outwards at the speed in tool_vel.x, with a smooth centre where the direction is
 // undefined; a stream's nozzle (4) holds it at the launch velocity.
+// Whirl (7) turns it around the cursor: like a rigid body inside 0.4 of the radius, at the
+// speed in tool_vel.x outside, with a gentle pull inwards that keeps the liquid in the
+// whirl; hold (8) brings it to rest.
 vec2 tool_target(vec2 d) {
     if (P.tool_mode == 3) return -d / max(length(d), 0.15 * P.tool_radius) * P.tool_vel.x;
     if (P.tool_mode == 4) return P.tool_vel;
+    if (P.tool_mode == 7) return vec2(d.y, -d.x) / max(length(d), 0.4 * P.tool_radius) * P.tool_vel.x + d * 2.0;
+    if (P.tool_mode == 8) return vec2(0.0);
     return P.tool_vel + d * 4.0;
 }
 
@@ -165,7 +170,7 @@ vec2 air_velocity(vec2 x, float lean, out float occ) {
     vec2 vl = sample_vel(x, v - vec2(0.0, P.steam.y));
     v = mix(v, vl + vec2(0.0, P.steam.y), smoothstep(0.0, 0.4, occ));
     // The mouse tool (Erase is handled by the callers).
-    if (P.tool_mode == 1 || P.tool_mode == 3 || P.tool_mode == 4) {
+    if (P.tool_mode == 1 || P.tool_mode == 3 || P.tool_mode == 4 || P.tool_mode == 7) {
         vec2 td = P.tool_pos - x;
         float r2 = dot(td, td) / (P.tool_radius * P.tool_radius);
         if (r2 < 1.0) v = mix(v, tool_target(td), 1.0 - r2);

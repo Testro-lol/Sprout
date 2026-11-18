@@ -9,7 +9,7 @@ use crate::{
     render::View,
     maps::fill_rect,
     scene::{Scene, Shape, WALL},
-    sim::{Current, Material, PhaseGroup, NOMINAL_DT, PPC, Particle, SimParams, ToolState},
+    sim::{Current, Material, PhaseGroup, NOMINAL_DT, PPC, Particle, SimParams, ToolState, WHIRL_SPEED},
     world::{Source, World},
 };
 
@@ -47,9 +47,9 @@ fn is_oil(p: &Particle) -> bool {
     p.is(Material::Oil)
 }
 
-/// Syrup share of a particle (0 for water and oil).
-fn syrup_in(p: &Particle) -> f32 {
-    if p.is(Material::Syrup) { p.s } else { 0.0 }
+/// Honey share of a particle (0 for water and oil).
+fn honey_in(p: &Particle) -> f32 {
+    if p.is(Material::Honey) { p.s } else { 0.0 }
 }
 
 pub(crate) fn world(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), fills: &[([f32; 4], Material)]) -> World {
@@ -237,9 +237,9 @@ fn ritter(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.check("flow speed at the dam site / sqrt(g h0)", format!("{:.3}", speed), "2/3 = 0.667 (+/- 10 %)", (speed / (2.0 / 3.0) - 1.0).abs() < 0.10);
 }
 
-/// Three layers stacked upside down must overturn into oil / water / syrup.
+/// Three layers stacked upside down must overturn into oil / water / honey.
 fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
-    println!("\nRayleigh-Taylor overturn (oil under water under syrup, 48 s)");
+    println!("\nRayleigh-Taylor overturn (oil under water under honey, 48 s)");
     // Both interfaces carry a one-cell sine bump (wavelength 64 cells), as Rayleigh-Taylor
     // set-ups do: a perfectly flat interface has no defined onset, and grows only from the
     // particle noise. Until 2026-11-15 the layers were flat and the overturn was seeded by
@@ -254,13 +254,13 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
             if p.pos[1] < 60.0 + bump {
                 *p = Particle::new(Material::Oil, p.pos, [0.0, 0.0]);
             } else if p.pos[1] >= 120.0 - bump {
-                *p = Particle::new(Material::Syrup, p.pos, [0.0, 0.0]);
+                *p = Particle::new(Material::Honey, p.pos, [0.0, 0.0]);
             }
         }
         world_from(gpu, GRID, apply, ps)
     };
     let before = w.sim.download_particles();
-    let syrup0: f64 = before.iter().map(|p| syrup_in(p) as f64).sum();
+    let honey0: f64 = before.iter().map(|p| honey_in(p) as f64).sum();
     let area0 = occupied_area(&before);
     let sp = w.sim.params;
     // Nothing here may add mechanical energy: overturning turns potential energy into
@@ -298,32 +298,32 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
     let (ke1, pe1) = energy(&ps);
     let released = pe0 - pe1;
     let oil_y = mean_height(&ps, |p| (is_oil(p)) as u32 as f32);
-    let water_y = mean_height(&ps, |p| if is_oil(p) { 0.0 } else { 1.0 - syrup_in(p) });
-    let syrup_y = mean_height(&ps, syrup_in);
+    let water_y = mean_height(&ps, |p| if is_oil(p) { 0.0 } else { 1.0 - honey_in(p) });
+    let honey_y = mean_height(&ps, honey_in);
     r.check(
-        "mean heights oil / water / syrup",
-        format!("{:.0} / {:.0} / {:.0} cells", oil_y, water_y, syrup_y),
-        "oil > water > syrup",
-        oil_y > water_y + 20.0 && water_y > syrup_y,
+        "mean heights oil / water / honey",
+        format!("{:.0} / {:.0} / {:.0} cells", oil_y, water_y, honey_y),
+        "oil > water > honey",
+        oil_y > water_y + 20.0 && water_y > honey_y,
     );
     // Oil should end as one clean layer: almost all of it above almost all the rest.
     let below = trapped(&ps);
     println!(
-        "  water/syrup above the oil layer's floor at 8, 16, 24, 32, 40, 48 s: {}",
+        "  water/honey above the oil layer's floor at 8, 16, 24, 32, 40, 48 s: {}",
         trend.iter().map(|t| format!("{:.2} %", t * 100.0)).collect::<Vec<_>>().join(", ")
     );
-    r.check("water/syrup left above the oil layer's floor", format!("{:.2} %", below * 100.0), "< 3 %", below < 0.03);
-    let syrup1: f64 = ps.iter().map(|p| syrup_in(p) as f64).sum();
+    r.check("water/honey left above the oil layer's floor", format!("{:.2} %", below * 100.0), "< 3 %", below < 0.03);
+    let honey1: f64 = ps.iter().map(|p| honey_in(p) as f64).sum();
     r.check(
-        "dissolved syrup volume conserved",
-        format!("{:+.4} %", (syrup1 / syrup0 - 1.0) * 100.0),
+        "dissolved honey volume conserved",
+        format!("{:+.4} %", (honey1 / honey0 - 1.0) * 100.0),
         "|drift| < 0.1 %",
-        (syrup1 / syrup0 - 1.0).abs() < 1e-3,
+        (honey1 / honey0 - 1.0).abs() < 1e-3,
     );
-    // Miscibility: water and syrup should have blended; oil particles never change kind.
-    let aq: Vec<f32> = ps.iter().filter(|p| !is_oil(p)).map(syrup_in).collect();
+    // Miscibility: water and honey should have blended; oil particles never change kind.
+    let aq: Vec<f32> = ps.iter().filter(|p| !is_oil(p)).map(honey_in).collect();
     let mixed = aq.iter().filter(|&&s| s > 0.1 && s < 0.9).count() as f32 / aq.len() as f32;
-    r.check("aqueous particles that are a water-syrup blend", format!("{:.0} %", mixed * 100.0), "> 50 %", mixed > 0.5);
+    r.check("aqueous particles that are a water-honey blend", format!("{:.0} %", mixed * 100.0), "> 50 %", mixed > 0.5);
     let n_oil0 = before.iter().filter(|p| is_oil(p)).count();
     let n_oil1 = ps.iter().filter(|p| is_oil(p)).count();
     r.check("oil phase conserved", format!("{} -> {}", n_oil0, n_oil1), "equal", n_oil0 == n_oil1);
@@ -343,15 +343,15 @@ fn stratification(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report
     );
 }
 
-/// Viscous gravity current: a syrup column slumping over a no-slip floor. In the
+/// Viscous gravity current: a honey column slumping over a no-slip floor. In the
 /// lubrication regime the front follows Huppert's (1982) similarity solution
 /// x = 1.411 (g q^3 / 3 nu)^(1/5) t^(1/5), with q the released area.
 fn viscous_current(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
-    println!("\nViscous gravity current (syrup, Huppert 1982)");
+    println!("\nViscous gravity current (honey, Huppert 1982)");
     let (bw, bh) = (50.0, 60.0);
-    let mut w = world(gpu, apply, &[([0.0, 0.0, WALL + bw, WALL + bh], Material::Syrup)]);
+    let mut w = world(gpu, apply, &[([0.0, 0.0, WALL + bw, WALL + bh], Material::Honey)]);
     let q = w.sim.download_particles().len() as f32 / PPC as f32;
-    let (g, nu) = (w.sim.params.g_cells(), w.sim.params.nu_cells(Material::Syrup));
+    let (g, nu) = (w.sim.params.g_cells(), w.sim.params.nu_cells(Material::Honey));
     let k = 1.411 * (g * q.powi(3) / (3.0 * nu)).powf(0.2);
     let mut t = 0.0;
     let mut pts = Vec::new();
@@ -375,21 +375,21 @@ fn viscous_current(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Repor
     let mut ww = world(gpu, apply, &[([0.0, 0.0, WALL + bw, WALL + bh], Material::Water)]);
     run(&mut ww, 1.0);
     let water_front = percentile(ww.sim.download_particles().iter().map(|p| p.pos[0]).collect(), 0.998) - WALL;
-    let mut ws = world(gpu, apply, &[([0.0, 0.0, WALL + bw, WALL + bh], Material::Syrup)]);
+    let mut ws = world(gpu, apply, &[([0.0, 0.0, WALL + bw, WALL + bh], Material::Honey)]);
     run(&mut ws, 1.0);
-    let syrup_front = percentile(ws.sim.download_particles().iter().map(|p| p.pos[0]).collect(), 0.998) - WALL;
+    let honey_front = percentile(ws.sim.download_particles().iter().map(|p| p.pos[0]).collect(), 0.998) - WALL;
     r.check(
-        "front after 1 s, water vs syrup",
-        format!("{:.0} vs {:.0} cells", water_front, syrup_front),
+        "front after 1 s, water vs honey",
+        format!("{:.0} vs {:.0} cells", water_front, honey_front),
         "water at least 2x further",
-        water_front - bw > 2.0 * (syrup_front - bw),
+        water_front - bw > 2.0 * (honey_front - bw),
     );
 }
 
 /// A blob of oil released at the bottom of a pool must rise and collect on top; a blob
-/// of syrup released at the top must sink.
+/// of honey released at the top must sink.
 fn buoyancy(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
-    println!("\nBuoyancy (oil and syrup blobs in a water pool, 12 s)");
+    println!("\nBuoyancy (oil and honey blobs in a water pool, 12 s)");
     let scene = Scene::new(GRID);
     let mut ps = Vec::new();
     fill_rect(&scene, [0.0, 0.0, 512.0, 150.0], Material::Water, &mut ps);
@@ -400,7 +400,7 @@ fn buoyancy(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         if inside(oil_c) {
             *p = Particle::new(Material::Oil, p.pos, [0.0, 0.0]);
         } else if inside(syr_c) {
-            *p = Particle::new(Material::Syrup, p.pos, [0.0, 0.0]);
+            *p = Particle::new(Material::Honey, p.pos, [0.0, 0.0]);
         }
     }
     let mut w = World::custom(gpu.clone(), scene, ps);
@@ -411,9 +411,9 @@ fn buoyancy(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     let ps = w.sim.download_particles();
     let surface = percentile(ps.iter().map(|p| p.pos[1]).collect(), 0.995);
     let oil_y = mean_height(&ps, |p| (is_oil(p)) as u32 as f32);
-    let syr_y = mean_height(&ps, syrup_in);
+    let syr_y = mean_height(&ps, honey_in);
     r.check("oil blob", format!("{:.0} -> {:.0} cells (surface {:.0})", oil_c[1], oil_y, surface), "within 12 cells of the surface", surface - oil_y < 12.0);
-    r.check("syrup blob", format!("{:.0} -> {:.0} cells", syr_c[1], syr_y), "sank below 60 cells", syr_y < 60.0);
+    r.check("honey blob", format!("{:.0} -> {:.0} cells", syr_c[1], syr_y), "sank below 60 cells", syr_y < 60.0);
 }
 
 /// Holds a source at `at(frame)` for `frames` frames of `ticks` nominal substeps, as the app
@@ -513,7 +513,7 @@ fn pour(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
 
     // ---- a trickle ---------------------------------------------------------------------
     let mut w = empty();
-    let emitted = hold(&mut w, Source::Pour, Material::Syrup, &|_| spout_at, radius, 2000.0, 60, 4);
+    let emitted = hold(&mut w, Source::Pour, Material::Honey, &|_| spout_at, radius, 2000.0, 60, 4);
     r.shot(&w, "pour_trickle");
     let ps = w.sim.download_particles();
     let thin = Source::Pour.spout(radius, 2000.0).unwrap();
@@ -896,6 +896,187 @@ fn tools(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
 // ---- independent checks of viscosity, surface tension and settling ------------------
 
 /// A world on an arbitrary grid from explicit particles.
+/// The tools added with the interface overhaul: pull, whirl and hold (forces), drains and
+/// faucets (devices that keep working), rain.
+fn devices(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
+    println!("\nDevices and forces (pull, whirl, hold, drain, faucet, rain)");
+    let frame = |w: &mut World, tool: ToolState| w.sim.step_blocking(4, tool);
+    let fullest = |ps: &[Particle]| {
+        let mut count = vec![0u32; (GRID[0] * GRID[1]) as usize];
+        for p in ps {
+            count[p.pos[1] as usize * GRID[0] as usize + p.pos[0] as usize] += 1;
+        }
+        count.into_iter().max().unwrap_or(0)
+    };
+    let centre = [256.0, WALL + 30.0];
+    let pool = || world(gpu, apply, &[([0.0, 0.0, 512.0, WALL + 60.0], Material::Water)]);
+    // Mean radial (outward) and tangential (anticlockwise) speed of the liquid between 0.4
+    // and 0.9 of `radius` from the centre.
+    let swirl = |ps: &[Particle], radius: f32| {
+        let (mut radial, mut around, mut n) = (0.0, 0.0, 0);
+        for p in ps {
+            let d = [p.pos[0] - centre[0], p.pos[1] - centre[1]];
+            let len = d[0].hypot(d[1]);
+            if len > 0.4 * radius && len < 0.9 * radius {
+                radial += (p.vel[0] * d[0] + p.vel[1] * d[1]) / len;
+                around += (d[0] * p.vel[1] - d[1] * p.vel[0]) / len;
+                n += 1;
+            }
+        }
+        (radial / n.max(1) as f32, around / n.max(1) as f32)
+    };
+
+    // ---- pull ----------------------------------------------------------------------------
+    let mut w = pool();
+    let n0 = w.sim.download_particles().len();
+    for _ in 0..30 {
+        frame(&mut w, ToolState::pull(centre, 20.0));
+    }
+    r.shot(&w, "devices_pull");
+    let ps = w.sim.download_particles();
+    let (radial, _) = swirl(&ps, 20.0);
+    r.check("pull: liquid under the brush moves inwards", format!("{radial:.0} cells/s radially"), "< -10", radial < -10.0);
+    r.check(
+        "pull: nothing is added, lost or packed into a cell",
+        format!("{} -> {}, fullest cell {}", n0, ps.len(), fullest(&ps)),
+        &format!("equal, < {} (rest {})", 5 * PPC, PPC),
+        ps.len() == n0 && fullest(&ps) < 5 * PPC,
+    );
+
+    // ---- whirl ---------------------------------------------------------------------------
+    for clockwise in [false, true] {
+        let mut w = pool();
+        for _ in 0..45 {
+            frame(&mut w, ToolState::whirl(centre, 20.0, clockwise));
+        }
+        if !clockwise {
+            r.shot(&w, "devices_whirl");
+        }
+        let ps = w.sim.download_particles();
+        let (_, around) = swirl(&ps, 20.0);
+        let (name, want) = if clockwise { ("whirl: reversed, it turns clockwise", "< -50") } else { ("whirl: liquid under the brush turns anticlockwise", "> 50") };
+        r.check(name, format!("{around:.0} cells/s around the cursor (whirl speed {WHIRL_SPEED:.0})"), want, if clockwise { around < -50.0 } else { around > 50.0 });
+        if clockwise {
+            r.check("whirl: nothing is added or lost", format!("{} -> {}", n0, ps.len()), "equal", ps.len() == n0);
+        }
+    }
+
+    // ---- hold ----------------------------------------------------------------------------
+    // A block of water in mid-air, inside the brush: held, it stays; let go, it falls.
+    let mut w = world(gpu, apply, &[([236.0, 150.0, 276.0, 190.0], Material::Water)]);
+    let before = w.sim.download_particles();
+    let y0 = mean_height(&before, |_| 1.0);
+    for _ in 0..90 {
+        frame(&mut w, ToolState::hold([256.0, 170.0], 36.0));
+    }
+    r.shot(&w, "devices_hold");
+    let ps = w.sim.download_particles();
+    let (y1, speed) = (mean_height(&ps, |_| 1.0), rms_speed(&ps));
+    r.check(
+        "hold: a block in mid-air stays where it is for 1.5 s",
+        format!("mean height {y0:.1} -> {y1:.1} cells, rms speed {speed:.1} cells/s"),
+        "sinks < 3 cells, < 10 cells/s",
+        y0 - y1 < 3.0 && speed < 10.0 && ps.len() == before.len(),
+    );
+    run(&mut w, 0.5);
+    let y2 = mean_height(&w.sim.download_particles(), |_| 1.0);
+    r.check("hold: let go, it falls", format!("{y1:.1} -> {y2:.1} cells in 0.5 s"), "> 60 cells lower", y1 - y2 > 60.0);
+
+    // ---- drain ---------------------------------------------------------------------------
+    // A drain in the air above the pool takes nothing; one on the floor empties the pool,
+    // and only through itself.
+    let mut w = pool();
+    assert!(w.add_drain(Current::drain([256.0, 200.0], 12.0, 1.0)));
+    run(&mut w, 1.0);
+    let ps = w.sim.download_particles();
+    r.check("drain: one that no liquid reaches takes none", format!("{} -> {}", n0, ps.len()), "equal", ps.len() == n0);
+    let mut w = pool();
+    let drain = Current::drain([256.0, WALL + 6.0], 12.0, 1.0);
+    assert!(w.add_drain(drain));
+    run(&mut w, 2.0);
+    r.shot(&w, "devices_drain");
+    let ps = w.sim.download_particles();
+    // (The pool keeps running in from both sides, so the drain itself stays full: what it
+    // takes is set by how fast the pool can reach it.)
+    r.check(
+        "drain: liquid that reaches it leaves the tank",
+        format!("{} -> {} particles in 2 s", n0, ps.len()),
+        "> 10 % gone",
+        (ps.len() as f32) < 0.9 * n0 as f32,
+    );
+    let far = ps.iter().filter(|p| p.pos[0] < 100.0).count();
+    let level = mean_height(&ps, |_| 1.0);
+    r.check("drain: the rest of the pool is still there, and still a pool", format!("{far} particles left of x = 100, mean height {level:.1}"), "> 0, above the floor", far > 1000 && level > WALL);
+    let removed = w.pick([256.0, WALL + 6.0]) == Some(crate::world::Pick::Drain(0));
+    w.remove_pick(crate::world::Pick::Drain(0));
+    let n1 = w.sim.download_particles().len();
+    run(&mut w, 1.0);
+    let n2 = w.sim.download_particles().len();
+    r.check("drain: removed, it takes no more", format!("{n1} -> {n2}"), "equal", removed && n1 == n2 && w.currents().is_empty());
+
+    // ---- faucet --------------------------------------------------------------------------
+    // 6000 particles/s for 120 frames of 4 nominal substeps, with no brush held.
+    for (angle, name) in [(0.0, "down"), (90.0, "to the right")] {
+        let mut w = World::custom(gpu.clone(), Scene::new(GRID), Vec::new());
+        apply(&mut w.sim.params);
+        assert!(w.add_faucet(crate::world::Faucet::new([200.0, 200.0], 6.0, angle, 6000.0, Material::Oil)));
+        let mut emitted = 0;
+        for _ in 0..120 {
+            emitted += w.run_faucets(4.0 * NOMINAL_DT);
+            frame(&mut w, ToolState::default());
+        }
+        if angle == 0.0 {
+            r.shot(&w, "devices_faucet");
+        }
+        let ps = w.sim.download_particles();
+        let want = (6000.0 * 480.0 * NOMINAL_DT) as usize;
+        r.check(
+            &format!("faucet aimed {name}: it delivers its flow of its liquid"),
+            format!("{} particles, {} live, {} of them oil", emitted, ps.len(), ps.iter().filter(|p| is_oil(p)).count()),
+            // A faucet has no nozzle holding its liquid at the launch velocity (the brush's
+            // has: there is one tool force per substep). Aimed sideways its stream bends
+            // under gravity inside the spout, new liquid meets liquid that has not got away,
+            // and the surplus is held back, as for a spout swept sideways.
+            &format!("{want} ({}), all live, all oil", if angle == 0.0 { "+/- 3 %" } else { "- 10 % at most" }),
+            (if angle == 0.0 { emitted.abs_diff(want) * 100 < 3 * want } else { emitted <= want + want / 100 && emitted * 10 > want * 9 }) && ps.len() == emitted && ps.iter().all(is_oil),
+        );
+        if angle != 0.0 {
+            let x = ps.iter().map(|p| p.pos[0]).sum::<f32>() / ps.len().max(1) as f32;
+            r.check("faucet aimed to the right: the liquid lands to its right", format!("mean x {x:.0} (faucet at 200)"), "> 215", x > 215.0);
+        }
+    }
+    let mut w = World::custom(gpu.clone(), Scene::new(GRID), Vec::new());
+    apply(&mut w.sim.params);
+    let placed = (0..crate::world::MAX_FAUCETS + 1).filter(|k| w.add_faucet(crate::world::Faucet::new([60.0 + 60.0 * *k as f32, 200.0], 4.0, 0.0, 3000.0, Material::Water))).count();
+    r.check("faucet: the tank holds only so many", format!("{placed} of {} placed", crate::world::MAX_FAUCETS + 1), &format!("{}", crate::world::MAX_FAUCETS), placed == crate::world::MAX_FAUCETS);
+    r.check("faucet: none runs while time stands still", format!("{} emitted in a frame of 0 s", w.run_faucets(0.0)), "0", w.run_faucets(0.0) == 0);
+
+    // ---- rain ----------------------------------------------------------------------------
+    let mut w = World::custom(gpu.clone(), Scene::new(GRID), Vec::new());
+    apply(&mut w.sim.params);
+    let emitted = hold(&mut w, Source::Rain, Material::Water, &|_| [256.0, 240.0], 9.0, 12000.0, 60, 4);
+    r.shot(&w, "devices_rain");
+    let ps = w.sim.download_particles();
+    let want = 12000.0 * crate::brush::RAIN_SHARE * 240.0 * NOMINAL_DT;
+    let half = 9.0 * crate::brush::RAIN_SPAN;
+    let xs: Vec<f32> = ps.iter().filter(|p| p.pos[1] > 120.0).map(|p| p.pos[0] - 256.0).collect();
+    let (lo, hi) = (percentile(xs.clone(), 0.02), percentile(xs.clone(), 0.98));
+    r.check(
+        "rain: drops at its share of the flow, all live",
+        format!("{} emitted, {} live", emitted, ps.len()),
+        &format!("{want:.0} (+/- 10 %)"),
+        (emitted as f32 - want).abs() < 0.1 * want && ps.len() == emitted,
+    );
+    r.check(
+        "rain: it falls from the whole cloud, and only from it",
+        format!("drops in the air from {lo:.0} to {hi:.0} cells of the cursor (cloud +/- {half:.0})"),
+        "most of the cloud's width, none far outside",
+        lo < -0.7 * half && hi > 0.7 * half && xs.iter().all(|x| x.abs() < half + 12.0),
+    );
+    let falling = ps.iter().filter(|p| p.pos[1] > 120.0).all(|p| p.vel[1] < 0.0);
+    r.check("rain: every drop in the air is falling", format!("{falling}"), "true", falling);
+}
+
 pub(crate) fn world_from(gpu: &Arc<Gpu>, grid: [u32; 2], apply: &dyn Fn(&mut SimParams), ps: Vec<Particle>) -> World {
     let mut w = World::custom(gpu.clone(), Scene::new(grid), ps);
     apply(&mut w.sim.params);
@@ -1088,7 +1269,7 @@ pub(crate) fn period(samples: &[(f32, f32)]) -> Option<f32> {
 /// Surface tension and wetting, on 1 mm cells where capillarity is resolved, zero gravity.
 fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     println!("\nSurface tension (1 mm cells, zero gravity unless stated)");
-    // Debugging aids: SPROUT_CASE=drop|oildisc|waterdrop|oildrop|syrup|contact|bead runs one
+    // Debugging aids: SPROUT_CASE=drop|oildisc|waterdrop|oildrop|honey|contact|bead runs one
     // part, SPROUT_TRACE=1 prints the oscillation samples, SPROUT_RAD=<cells> sets the radius
     // of the oscillating drops (for resolution studies).
     let only = std::env::var("SPROUT_CASE").ok();
@@ -1272,24 +1453,24 @@ fn surface(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     }
     }
 
-    // ---- miscible: a syrup disc in water feels no interfacial tension ---------------------
-    if on("syrup") {
+    // ---- miscible: a honey disc in water feels no interfacial tension ---------------------
+    if on("honey") {
     let t_theory = t_oil;
     let mut ps = particles_where(GRID, [0.0, 0.0, 512.0, 260.0], Material::Water, &|_| true, &zero, &zero4);
     for p in &mut ps {
         if ellipse(p.pos) {
-            *p = Particle::new(Material::Syrup, p.pos, [0.0, 0.0]);
+            *p = Particle::new(Material::Honey, p.pos, [0.0, 0.0]);
         }
     }
     let mut w = world_from(gpu, GRID, &|p: &mut SimParams| {
         setup(p);
-        p.mat[Material::Syrup.index()].mix_rate = 0.0;
+        p.mat[Material::Honey.index()].mix_rate = 0.0;
     }, ps);
-    let e0 = ellipticity(&w.sim.download_particles(), &|p: &Particle| syrup_in(p) > 0.5);
+    let e0 = ellipticity(&w.sim.download_particles(), &|p: &Particle| honey_in(p) > 0.5);
     run(&mut w, t_theory / 2.0);
-    let e1 = ellipticity(&w.sim.download_particles(), &|p: &Particle| syrup_in(p) > 0.5);
+    let e1 = ellipticity(&w.sim.download_particles(), &|p: &Particle| honey_in(p) > 0.5);
     r.check(
-        "syrup blob in water keeps its shape (miscible)",
+        "honey blob in water keeps its shape (miscible)",
         format!("ellipticity {:.3} -> {:.3}", e0, e1),
         "unchanged (+/- 0.01)",
         (e1 - e0).abs() < 0.01,
@@ -1656,7 +1837,7 @@ pub fn run_all(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), only: Option<&str>
         (Offscreen::new(gpu.clone(), [960, 540]), PathBuf::from(dir))
     });
     let mut r = Report { failures: 0, shots };
-    let tests: [(&str, Test); 25] = [
+    let tests: [(&str, Test); 26] = [
         ("hydrostatic", hydrostatic),
         ("sealed", sealed),
         ("dam", dam_break),
@@ -1671,6 +1852,7 @@ pub fn run_all(gpu: Arc<Gpu>, apply: &dyn Fn(&mut SimParams), only: Option<&str>
         ("pour", pour),
         ("current", current),
         ("tools", tools),
+        ("devices", devices),
         ("thermal", crate::checks::thermal),
         ("rheology", crate::checks::rheology),
         ("suspension", crate::checks::suspension),

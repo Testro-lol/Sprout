@@ -31,9 +31,26 @@ use crate::{
     scene::Shape,
     selftest::{self, Act, Snapshot},
     sim::{Current, Material, ToolState},
-    ui::{self, Overlay, Tool, UiActions, UiState},
-    world::{Source, World},
+    ui::{self, Canvas, Group, Overlay, Page, Placement, Tool, UiActions, UiState},
+    world::{Pick, Source, World},
 };
+
+/// What a held left button is in the middle of, for the tools that are more than a brush.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Gesture {
+    None,
+    /// Dragging out what a placing tool places, from where the button went down (cells).
+    Place { anchor: [f32; 2] },
+    /// Drawing a freehand line: the end of the last piece.
+    Draw { last: [f32; 2] },
+    /// Moving a solid or a device: where the cursor was at the last frame, and whether the
+    /// thing has moved at all.
+    Move { pick: Pick, last: [f32; 2], moved: bool },
+}
+
+/// How far the cursor must travel from where the button went down before a press counts
+/// as dragging something out rather than a click, pixels.
+const DRAG_MIN_PX: f32 = 6.0;
 
 pub struct AppOptions {
     pub map: usize,
@@ -90,6 +107,9 @@ struct App {
     input: Input,
     camera: Camera,
     overlay: Overlay,
+    gesture: Gesture,
+    /// When the solids were last rasterised during a gesture (Draw, Move).
+    last_raster: Instant,
     /// Tool and liquid of the last frame, to announce changes.
     shown: (Tool, Material),
     last_frame: Instant,
@@ -127,6 +147,8 @@ pub fn run(event_loop: EventLoop<()>, gpu: Arc<Gpu>, opts: AppOptions) -> bool {
     let mut app = App {
         camera: Camera::new(opts.grid, opts.size),
         overlay: Overlay::default(),
+        gesture: Gesture::None,
+        last_raster: Instant::now(),
         shown: (ui.tool, ui.material),
         gpu,
         opts,
@@ -170,39 +192,41 @@ fn pick_present_mode(available: &[PresentMode], vsync: bool) -> PresentMode {
     prefer.iter().copied().find(|m| available.contains(m)).unwrap_or(PresentMode::Fifo)
 }
 
-/// The tool a key selects (`Tool::key` names it in the UI).
+/// The tool a key selects directly (`Tool::key` names it in the UI).
 fn tool_for_key(code: KeyCode) -> Option<Tool> {
     Some(match code {
-        KeyCode::KeyQ => Tool::Pour,
-        KeyCode::KeyB => Tool::Spray,
         KeyCode::KeyJ => Tool::Jet,
+        KeyCode::KeyB => Tool::Spray,
         KeyCode::KeyC => Tool::Drop,
-        KeyCode::KeyW => Tool::Grab,
         KeyCode::KeyV => Tool::Push,
         KeyCode::KeyZ => Tool::Current,
-        KeyCode::KeyE => Tool::Erase,
-        KeyCode::KeyA => Tool::Circle,
-        KeyCode::KeyS => Tool::Box,
-        KeyCode::KeyD => Tool::Ramp,
         KeyCode::KeyX => Tool::Remove,
+        KeyCode::KeyI => Tool::Pipette,
+        KeyCode::KeyM => Tool::Magnet,
         KeyCode::KeyY => Tool::Heat,
         KeyCode::KeyU => Tool::Cool,
-        KeyCode::KeyM => Tool::Magnet,
         _ => return None,
     })
 }
 
-/// The solid a shape tool would place at `c` right now.
-fn pending_shape(ui: &UiState, c: [f32; 2]) -> Option<Shape> {
-    let r = ui.brush;
-    let k = ui.shape_aspect.sqrt();
-    let angle = ui.shape_angle.to_radians();
-    match ui.tool {
-        Tool::Circle => Some(Shape::Circle { c, r }),
-        Tool::Box => Some(Shape::Box { c, half: [r * k, r / k], angle }),
-        Tool::Ramp => Some(Shape::Ramp { c, half: [r * k, r / k], angle, flip: ui.shape_flip }),
-        _ => None,
-    }
+/// The group a key opens (`Group::key`): the left hand's two rows, in the dock's order.
+fn group_for_key(code: KeyCode) -> Option<Group> {
+    Some(match code {
+        KeyCode::KeyQ => Group::Pour,
+        KeyCode::KeyW => Group::Move,
+        KeyCode::KeyE => Group::Edit,
+        KeyCode::KeyA => Group::Build,
+        KeyCode::KeyS => Group::Devices,
+        KeyCode::KeyD => Group::Heat,
+        _ => return None,
+    })
+}
+
+/// The palette slot of a number key.
+fn slot_for_key(code: KeyCode) -> Option<usize> {
+    [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8]
+        .iter()
+        .position(|c| *c == code)
 }
 
 impl Win {
@@ -302,6 +326,7 @@ impl App {
     }
 
     fn load_map(&mut self, map: usize) {
+        self.gesture = Gesture::None;
         let changed = map != self.world.map;
         self.world.load_map(map);
         self.pacer.reset();
@@ -309,7 +334,7 @@ impl App {
             if changed {
                 self.overlay.toast_map(&ctx, self.world.map);
             } else {
-                self.overlay.toast(&ctx, "Reset", MAPS[map].name, egui::Color32::from_gray(235));
+                self.overlay.toast(&ctx, "Reset", MAPS[map].name, ui::theme::LEAF);
             }
         }
     }
@@ -334,7 +359,7 @@ impl App {
         self.reset_view(false);
         if let Some(ctx) = self.egui() {
             let name = ui::GRIDS.iter().find(|g| g.1 == grid).map_or("Custom", |g| g.0);
-            self.overlay.toast(&ctx, "Quality", name, egui::Color32::from_gray(235));
+            self.overlay.toast(&ctx, "Quality", name, ui::theme::LEAF);
         }
     }
 
@@ -358,6 +383,20 @@ impl App {
         if actions.clean_stains {
             self.world.sim.clean_stains();
         }
+        if actions.clear_liquid {
+            self.world.clear_liquid();
+            self.pacer.reset();
+            self.toast("Cleared", "The liquid is gone; solids and devices stay.", ui::theme::WATER);
+        }
+        if actions.undo {
+            self.cancel_gesture();
+            if self.world.undo() {
+                self.toast("Undo", "", ui::theme::CLAY);
+            }
+        }
+        if actions.redo && self.world.redo() {
+            self.toast("Redo", "", ui::theme::CLAY);
+        }
         if actions.vsync_changed && let Some(win) = &mut self.win {
             win.recreate = true;
         }
@@ -366,41 +405,94 @@ impl App {
         }
     }
 
+    fn toast(&mut self, text: &str, detail: &str, color: egui::Color32) {
+        if let Some(ctx) = self.egui() {
+            self.overlay.toast(&ctx, text, detail, color);
+        }
+    }
+
     fn key(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
         let mut a = UiActions::default();
         let n_maps = MAPS.len();
+        let mods = self.input.modifiers;
+        if mods.control_key() {
+            // Commands, not tools.
+            match code {
+                KeyCode::KeyZ if mods.shift_key() => a.redo = true,
+                KeyCode::KeyZ => a.undo = true,
+                KeyCode::KeyY => a.redo = true,
+                KeyCode::KeyQ => a.quit = true,
+                _ => {}
+            }
+            self.apply(a, Some(event_loop));
+            return;
+        }
         if let Some(tool) = tool_for_key(code) {
-            self.ui.tool = tool;
+            self.cancel_gesture();
+            self.ui.select(tool);
+        } else if let Some(group) = group_for_key(code) {
+            self.cancel_gesture();
+            self.ui.select_group(group, mods.shift_key());
+        } else if let Some(slot) = slot_for_key(code) {
+            self.ui.pick_material(Material(self.ui.palette[slot] as u8));
         }
         match code {
             KeyCode::Space => self.ui.paused = !self.ui.paused,
             KeyCode::KeyN | KeyCode::Period => a.step = true,
+            KeyCode::KeyR if mods.shift_key() => a.clear_liquid = true,
             KeyCode::KeyR => a.reset = true,
-            KeyCode::Digit1 => self.ui.pick_material(Material(self.ui.favourites[0] as u8)),
-            KeyCode::Digit2 => self.ui.pick_material(Material(self.ui.favourites[1] as u8)),
-            KeyCode::Digit3 => self.ui.pick_material(Material(self.ui.favourites[2] as u8)),
-            KeyCode::Digit4 => self.ui.pick_material(Material(self.ui.favourites[3] as u8)),
+            KeyCode::Tab => {
+                self.cancel_gesture();
+                self.ui.swap_tool();
+            }
+            KeyCode::KeyL => self.ui.editor.picker_open = !self.ui.editor.picker_open,
             KeyCode::BracketLeft => self.ui.scale_brush(1.0 / 1.15),
             KeyCode::BracketRight => self.ui.scale_brush(1.15),
             KeyCode::Minus => self.ui.scale_rate(1.0 / 1.25),
             KeyCode::Equal => self.ui.scale_rate(1.25),
-            KeyCode::KeyT => self.ui.rotate(15.0),
-            KeyCode::KeyG => self.ui.rotate(-15.0),
-            KeyCode::KeyF => self.ui.shape_flip = !self.ui.shape_flip,
+            KeyCode::KeyT => {
+                self.ui.rotate(15.0);
+            }
+            KeyCode::KeyG => {
+                self.ui.rotate(-15.0);
+            }
+            KeyCode::KeyF => self.ui.flip(),
             KeyCode::KeyH => self.ui.show_panel = !self.ui.show_panel,
+            KeyCode::F1 => self.ui.page = if self.ui.page == Some(Page::Keys) { None } else { Some(Page::Keys) },
             KeyCode::Home | KeyCode::Digit0 => a.reset_view = true,
             KeyCode::PageDown => a.load_map = Some((self.world.map + 1) % n_maps),
             KeyCode::PageUp => a.load_map = Some((self.world.map + n_maps - 1) % n_maps),
+            KeyCode::Delete | KeyCode::Backspace => self.remove_at(self.input.cursor_world),
             KeyCode::F11 => {
                 if let Some(win) = &self.win {
                     let fs = win.window.fullscreen().is_none().then_some(Fullscreen::Borderless(None));
                     win.window.set_fullscreen(fs);
                 }
             }
-            KeyCode::Escape => a.quit = true,
+            KeyCode::Escape => self.escape(),
             _ => {}
         }
         self.apply(a, Some(event_loop));
+    }
+
+    /// Esc: backs out of whatever is in progress or open, one thing at a time.
+    fn escape(&mut self) {
+        let ui = &mut self.ui;
+        if self.gesture != Gesture::None {
+            self.cancel_gesture();
+        } else if ui.maps_open {
+            ui.maps_open = false;
+        } else if ui.stats_open {
+            ui.stats_open = false;
+        } else if ui.page.is_some() {
+            ui.page = None;
+        } else if ui.editor.open {
+            ui.editor.open = false;
+        } else if ui.editor.picker_open {
+            ui.editor.picker_open = false;
+        } else if !ui.show_panel {
+            ui.show_panel = true;
+        }
     }
 
     fn pointer_moved(&mut self, px: [f32; 2]) {
@@ -419,20 +511,30 @@ impl App {
             MouseButton::Left => {
                 self.input.left = down;
                 if down {
-                    self.click();
+                    self.press();
+                } else {
+                    self.release();
                 }
             }
+            // The right button backs out of a drag; otherwise it grabs.
+            MouseButton::Right if down && self.gesture != Gesture::None => self.cancel_gesture(),
             MouseButton::Right => self.input.right = down,
             MouseButton::Middle => self.input.middle = down,
             _ => {}
         }
     }
 
+    /// The wheel zooms; with Shift it sizes the brush, with Ctrl it turns what the tool aims
+    /// or places, with Alt it sets the flow or strength.
     fn wheel(&mut self, lines: f32) {
-        if self.input.modifiers.shift_key() || self.input.modifiers.control_key() {
+        let mods = self.input.modifiers;
+        if mods.shift_key() {
             self.ui.scale_brush(1.12f32.powf(lines));
-        } else if self.input.modifiers.alt_key() || !self.ui.aim(lines * 15.0) {
-            // Nothing to aim (or Alt held): the wheel zooms.
+        } else if mods.control_key() {
+            self.ui.rotate(lines * 15.0);
+        } else if mods.alt_key() {
+            self.ui.scale_rate(1.12f32.powf(lines));
+        } else {
             self.zoom_at_cursor(1.15f32.powf(lines));
         }
     }
@@ -464,7 +566,7 @@ impl App {
             radial_speed: radial / ps.len().max(1) as f32,
             particles: ps.len(),
             oil: ps.iter().filter(|p| p.is(Material::Oil)).count(),
-            syrup: ps.iter().map(|p| p.share(Material::Syrup, &self.world.sim.params)).sum(),
+            honey: ps.iter().map(|p| p.share(Material::Honey, &self.world.sim.params)).sum(),
             rms_speed: (speed2 / ps.len().max(1) as f32).sqrt(),
             shapes: self.world.scene.shapes.len(),
             substeps: self.world.sim.substeps_done(),
@@ -487,6 +589,22 @@ impl App {
                 && file.iter().zip(&self.world.library.custom).any(|(f, c)| f.id == c.id && f.props == self.world.sim.params.mat[ed.row] && crate::library::custom_row(self.world.library.custom.iter().position(|x| x.id == c.id).unwrap()) == ed.row),
             water: ps.iter().filter(|p| p.is(Material::Water)).count(),
             magnets: self.world.sim.magnets().len(),
+            tool: self.ui.tool.name(),
+            faucets: self.world.faucets().len(),
+            drains: self.world.drains().len(),
+            pumps: self.world.fans().len(),
+            can_undo: self.world.can_undo(),
+            material: self.ui.material.index(),
+            spin: {
+                let near: Vec<f32> = ps
+                    .iter()
+                    .map(|p| ([p.pos[0] - self.input.cursor_world[0], p.pos[1] - self.input.cursor_world[1]], p.vel))
+                    .filter(|(d, _)| d[0].hypot(d[1]) < self.ui.brush)
+                    .map(|(d, v)| d[0] * v[1] - d[1] * v[0])
+                    .collect();
+                near.iter().sum::<f32>() / near.len().max(1) as f32
+            },
+            mean_y: ps.iter().map(|p| p.pos[1]).sum::<f32>() / ps.len().max(1) as f32,
             mean_t: ps.iter().map(|p| self.world.sim.params.temperature(p).0).sum::<f32>() / ps.len().max(1) as f32,
         }
     }
@@ -508,6 +626,12 @@ impl App {
                 Act::Press(button) => self.button(button, true),
                 Act::Release(button) => self.button(button, false),
                 Act::Wheel(lines) => self.wheel(lines),
+                Act::Tool(tool) => {
+                    self.cancel_gesture();
+                    self.ui.select(tool);
+                }
+                Act::Mods(mods) => self.input.modifiers = mods,
+                Act::Tweak(f) => f(&mut self.ui),
                 Act::Grid(grid) => self.apply(UiActions { grid: Some(grid), ..Default::default() }, Some(event_loop)),
                 Act::Mark => test.mark = self.snapshot(),
                 Act::Liquid(act) => {
@@ -539,8 +663,8 @@ impl App {
                     let ok = check(&test.mark, &now);
                     test.failures += !ok as u32;
                     println!(
-                        "  [{}] {:<38} {} particles ({} oil, {:.0} syrup), {} solids, rms {:.0} cells/s",
-                        if ok { "pass" } else { "FAIL" }, what, now.particles, now.oil, now.syrup.abs(), now.shapes, now.rms_speed.abs()
+                        "  [{}] {:<38} {} particles ({} oil, {:.0} honey), {} solids, rms {:.0} cells/s",
+                        if ok { "pass" } else { "FAIL" }, what, now.particles, now.oil, now.honey.abs(), now.shapes, now.rms_speed.abs()
                     );
                     if !ok {
                         println!("         at the mark: {:?}\n         now:         {:?}", test.mark, now);
@@ -555,24 +679,174 @@ impl App {
         self.selftest = Some(test);
     }
 
-    /// A press of the left button: the tools that act once per click.
-    fn click(&mut self) {
+    fn liquid_color(&self) -> egui::Color32 {
+        ui::swatch_of(&self.world.sim.params, self.ui.material.index())
+    }
+
+    fn ripple(&mut self, at: [f32; 2], radius: f32, color: egui::Color32) {
+        if let Some(ctx) = self.egui() {
+            self.overlay.ripple(&ctx, at, radius, color);
+        }
+    }
+
+    /// What the selected tool would place now: at the cursor, or dragged out from `anchor`.
+    /// The flag says whether the drag has gone far enough to count.
+    fn placement(&self, anchor: Option<[f32; 2]>) -> Option<(Placement, bool)> {
+        let at = self.input.cursor_world;
+        let drag_min = DRAG_MIN_PX / self.camera.view.zoom;
+        let dragged = anchor.is_some_and(|a| (at[0] - a[0]).hypot(at[1] - a[1]) > drag_min);
+        ui::placement(&self.ui, anchor, at, drag_min, self.input.modifiers.shift_key()).map(|p| (p, dragged))
+    }
+
+    /// A press of the left button on the canvas: the tools that act once per click, and the
+    /// start of the ones that are dragged.
+    fn press(&mut self) {
         let at = self.input.cursor_world;
         let (tool, material, radius) = (self.ui.tool, self.ui.material, self.ui.brush);
-        let done = match tool {
-            Tool::Drop => self.world.stamp(material, at, radius) > 0,
-            Tool::Remove => self.world.remove_shape_at(at) || self.world.remove_magnet_at(at),
-            Tool::Magnet => self.world.add_magnet(crate::sim::Magnet::new(at, radius.max(2.0), 0.0, self.ui.magnet_strength)),
-            _ => match pending_shape(&self.ui, at) {
-                Some(shape) => {
-                    self.world.add_shape(shape);
-                    true
+        if self.input.modifiers.alt_key() || tool == Tool::Pipette {
+            self.sample(at);
+            return;
+        }
+        match tool {
+            Tool::Drop => {
+                if self.world.stamp(material, at, radius) > 0 {
+                    self.ripple(at, radius, tool.color(self.liquid_color()));
                 }
-                None => false,
-            },
+            }
+            Tool::Remove => self.remove_at(at),
+            Tool::Move => {
+                if let Some(pick) = self.world.pick(at) {
+                    self.world.checkpoint();
+                    self.gesture = Gesture::Move { pick, last: at, moved: false };
+                }
+            }
+            Tool::Draw => {
+                self.world.checkpoint();
+                self.world.add_shape_later(Shape::Capsule { a: at, b: at, r: self.ui.thickness }, self.ui.solid_temp());
+                self.gesture = Gesture::Draw { last: at };
+            }
+            t if t.places() => self.gesture = Gesture::Place { anchor: at },
+            _ => {}
+        }
+    }
+
+    /// The left button came up: what was being dragged out is placed.
+    fn release(&mut self) {
+        match std::mem::replace(&mut self.gesture, Gesture::None) {
+            Gesture::Place { anchor } => {
+                if let Some((p, dragged)) = self.placement(Some(anchor)) {
+                    self.place(p, dragged);
+                }
+            }
+            Gesture::Move { moved: false, .. } => self.world.drop_checkpoint(),
+            _ => {}
+        }
+        self.world.flush_solids();
+    }
+
+    /// Backs out of a drag: nothing is placed, a line being drawn is taken back, a thing
+    /// being moved returns to where it was.
+    fn cancel_gesture(&mut self) {
+        match std::mem::replace(&mut self.gesture, Gesture::None) {
+            Gesture::Draw { .. } | Gesture::Move { moved: true, .. } => {
+                self.world.undo();
+            }
+            Gesture::Move { moved: false, .. } => self.world.drop_checkpoint(),
+            _ => {}
+        }
+        self.world.flush_solids();
+    }
+
+    fn place(&mut self, p: Placement, dragged: bool) {
+        self.world.checkpoint();
+        let color = self.ui.tool.color(self.liquid_color());
+        let (ok, at, radius, full) = match p {
+            Placement::Solid(s) => {
+                self.world.add_shape_at(s, self.ui.solid_temp());
+                (true, s.center(), s.bound().1.min(24.0), "")
+            }
+            Placement::Faucet(f) => (self.world.add_faucet(f), f.pos, f.radius, "The tank holds six faucets"),
+            Placement::Pump(c) => (self.world.add_current(c), c.pos, c.radius, "The tank holds fifteen pumps and drains"),
+            Placement::Drain(c) => (self.world.add_drain(c), c.pos, c.radius, "The tank holds fifteen pumps and drains"),
+            Placement::Magnet(m) => (self.world.add_magnet(m), m.pos, m.radius, "The tank holds eight magnets"),
         };
-        if done && let Some(ctx) = self.egui() {
-            self.overlay.ripple_for(&ctx, at, if tool == Tool::Remove { 2.0 } else { radius }, tool, material);
+        if !ok {
+            self.world.drop_checkpoint();
+            self.toast(full, "Remove one first (the Remove tool, or Delete over it).", ui::theme::WARN);
+            return;
+        }
+        // A heading set by dragging stays for the next one.
+        if dragged {
+            match p {
+                Placement::Faucet(f) => self.ui.faucet_angle = f.angle,
+                Placement::Pump(c) => self.ui.pump_angle = c.vel[0].atan2(-c.vel[1]).to_degrees(),
+                Placement::Magnet(m) => self.ui.magnet_angle = m.dir[0].atan2(m.dir[1]).to_degrees(),
+                _ => {}
+            }
+        }
+        self.ripple(at, radius, color);
+    }
+
+    /// Removes the solid or device under `at` (the Remove tool, or Delete with any tool).
+    fn remove_at(&mut self, at: [f32; 2]) {
+        if let Some(pick) = self.world.pick(at) {
+            self.cancel_gesture();
+            self.world.checkpoint();
+            self.world.remove_pick(pick);
+            self.ripple(at, 2.0, ui::theme::DANGER);
+        }
+    }
+
+    /// The pipette: the liquid under `at` becomes the one to pour.
+    fn sample(&mut self, at: [f32; 2]) {
+        if let Some(f) = self.win.as_mut().and_then(|w| w.in_flight.take()) {
+            let _ = f.wait(None);
+        }
+        match self.world.sample(at, self.ui.brush.max(3.0)) {
+            Some(s) => {
+                let name = self.world.library.name(s.row);
+                self.ui.material = Material(s.row as u8);
+                let color = ui::theme::lifted(self.liquid_color());
+                let dx = self.world.sim.params.cell_size;
+                let detail = format!("{:.0} °C{}  ·  {:.2} m/s", s.temp, if s.frozen { ", frozen" } else { "" }, s.speed * dx);
+                self.toast(&name, &detail, color);
+                self.ripple(at, 2.0, color);
+            }
+            None => self.toast("No liquid here", "", ui::theme::TEXT_WEAK),
+        }
+    }
+
+    /// Carries on what the held button is in the middle of, once per frame.
+    fn continue_gesture(&mut self) {
+        let at = self.input.cursor_world;
+        match self.gesture {
+            Gesture::Draw { last } => {
+                // A new piece once the cursor is a thickness away: short enough to follow a
+                // curve, long enough not to stack pieces on a slow hand.
+                let r = self.ui.thickness;
+                if (at[0] - last[0]).hypot(at[1] - last[1]) >= r.max(1.5) {
+                    self.world.add_shape_later(Shape::Capsule { a: last, b: at, r }, self.ui.solid_temp());
+                    self.gesture = Gesture::Draw { last: at };
+                }
+            }
+            Gesture::Move { pick, last, moved } => {
+                let d = [at[0] - last[0], at[1] - last[1]];
+                if d != [0.0, 0.0] {
+                    self.world.move_pick(pick, d);
+                    self.gesture = Gesture::Move { pick, last: at, moved: true };
+                } else if !moved {
+                    self.gesture = Gesture::Move { pick, last, moved };
+                }
+            }
+            _ => {}
+        }
+        // The overlay shows the line or the moved solid at once; the simulation gets it as
+        // often as rasterising allows: at most 60 times a second, and for no more than half
+        // the time (a solid that jumps further than its own thickness between two
+        // rasterisations leaves the liquid it was carrying behind).
+        let pace = (2.0 * self.world.raster_cost()).max(1.0 / 60.0);
+        if self.last_raster.elapsed().as_secs_f32() >= pace && self.world.flush_solids() {
+            self.last_raster = Instant::now();
         }
     }
 
@@ -689,6 +963,10 @@ impl App {
         self.ui.speed = if self.ui.paused { 1.0 } else { self.pacer.speed() };
 
         // ---- input -> world --------------------------------------------------------
+        // The tank sits above the dock while the interface is shown, and fills the window
+        // when it is hidden.
+        let below = if self.ui.show_panel { ui::DOCK_INSET * win.egui_ctx.pixels_per_point() } else { 0.0 };
+        self.camera.set_below(below.min(size[1] as f32 * 0.4), self.world.sim.grid, size);
         self.camera.update(frame_dt, size);
         let view = self.camera.view;
         let input = &mut self.input;
@@ -712,64 +990,105 @@ impl App {
         let on_canvas = input.inside && !over_panel && !input.middle;
         let held = on_canvas && input.left && !input.right;
         let (at, radius, material) = (input.cursor_world, self.ui.brush, self.ui.material);
+        // Alt + click samples (the pipette) with any tool.
+        let held = held && !input.modifiers.alt_key();
+        let (left, right) = (input.left, input.right);
+        self.continue_gesture();
         let source = match self.ui.tool {
             Tool::Pour => Some(Source::Pour),
             Tool::Spray => Some(Source::Spray),
+            Tool::Rain => Some(Source::Rain),
             Tool::Jet => Some(Source::Jet { angle: self.ui.jet_angle }),
             _ => None,
         };
         let mut tool = ToolState::default();
-        if on_canvas && (input.right || (input.left && self.ui.tool == Tool::Grab)) {
-            tool = ToolState::grab(at, input.velocity, radius);
-            tool.strength *= self.ui.force_strength;
-        } else if held && self.ui.tool == Tool::Push {
-            tool = ToolState::push(at, radius);
-            tool.strength *= self.ui.force_strength;
-        } else if held && self.ui.tool == Tool::Erase {
-            tool = ToolState::erase(at, radius);
-        } else if held && matches!(self.ui.tool, Tool::Heat | Tool::Cool) {
-            tool = ToolState::heat(at, radius, self.ui.tool == Tool::Cool);
-        } else if held && let Some(source) = source {
-            // The stroke is laid out for the time the simulation is about to advance, so
-            // nothing is emitted while paused (single steps still emit).
-            self.world.emit(source, material, at, radius, self.ui.pour_rate, plan.expected);
-            tool = source.nozzle(at, radius, self.ui.pour_rate);
+        let force = |mut t: ToolState, k: f32| {
+            t.strength *= k;
+            t
+        };
+        let strength = self.ui.force_strength;
+        if on_canvas && self.gesture == Gesture::None && (right || (left && self.ui.tool == Tool::Grab)) {
+            tool = force(ToolState::grab(at, self.input.velocity, radius), strength);
+        } else if held {
+            match self.ui.tool {
+                Tool::Push => tool = force(ToolState::push(at, radius), strength),
+                Tool::Pull => tool = force(ToolState::pull(at, radius), strength),
+                Tool::Whirl => tool = force(ToolState::whirl(at, radius, self.ui.whirl_clockwise), strength),
+                Tool::Hold => tool = force(ToolState::hold(at, radius), strength),
+                Tool::Erase => tool = ToolState::erase(at, radius),
+                Tool::Heat | Tool::Cool => tool = ToolState::heat(at, radius, self.ui.tool == Tool::Cool),
+                _ => {}
+            }
+            if let Some(source) = source {
+                // The stroke is laid out for the time the simulation is about to advance, so
+                // nothing is emitted while paused (single steps still emit).
+                self.world.emit(source, material, at, radius, self.ui.pour_rate, plan.expected);
+                tool = source.nozzle(at, radius, self.ui.pour_rate);
+            }
         }
         if !(held && source.is_some()) {
             self.world.end_stroke();
         }
+        self.world.run_faucets(plan.expected);
         // The Current tool drives the liquid under the cursor while the button is held.
         let current = (held && self.ui.tool == Tool::Current)
             .then(|| Current::new(at, radius, self.ui.current_angle, self.ui.current_strength));
         self.world.hold_current(current);
 
         // ---- UI --------------------------------------------------------------------
-        let raw_input = win.egui_state.take_egui_input(&win.window);
-        let shape = if self.ui.tool == Tool::Remove {
-            self.world.scene.pick(at).map(|i| (self.world.scene.shapes[i], true))
-        } else {
-            pending_shape(&self.ui, at).map(|s| (s, false))
+        // What a click would place, remove or move, for the overlay to show.
+        let placing = match self.gesture {
+            Gesture::Place { anchor } => Some(anchor),
+            _ => None,
         };
+        let ghost = self.placement(placing);
+        let target = match (self.gesture, self.ui.tool) {
+            (Gesture::Move { pick, .. }, _) => Some((pick, false)),
+            (_, Tool::Remove) => self.world.pick(at).map(|p| (p, true)),
+            (_, Tool::Move) => self.world.pick(at).map(|p| (p, false)),
+            _ => None,
+        };
+        let busy = self.gesture != Gesture::None;
+        let Some(win) = &mut self.win else { return };
+        let raw_input = win.egui_state.take_egui_input(&win.window);
         let mut actions = UiActions::default();
-        let (pressed, grabbing) = (on_canvas && (self.input.left || self.input.right), on_canvas && self.input.right);
+        let (pressed, grabbing) = (on_canvas && (self.input.left || self.input.right), on_canvas && self.input.right && !busy);
         let full = win.egui_ctx.run(raw_input, |ctx| {
             let swatches = self.swatches.get_or_insert_with(|| crate::editor::Swatches::new(self.gpu.clone()));
             actions = ui::build(ctx, &mut self.ui, &mut self.world, swatches);
             let now = (self.ui.tool, self.ui.material);
-            if now.0 != self.shown.0 || (now.1 != self.shown.1 && self.ui.tool.uses_material()) {
-                self.overlay.toast_tool(ctx, &self.ui);
+            // With the interface hidden a change of tool or liquid is announced instead.
+            if !self.ui.show_panel && (now.0 != self.shown.0 || (now.1 != self.shown.1 && self.ui.tool.uses_material())) {
+                self.overlay.toast_tool(ctx, &self.ui, &self.world);
             }
             self.shown = now;
             let hover = self.input.inside && !ctx.is_pointer_over_area();
-            self.overlay.draw(ctx, &self.ui, view, size, hover.then_some(at), pressed, grabbing, shape.filter(|_| hover), self.world.currents(), self.world.sim.magnets());
+            let canvas = Canvas {
+                view,
+                size,
+                cursor: (hover || busy).then_some(at),
+                pressed,
+                grabbing,
+                ghost: ghost.filter(|_| hover || busy),
+                target: target.filter(|_| hover || busy),
+                world: &self.world,
+            };
+            self.overlay.draw(ctx, &self.ui, &canvas);
         });
         win.egui_state.handle_platform_output(&win.window, full.platform_output);
         let primitives = win.egui_ctx.tessellate(full.shapes, full.pixels_per_point);
 
         // ---- record ----------------------------------------------------------------
+        // Read-backs are picked up before this frame records new ones. (Polled after `record`,
+        // the read-back it had just asked for was not submitted yet, so nothing held its host
+        // copy and reading it succeeded: the slot was taken as done and its data lost, and
+        // the next request into it read what an earlier copy had left there. After a reset that
+        // stale copy was the old tank's time: simulated time jumped ahead by the time
+        // since the last reset and then stood still until the new tank caught up, and the
+        // bubbles, foam and specks, which run on it, were neither made nor moved meanwhile.)
+        self.world.sim.poll_stats();
         let mut b = self.gpu.builder();
         self.world.sim.record(&mut b, substeps, plan.target, tool);
-        self.world.sim.poll_stats();
         if self.frame_index.is_multiple_of(15) {
             self.world.sim.request_stats(&mut b);
         }
@@ -846,8 +1165,10 @@ impl ApplicationHandler for App {
                 self.input.left = false;
                 self.input.right = false;
                 self.input.middle = false;
+                self.cancel_gesture();
             }
             WindowEvent::Focused(false) => {
+                self.cancel_gesture();
                 self.input.left = false;
                 self.input.right = false;
                 self.input.middle = false;
@@ -857,7 +1178,7 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => self.pointer_moved([position.x as f32, position.y as f32]),
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
-                // A press that lands on the panel belongs to the panel; releases always count.
+                // A press that lands on a panel belongs to the panel; releases always count.
                 if !(down && consumed) {
                     self.button(button, down);
                 }
@@ -870,7 +1191,7 @@ impl ApplicationHandler for App {
                 if let (PhysicalKey::Code(code), ElementState::Pressed) = (event.physical_key, event.state) {
                     let repeatable = matches!(
                         code,
-                        KeyCode::BracketLeft | KeyCode::BracketRight | KeyCode::Minus | KeyCode::Equal | KeyCode::KeyN | KeyCode::Period
+                        KeyCode::BracketLeft | KeyCode::BracketRight | KeyCode::Minus | KeyCode::Equal | KeyCode::KeyN | KeyCode::Period | KeyCode::KeyT | KeyCode::KeyG
                     );
                     if !event.repeat || repeatable {
                         self.key(code, event_loop);
@@ -895,15 +1216,31 @@ impl ApplicationHandler for App {
 mod tests {
     use super::*;
 
+    const KEYS: [KeyCode; 26] = [
+        KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI,
+        KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR,
+        KeyCode::KeyS, KeyCode::KeyT, KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY, KeyCode::KeyZ,
+    ];
+
+    fn code(letter: &str) -> KeyCode {
+        KEYS.into_iter().find(|c| format!("{c:?}") == format!("Key{letter}")).unwrap_or_else(|| panic!("no key {letter}"))
+    }
+
     #[test]
-    fn every_tool_has_the_key_its_label_shows() {
-        for tool in Tool::LIQUID.into_iter().chain(Tool::SOLID) {
-            let code = [KeyCode::KeyQ, KeyCode::KeyB, KeyCode::KeyJ, KeyCode::KeyC, KeyCode::KeyW, KeyCode::KeyV, KeyCode::KeyZ, KeyCode::KeyE,
-                KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD, KeyCode::KeyX]
-                .into_iter()
-                .find(|&c| format!("{c:?}") == format!("Key{}", tool.key()))
-                .unwrap_or_else(|| panic!("no key for {}", tool.name()));
-            assert_eq!(tool_for_key(code), Some(tool));
+    fn every_tool_and_group_has_the_key_its_label_shows() {
+        for tool in Tool::all() {
+            if let Some(k) = tool.key() {
+                assert_eq!(tool_for_key(code(k)), Some(tool), "{}", tool.name());
+            }
+        }
+        for group in Group::ALL {
+            assert_eq!(group_for_key(code(group.key())), Some(group));
+        }
+        // No key means two things, and none of them is taken by a command.
+        for c in KEYS {
+            assert!(tool_for_key(c).is_none() || group_for_key(c).is_none(), "{c:?}");
+            let command = matches!(c, KeyCode::KeyN | KeyCode::KeyR | KeyCode::KeyL | KeyCode::KeyT | KeyCode::KeyG | KeyCode::KeyF | KeyCode::KeyH);
+            assert!(!(command && (tool_for_key(c).is_some() || group_for_key(c).is_some())), "{c:?}");
         }
     }
 }

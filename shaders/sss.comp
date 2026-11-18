@@ -1,0 +1,93 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+// Light inside the liquid (README, "Look", "Light under the surface"). The key light reaches
+// each cell straight from above (light.comp, smoothed sideways: layer 9), coloured by what it
+// passed through. Under the surface it also scatters: it comes in through every face of a
+// body that sees the sky (the sides and underside of a drop as well as its top), spreads
+// through it and fades, each colour at its own rate. That is the diffusion approximation of
+// light transport: per channel,
+//     - div (D grad phi) + s phi = s E,      D = 1 / (3 (a + s_s)),   s = a + ESCAPE
+// with E the light arriving straight (layer 9), a and s_s the liquid's absorption and
+// scattering for light (cell_optics.comp layer 19), and the air around the liquid held at
+// the light that falls there (light.comp's raw layer 10: open air 1, under a shelf less).
+// ESCAPE is the light that leaves through the front and back of the tank. The solution phi
+// is the light at each cell of liquid: within a few cells of a lit face, a scattering liquid
+// is lit from that face (milk glows at its rim, blood is scarlet at its edges and dark red
+// deep in, red light travels furthest), and a shadow inside a body has a soft edge.
+//
+// Jacobi iterations at the cell's resolution, warm-started from the last frame's solution
+// (layer 20), so it settles over a few frames and follows the liquid as it moves. Stage 0
+// prepares each cell (layer 22: E, D; layer 23: s, kind), stage 1 iterates from layer
+// `src` into the other one. The clear limit (no scattering) diffuses with D capped at D_MAX
+// cells: light then enters through the nearest face and fades over a few cells, by colour.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 58, rgba16f) uniform readonly image2DArray raw;
+layout(set = 0, binding = 60, rgba16f) uniform image2DArray cellopt;
+
+layout(push_constant) uniform SSPC {
+    uint stage;
+    uint src;       // layer read in stage 1 (20 or 21); the other one is written
+} Q;
+
+const float ESCAPE = 0.04;   // per cell
+const float D_MAX = 1.6;     // cells
+const float D_MIN = 0.04;
+const float KIND_AIR = -1.0, KIND_SOLID = -2.0;
+
+float sdf_centre(ivec2 q) {
+    int w1 = P.grid.x + 1, k = q.y * w1 + q.x;
+    return 0.25 * (sdf[k] + sdf[k + 1] + sdf[k + w1] + sdf[k + w1 + 1]);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    if (Q.stage == 0u) {
+        float occ = imageLoad(cellopt, ivec3(c, 4)).w;
+        if (sdf_centre(c) < -0.3) {
+            imageStore(cellopt, ivec3(c, 22), vec4(0.0));
+            imageStore(cellopt, ivec3(c, 23), vec4(0.0, 0.0, 0.0, KIND_SOLID));
+            return;
+        }
+        if (occ < 0.05) {
+            vec3 e = imageLoad(raw, ivec3(c, 10)).yzw;
+            imageStore(cellopt, ivec3(c, 22), vec4(e, 0.0));
+            imageStore(cellopt, ivec3(c, 23), vec4(0.0, 0.0, 0.0, KIND_AIR));
+            imageStore(cellopt, ivec3(c, 20), vec4(e, 0.0));
+            return;
+        }
+        vec4 k = imageLoad(cellopt, ivec3(c, 19)) / occ;
+        vec3 e = imageLoad(cellopt, ivec3(c, 9)).rgb / occ;
+        float lum_a = dot(k.rgb, vec3(0.3, 0.45, 0.25));
+        float D = clamp(1.0 / (3.0 * (lum_a + k.a) + 1e-4), D_MIN, D_MAX);
+        imageStore(cellopt, ivec3(c, 22), vec4(e, D));
+        imageStore(cellopt, ivec3(c, 23), vec4(k.rgb + ESCAPE, occ));
+        return;
+    }
+    uint dst = Q.src == 20u ? 21u : 20u;
+    vec4 kc = imageLoad(cellopt, ivec3(c, 23));
+    vec4 ec = imageLoad(cellopt, ivec3(c, 22));
+    if (kc.w < 0.0) {
+        // Air holds the light that falls in it; a solid holds nothing.
+        imageStore(cellopt, ivec3(c, int(dst)), vec4(kc.w == KIND_AIR ? ec.rgb : vec3(0.0), 0.0));
+        return;
+    }
+    vec3 num = kc.rgb * ec.rgb;
+    vec3 den = kc.rgb;
+    for (int q = 0; q < 4; q++) {
+        ivec2 nq = c + ivec2(q == 0 ? -1 : q == 1 ? 1 : 0, q == 2 ? -1 : q == 3 ? 1 : 0);
+        if (any(lessThan(nq, ivec2(0))) || any(greaterThanEqual(nq, P.grid))) continue;
+        float kind = imageLoad(cellopt, ivec3(nq, 23)).w;
+        if (kind == KIND_SOLID) continue;
+        float Dn = kind == KIND_AIR ? ec.a : imageLoad(cellopt, ivec3(nq, 22)).a;
+        float Df = 2.0 * ec.a * Dn / max(ec.a + Dn, 1e-6);
+        vec3 pn = imageLoad(cellopt, ivec3(nq, int(Q.src))).rgb;
+        num += Df * pn;
+        den += Df;
+    }
+    imageStore(cellopt, ivec3(c, int(dst)), vec4(num / den, 0.0));
+}

@@ -1,0 +1,495 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "air.glsl"
+#include "optics.glsl"
+
+// Bubbles, foam and spray (README, "Look", "Bubbles and foam"): secondary particles that the
+// liquid makes and carries but that do not push back on it (Ihmsen et al. 2012, "Unified
+// spray, foam and bubbles for particle-based fluids"). Each is one entry of a pool of
+// `cap`; it lives in one of three states, by how much liquid is around it:
+//
+//   bubble  inside the liquid: carried by it and rising at its terminal velocity through it
+//           (common.glsl: terminal, Stokes to Newton drag), from the liquid's own density and
+//           viscosity: in water a millimetre bubble rises at a quarter of a metre a second, in
+//           honey it stays where it was stirred in for minutes;
+//   foam    at the free surface (or held up by the foam around it): carried along the surface
+//           by the liquid, pushed apart where it crowds so that a head builds up and spreads,
+//           and bursting after the liquid's `froth` time, sooner where it is alone;
+//   spray   in the air: ballistic, slowed a little by the air, foam again where it lands.
+//
+// Stage 0 (per cell) makes them: where liquid that foams (`foam`) traps air, at the meeting
+// of streams that move differently (Ihmsen's trapped-air potential, from the velocity
+// difference to each neighbour that closes on it) and at a crest moving out of the surface,
+// both times how fast it is going; and where a liquid fizzes (`fizz`), dissolved gas comes
+// out on its own, most on the solids it touches (nucleation sites). Its size follows the
+// liquid's tension (soap makes a fine lather). Stage 1 (per entry) moves them, turns them
+// from one state into another, counts the foam per cell for the next frame's crowding, and
+// lists the live ones for the sprite pass (sprite.vert).
+//
+// Bubbles, foam and spray remember the liquid they came from (its row), so that the sprites
+// colour them by it: foam by how its films absorb as they drain, spray as droplets of it.
+//
+// Specks (README, "Particles in the liquid"): the coarse particles of a liquid with `dust`,
+// in a part of the pool of their own (`dust_base`, `dust_cap`), brought in by new particles of
+// it (look.comp). Each stands for its liquid's specks around it and moves as one of them:
+//
+//   suspended  carried by the liquid and settling through it (or rising, if lighter) at its
+//              terminal velocity (common.glsl: terminal, Stokes to Newton drag, the diameter
+//              of the sphere of its volume), lagging the flow by its response time
+//              rho_p d^2 / (18 mu); a flake turns with the flow by Jeffery's equation, so
+//              eddies tumble it through the light;
+//   resting    on a solid, or on the specks packed below it (counted per cell, as foam is):
+//              a sediment that builds up at the packing of grains, until the flow over it
+//              passes the Shields threshold, theta = tau / ((rho_p - rho) g d) ~ 0.05, with the
+//              bed stress from the flow a cell above it (u* ~ u / 8). A flake lies flat.
+//              Left dry, it stays DUST_DRY_LIFE seconds;
+//   falling    out of the liquid: ballistic, as spray.
+//
+// Where it lies in liquid it adds its share of the liquid's colour (the specks too many to
+// draw: optics `dust`) to the dust field, which cell_optics.comp adds to the cell's.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 60, rgba16f) uniform readonly image2DArray smoothed;
+
+struct Diffuse {
+    vec2 pos;    // cells
+    vec2 vel;    // cells / s
+    float life;  // s left (foam: until it bursts; bubble and spray: until it is dropped)
+    float r;     // radius, cells
+    uint info;   // bits 0-1 state (0 free, 1 bubble, 2 foam, 3 spray; a speck: suspended,
+                 // resting, falling); bit 2 grows (dissolved gas); bit 3 a speck; bits 8-14 the
+                 // row + 1 of the liquid it came from (0 unknown); bits 15-31 a seed
+    float z;     // bubble, speck: depth behind the front of the tank, as a share of the body's
+                 // thickness; foam: the life it was given when it formed (s)
+};
+// (A speck keeps its flake's normal in `life`, as bits: look.comp's pack_n; and, resting dry,
+// how long it has been so in vel.x.)
+layout(std430, set = 0, binding = 94) buffer DiffuseBuf { Diffuse dpart[]; };
+// [0] entries handed out so far; [4..7] the sprites' draw command; from 8 the live entries.
+layout(std430, set = 0, binding = 95) buffer DiffuseCtl { uint dctl[]; };
+// Foam per cell, two copies (last frame's, read; this frame's, counted); then resting specks
+// per cell, two copies.
+layout(std430, set = 0, binding = 96) buffer DiffuseCount { uint dcount[]; };
+layout(std430, set = 0, binding = 57) readonly buffer OptBuf { Optics optics[]; };
+// The dust field: per cell, the specks' absorption (rgb) and scattering x DUST_FIX.
+layout(std430, set = 0, binding = 92) buffer DustBuf { int dfield[]; };
+// The film map's intake (film_lay.glsl): spray and drips that land leave a splat.
+layout(std430, set = 0, binding = 72) buffer FilmInBuf { uint film_in[]; };
+layout(std430, set = 0, binding = 73) buffer FilmColBuf { uint film_col[]; };
+layout(std430, set = 0, binding = 74) buffer FilmTileBuf { uint ftile[]; };
+#include "film_lay.glsl"
+const float DUST_FIX = 1024.0;   // cell_optics.comp: the same
+#include "pool.glsl"
+
+layout(push_constant) uniform SPC {
+    float dt;
+    float now;
+    uint stage;
+    uint parity;   // the copy of dcount counted into this frame
+    uint cap;      // entries in the pool
+    float amount;  // params.rs: bubbles (0: none are made)
+    uint dust_base; // the specks' part of the pool: first entry, count
+    uint dust_cap;
+} SP;
+
+const uint FREE = 0u, BUBBLE = 1u, FOAM = 2u, SPRAY = 3u;
+const float FOAM_RATE = 40.0;     // bubbles a second from a cell at full trapped-air potential
+const float CREST_RATE = 25.0;    // from a cell of crest at full speed
+const float FIZZ_RATE = 1.6;      // bubbles a second per cell of liquid that fizzes (fizz 1)
+const float FIZZ_WALL = 5.0;      // times as many where it touches a solid
+const float FIZZ_GROW = 0.5e-3;   // m / s: how fast a bubble of dissolved gas grows as it rises
+const int EMIT_MAX = 6;           // per cell and frame
+const float BUBBLE_OCC = 0.62;    // occupancy above which it is inside the liquid
+const float FOAM_OCC = 0.10;      // ... and above which (with its crowd) it lies on it
+const float FOAM_SPREAD = 6.0;    // cells / s: how fast crowded foam spreads (and builds up)
+const float FOAM_CROWD = 2.0;     // foam parcels per cell where they start to push apart (sprite.vert: FOAM_PARCEL)
+const float FOAM_FULL = 5.0;      // ... and where a surfacing bubble just joins the foam there
+const float FOAM_FALL = 8.0;      // cells / s: foam with nothing under it falls onto what is
+const float FOAM_SAG = 1.5;       // cells / s: foam held up by foam settles a little (it drains)
+const float ENTRAIN_RATE = 30.0;  // bubbles a second from a cell of surface folding into the liquid at full speed
+const float SPRAY_DRAG = 1.2;     // 1 / s
+const float SPRAY_LIFE = 1.5;     // s
+const float BUBBLE_LIFE = 40.0;   // s: a bubble that never reaches the surface (trapped in honey)
+const uint DUST = 8u;
+const uint DRIP = 16u;            // a drip from a film (film.comp)
+const float DUST_IN = 0.30;       // occupancy above which a speck is in the liquid
+const float DUST_DRY_LIFE = 30.0; // s a speck stays where liquid has left it
+const float SHIELDS = 0.05;       // critical Shields number
+const float BED_U = 8.0;          // flow a cell above a bed over its friction velocity (log law)
+
+float rnd(uint h) { return float(h >> 8) / 16777216.0; }
+float ramp(float x, float lo, float hi) { return clamp((x - lo) / (hi - lo), 0.0, 1.0); }
+
+vec2 centre_vel(int i) {
+    vec4 v = vel[i];
+    vec2 u = vec2(face_live(v.z) ? v.x : 0.0, face_live(v.w) ? v.y : 0.0);
+    vec4 vr = vel[min(i + 1, P.grid.x * P.grid.y - 1)], vt = vel[min(i + P.grid.x, P.grid.x * P.grid.y - 1)];
+    return 0.5 * (u + vec2(face_live(vr.z) ? vr.x : 0.0, face_live(vt.w) ? vt.y : 0.0));
+}
+
+float occ_cell(ivec2 q) {
+    if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, P.grid))) return 0.0;
+    return clamp(cell[cidx(q)].x, 0.0, 1.5);
+}
+
+// Occupancy at x, bilinear between cell centres.
+float occ_at(vec2 x) {
+    vec2 g = x - 0.5;
+    ivec2 b = ivec2(floor(g));
+    vec2 f = g - vec2(b);
+    return mix(mix(occ_cell(b), occ_cell(b + ivec2(1, 0)), f.x), mix(occ_cell(b + ivec2(0, 1)), occ_cell(b + ivec2(1, 1)), f.x), f.y);
+}
+
+// The row of the liquid that holds most of cell i (-1 none): as cell_optics.comp counts them.
+int dominant_row(int i) {
+    int k = i * P.acc_stride;
+    int cw = acc[k + 4];
+    if (cw <= 0) return -1;
+    int others = 0;
+    for (int j = 0; j < P.n_present; j++) {
+        int ch = mats[present_row(j)].ia.z;
+        if (ch >= 0) others += acc[k + ch];
+    }
+    int best = -1, bw = 0;
+    for (int j = 0; j < P.n_present; j++) {
+        int r = present_row(j);
+        ivec4 ia = mats[r].ia;
+        if (ia.z < 0 && P.primary >= 0 && r != P.primary) continue;
+        int w = ia.z >= 0 ? acc[k + ia.z] : max(cw - others, 0);
+        if (w > bw && r != int(ROW_STEAM)) { bw = w; best = r; }
+    }
+    return best;
+}
+
+float crowd_cell(ivec2 q, uint copy) {
+    q = clamp(q, ivec2(0), P.grid - 1);
+    return float(dcount[copy * uint(P.grid.x * P.grid.y) + uint(cidx(q))]);
+}
+
+void emit(ivec2 c, int i, uint h, int n, float r0, uint grows, vec2 u, float spread, float froth, int row) {
+    for (int k = 0; k < n; k++) {
+        uint hk = hash(h + uint(k) * 0x9e3779b9u);
+        // (A full pool drops what it cannot hold: it never cuts a living bubble short.)
+        int slot = pool_take(0u, 0u, SP.cap, SP.cap + SP.dust_cap);
+        if (slot < 0) return;
+        Diffuse d;
+        d.pos = vec2(c) + vec2(rnd(hk), rnd(hash(hk ^ 0x51ed270bu)));
+        float a = 6.2831853 * rnd(hash(hk ^ 0x2545f491u));
+        d.vel = u + spread * vec2(cos(a), sin(a)) * rnd(hash(hk ^ 0x27d4eb2fu));
+        float s = rnd(hash(hk ^ 0x165667b1u));
+        d.r = r0 * (0.45 + 1.1 * s * s);
+        d.info = BUBBLE | grows | (uint(row + 1) << 8) | (hash(hk ^ 0x68e31da4u) & 0xffff8000u);
+        d.life = BUBBLE_LIFE;
+        d.z = rnd(hash(hk ^ 0xb5297a4du));
+        dpart[slot] = d;
+    }
+}
+
+void make() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(c, P.grid))) return;
+    int i = cidx(c);
+    float occ = occ_cell(c);
+    if (occ < 0.08) return;
+    vec4 l4 = imageLoad(smoothed, ivec3(c, 4));
+    if (l4.w < 0.02) return;
+    // (Any liquid traps air where it is churned or folded in; `foam` is whether the bubbles
+    // that reach its surface stay there as foam, and adds the white water of a splash.)
+    float foam_k = l4.y / l4.w;
+    vec4 l16 = imageLoad(smoothed, ivec3(c, 16)) / l4.w;
+    float fizz = l16.y;
+    float cs = P.misc.z;
+    vec2 u = centre_vel(i);
+    // Trapped air: the velocity difference to each neighbour of liquid that closes on it.
+    float ta = 0.0;
+    vec2 gocc = vec2(0.0);
+    for (int q = 0; q < 4; q++) {
+        ivec2 dq = ivec2(q == 0 ? -1 : q == 1 ? 1 : 0, q == 2 ? -1 : q == 3 ? 1 : 0);
+        ivec2 nq = c + dq;
+        float on = occ_cell(nq);
+        gocc += vec2(dq) * on;
+        if (on < 0.08 || any(lessThan(nq, ivec2(0))) || any(greaterThanEqual(nq, P.grid))) continue;
+        vec2 dv = u - centre_vel(cidx(nq));
+        float m = length(dv);
+        if (m < 1e-4) continue;
+        ta += m * (1.0 - dot(dv / m, -vec2(dq)));
+    }
+    float speed = length(u) * cs;                       // m / s
+    float energy = ramp(speed, 0.6, 3.0);
+    float trapped = ramp(ta * cs, 1.0, 5.0);
+    // A crest: liquid at the surface moving out of it, fast.
+    float g = length(gocc);
+    float crest = 0.0, plunge = 0.0;
+    vec2 nout = vec2(0.0, 1.0);
+    if (g > 0.15 && speed > 0.05) {
+        nout = -gocc / g;
+        float along = dot(u / length(u), nout);
+        crest = ramp(along, 0.6, 0.95) * ramp(speed, 1.0, 3.5);
+        // The surface folding into the liquid (a stream plunging in, a whirl drawing it
+        // down): air goes under with it, even slowly in a thick liquid.
+        plunge = ramp(-along, 0.4, 0.9) * ramp(speed, 0.08, 1.2) * smoothstep(0.15, 0.6, g);
+    }
+    // Bubble size from the tension (Laplace: a lower tension holds smaller bubbles).
+    float tension = max(sprop[i].x, 0.0) * cs * cs * cs / 7.2e-5;   // relative to water's
+    float r0 = clamp(1.2e-3 * sqrt(clamp(tension, 0.05, 4.0)) / cs, 0.03, 0.4);
+    float froth = l16.x;
+    uint h = hash(uint(i) * 0x85ebca6bu ^ hash(P.frame * 0x9e3779b1u + 0x3c6ef372u));
+    float rate = SP.amount * (FOAM_RATE * trapped * energy + ENTRAIN_RATE * plunge + CREST_RATE * crest * foam_k);
+    int n = min(int(floor(rate * SP.dt + rnd(h))), EMIT_MAX);
+    int row = (n > 0 || fizz > 0.0) ? dominant_row(i) : -1;
+    if (n > 0) emit(c, i, h, n, r0, 0u, u, 0.3 * length(u), froth, row);
+    // Dissolved gas coming out: most where the liquid touches a solid.
+    if (fizz > 0.0) {
+        int w1 = P.grid.x + 1, kk = c.y * w1 + c.x;
+        float sd = 0.25 * (sdf[kk] + sdf[kk + 1] + sdf[kk + w1] + sdf[kk + w1 + 1]);
+        float wall = 1.0 - ramp(sd, 0.5, 2.0);
+        float fr = SP.amount * FIZZ_RATE * fizz * min(occ, 1.0) * (1.0 + FIZZ_WALL * wall);
+        uint h2 = hash(h ^ 0x7feb352du);
+        int nf = min(int(floor(fr * SP.dt + rnd(h2))), 2);
+        if (nf > 0) emit(c, i, h2, nf, clamp(0.25e-3 / cs, 0.02, 0.2), 4u, u, 0.0, froth, row);
+    }
+}
+
+// Unpacks a speck's flake normal (look.comp: pack_n).
+vec3 unpack_n(uint b) {
+    vec2 q = vec2(float(b & 1023u), float((b >> 10) & 1023u)) / 1023.0 * 2.0 - 1.0;
+    vec2 p = vec2(q.x + q.y, q.x - q.y) * 0.5;
+    return normalize(vec3(p, max(1.0 - abs(p.x) - abs(p.y), 0.0)));
+}
+uint quant(float v, uint bits, uint h) {
+    float m = float((1u << bits) - 1u);
+    return uint(clamp(floor(clamp(v, 0.0, 1.0) * m + rnd(h)), 0.0, m));
+}
+uint pack_n(vec3 n, uint h) {
+    if (n.z < 0.0) n = -n;
+    vec2 p = n.xy / max(abs(n.x) + abs(n.y) + n.z, 1e-6);
+    vec2 q = vec2(p.x + p.y, p.x - p.y) * 0.5 + 0.5;
+    return quant(q.x, 10u, hash(h)) | (quant(q.y, 10u, hash(h ^ 0x68e31da4u)) << 10);
+}
+
+// A speck (see the top): suspended (BUBBLE), resting (FOAM), falling (SPRAY).
+void move_dust(uint i, Diffuse d) {
+    uint st = d.info & 3u;
+    uint copy_in = 1u - SP.parity, copy_out = SP.parity;
+    uint ncell = uint(P.grid.x * P.grid.y);
+    int row = int((d.info >> 8) & 127u) - 1;
+    if (row < 0) { dpart[i].info = 0u; pool_return(1u, SP.dust_base, SP.cap + SP.dust_cap, i); return; }
+    Optics o = optics[row];
+    float rho_p = o.dust2.y / 998.0;                      // relative to water's, as cell[].y
+    float aspect = o.dust2.z;
+    float rr = d.r;                                       // radius, cells
+    // The diameter of the sphere of its volume (a flake of aspect r: D (1.5 r)^(1/3)).
+    float d_eq = 2.0 * rr * (aspect < 0.6667 ? pow(1.5 * max(aspect, 0.005), 1.0 / 3.0) : 1.0);
+    float pack = max(o.dcol.w, 1.0);
+    float Bc = (aspect * aspect - 1.0) / (aspect * aspect + 1.0);
+    vec3 n = unpack_n(floatBitsToUint(d.life));
+    uint h0 = hash(d.info ^ hash(P.frame * 0x9e3779b1u + i));
+    int steps = clamp(int(ceil(SP.dt * 120.0)), 1, 8);
+    float h = SP.dt / float(steps);
+    for (int k = 0; k < steps && st != FREE; k++) {
+        ivec2 c = clamp(ivec2(d.pos), ivec2(0), P.grid - 1);
+        int ci = cidx(c);
+        float occ = occ_at(d.pos);
+        vec4 cf = cell[ci];
+        float rho = max(cf.y, 0.3), nu = max(cf.z / rho, 1e-6);
+        float drho = rho_p - rho;
+        float down = drho >= 0.0 ? 1.0 : -1.0;
+        // What holds it up: a solid just below it (or above, if it rises), or the specks
+        // packed in the cell there.
+        vec2 under = d.pos - vec2(0.0, down * (rr + 0.35));
+        vec2 gs_u;
+        float sd_u = sample_sdf(under, gs_u);
+        ivec2 cu = clamp(ivec2(under), ivec2(0), P.grid - 1);
+        float packed = float(dcount[(2u + copy_in) * ncell + uint(cidx(cu))]);
+        bool held = sd_u < 0.0 || (cu != c && packed >= pack) || under.y < 0.0;
+        bool wet = occ > DUST_IN;
+        vec2 uf = sample_vel(d.pos, vec2(0.0));
+        // The flow that stirs a resting speck up again (Shields).
+        float u_crit = BED_U * sqrt(SHIELDS * abs(drho) * P.gravity * d_eq / rho);
+        if (st == FOAM) {
+            if (!held) st = wet ? BUBBLE : SPRAY;
+            else if (wet && length(uf) > u_crit) { st = BUBBLE; d.vel = uf; }
+            else {
+                // At rest: a flake lies flat on what holds it.
+                vec3 nb = vec3(sd_u < 0.0 ? normalize(gs_u + vec2(0.0, 1e-4)) : vec2(0.0, 1.0), 0.0);
+                n = normalize(mix(n, nb * sign(dot(n, nb) + 1e-4), 1.0 - exp(-h / 0.3)));
+                d.vel = vec2(wet ? 0.0 : d.vel.x + h, 0.0);
+                if (d.vel.x > DUST_DRY_LIFE) st = FREE;
+                continue;
+            }
+        }
+        if (st == SPRAY && wet) st = BUBBLE;
+        if (st == BUBBLE && !wet) st = SPRAY;
+        if (st == BUBBLE) {
+            // Settling at its terminal velocity, lagging the flow by its response time.
+            float vt = terminal(drho, rho, nu, d_eq);
+            vec2 target = uf - vec2(0.0, down * vt);
+            float tau = clamp(rho_p * d_eq * d_eq / (18.0 * rho * nu), 0.004, 0.5);
+            d.vel = mix(d.vel, target, 1.0 - exp(-h / tau));
+            // A flake turns with the flow (Jeffery): the velocity gradient across it.
+            if (aspect < 0.6667) {
+                vec2 ux1 = sample_vel(d.pos + vec2(0.5, 0.0), uf), ux0 = sample_vel(d.pos - vec2(0.5, 0.0), uf);
+                vec2 uy1 = sample_vel(d.pos + vec2(0.0, 0.5), uf), uy0 = sample_vel(d.pos - vec2(0.0, 0.5), uf);
+                vec2 gx = ux1 - ux0, gy = uy1 - uy0;          // (du/dx, dv/dx), (du/dy, dv/dy)
+                float w = 0.5 * (gx.y - gy.x);
+                float dv = 0.5 * (gx.x + gy.y);
+                float exx = gx.x - dv, eyy = gy.y - dv, exy = 0.5 * (gy.x + gx.y);
+                vec3 Wn = vec3(-w * n.y, w * n.x, 0.0);
+                vec3 En = vec3(exx * n.x + exy * n.y, exy * n.x + eyy * n.y, 0.0);
+                n = normalize(n + h * (Wn + Bc * (En - dot(n, En) * n)));
+            }
+            if (held && dot(d.vel - uf, vec2(0.0, -down)) >= 0.0 && length(uf) < u_crit) { st = FOAM; d.vel = vec2(0.0); }
+        } else if (st == SPRAY) {
+            d.vel += vec2(0.0, -P.gravity * h) - d.vel * SPRAY_DRAG * h;
+        }
+        d.pos += d.vel * h;
+        // Kept out of the solids; landing on one, it rests there.
+        vec2 gs;
+        float sd = sample_sdf(d.pos, gs);
+        float rim = rr + 0.05;
+        if (sd < rim) {
+            vec2 nrm = gs / max(length(gs), 1e-6);
+            d.pos += nrm * (rim - sd);
+            d.vel -= nrm * min(dot(d.vel, nrm), 0.0);
+            if (st == SPRAY) { st = FOAM; d.vel = vec2(0.0); }
+        }
+        if (any(lessThan(d.pos, vec2(0.0, -1.0))) || any(greaterThanEqual(d.pos, vec2(P.grid)))) st = FREE;
+    }
+    d.life = uintBitsToFloat(pack_n(n, h0));
+    d.info = (d.info & ~3u) | st;
+    dpart[i] = d;
+    if (st == FREE) { pool_return(1u, SP.dust_base, SP.cap + SP.dust_cap, i); return; }
+    ivec2 c = clamp(ivec2(d.pos), ivec2(0), P.grid - 1);
+    uint ci = uint(cidx(c));
+    if (st == FOAM) atomicAdd(dcount[(2u + copy_out) * ncell + ci], 1u);
+    // Its share of the liquid's colour, where it lies in liquid.
+    if (o.dust.a > 0.0 && occ_cell(c) > 0.05) {
+        ivec4 q = ivec4(o.dust * DUST_FIX + 0.5);
+        if (q.x > 0) atomicAdd(dfield[4u * ci], q.x);
+        if (q.y > 0) atomicAdd(dfield[4u * ci + 1u], q.y);
+        if (q.z > 0) atomicAdd(dfield[4u * ci + 2u], q.z);
+        atomicAdd(dfield[4u * ci + 3u], q.w);
+    }
+    uint k = atomicAdd(dctl[4], 6u) / 6u;
+    if (k < SP.cap + SP.dust_cap) dctl[8u + k] = i;
+}
+
+void move() {
+    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (i >= SP.cap + SP.dust_cap) return;
+    Diffuse d = dpart[i];
+    uint st = d.info & 3u;
+    if (st == FREE) return;
+    if ((d.info & DUST) != 0u) { move_dust(i, d); return; }
+    uint copy_in = 1u - SP.parity, copy_out = SP.parity;
+    float cs = P.misc.z;
+    int steps = clamp(int(ceil(SP.dt * 120.0)), 1, 8);
+    float h = SP.dt / float(steps);
+    for (int k = 0; k < steps && st != FREE; k++) {
+        ivec2 c = clamp(ivec2(d.pos), ivec2(0), P.grid - 1);
+        int ci = cidx(c);
+        float occ = occ_at(d.pos);
+        vec2 uf = sample_vel(d.pos, vec2(0.0));
+        // Crowding: the foam around it last frame, and which way it thins out.
+        float crowd = crowd_cell(c, copy_in);
+        vec2 gc = vec2(crowd_cell(c + ivec2(1, 0), copy_in) - crowd_cell(c - ivec2(1, 0), copy_in),
+                       crowd_cell(c + ivec2(0, 1), copy_in) - crowd_cell(c - ivec2(0, 1), copy_in));
+        uint want = occ > BUBBLE_OCC ? BUBBLE : (occ + 0.06 * crowd > FOAM_OCC ? FOAM : SPRAY);
+        vec4 l4 = imageLoad(smoothed, ivec3(c, 4));
+        float wl = max(l4.w, 1e-3);
+        if (want != st) {
+            if (want == FOAM || (want == BUBBLE && st == SPRAY)) {
+                // Surfacing, or landing: it lasts as long as this liquid's foam does (a
+                // droplet of one that does not foam merges with it).
+                float foam_k = l4.w > 0.02 ? l4.y / wl : 0.0;
+                float froth = l4.w > 0.02 ? imageLoad(smoothed, ivec3(c, 16)).x / wl : 0.0;
+                if (st == SPRAY && foam_k < 0.05) { st = FREE; break; }
+                // (Where the foam is already full, a bubble that comes up just joins it.)
+                if (want == FOAM && st == BUBBLE && (crowd > FOAM_FULL || foam_k < 0.05)) { st = FREE; break; }
+                if (want == FOAM) {
+                    d.life = max(froth, 0.05) * (0.5 + rnd(hash(d.info ^ uint(k))));
+                    d.z = d.life;   // (the sprites draw its age from it)
+                }
+                if (want == BUBBLE) d.life = BUBBLE_LIFE;
+            }
+            if (want == SPRAY) d.life = min(d.life, SPRAY_LIFE);
+            // (Foam pushed back under is a bubble at some depth again.)
+            if (want == BUBBLE && st == FOAM) d.z = rnd(hash(d.info ^ 0xb5297a4du));
+            st = want;
+        }
+        vec2 target;
+        float tau;
+        if (st == BUBBLE) {
+            // (The cell's density and dynamic viscosity: grid_prep.comp's cell fields.)
+            vec4 cf = cell[ci];
+            float rho = max(cf.y, 0.3), nu = max(cf.z / rho, 1e-6);
+            float vt = terminal(rho, rho, nu, 2.0 * d.r);
+            target = uf + vec2(0.0, vt);
+            tau = 0.03;
+            if ((d.info & 4u) != 0u) d.r = min(d.r + FIZZ_GROW / cs * h, 0.35);
+            d.life -= h;
+        } else if (st == FOAM) {
+            float sub = clamp(occ * 2.0, 0.0, 1.0);
+            target = uf * sub;
+            // Packed foam pushes apart: sideways freely, upwards only off foam or liquid that
+            // holds it up (a head builds up), and with nothing under it, it falls onto what is.
+            float below = occ_at(d.pos - vec2(0.0, 0.7)) + 0.25 * crowd_cell(c - ivec2(0, 1), copy_in);
+            bool held = occ > 0.25 || below > 0.45;
+            float push = ramp(crowd, FOAM_CROWD * 0.7, FOAM_CROWD * 2.0);
+            float gl = length(gc);
+            if (gl > 1e-3) {
+                vec2 sp = -gc / gl * FOAM_SPREAD * push;
+                if (!held) sp.y = min(sp.y, 0.0);
+                target += sp;
+            }
+            target.y -= held ? FOAM_SAG * (1.0 - ramp(occ, 0.1, 0.4)) : FOAM_FALL;
+            // Pushed under, it comes back up.
+            if (occ > 0.45) target.y += 4.0 * (occ - 0.45);
+            tau = 0.06;
+            // A bubble on its own bursts sooner than one in a head of foam.
+            d.life -= h * (crowd < 2.0 ? 2.5 : 1.0);
+        } else {
+            target = d.vel + vec2(0.0, -P.gravity * h) - d.vel * SPRAY_DRAG * h;
+            tau = 0.0;
+            d.life -= h;
+        }
+        d.vel = tau > 0.0 ? mix(d.vel, target, 1.0 - exp(-h / tau)) : target;
+        d.pos += d.vel * h;
+        // Kept out of the solids. A droplet in the air that strikes one splats: its liquid
+        // spreads to a disc about twice its width, a third of its radius thick (film_lay).
+        vec2 gs;
+        float sd = sample_sdf(d.pos, gs);
+        float rim = d.r + 0.1;
+        int drow = int((d.info >> 8) & 127u) - 1;
+        if (st == SPRAY && sd < rim && drow >= 0) {
+            float unit = 1.0e-4 / P.misc.z;
+            vec2 nrm = gs / max(length(gs), 1e-6);
+            film_lay(d.pos - nrm * (sd + 0.3), optics[drow].absorb * unit, optics[drow].fx.x, drow,
+                     d.r / 3.0 / unit * mix(1.0, 1.3, ramp(length(d.vel) * P.misc.z, 0.5, 3.0)), 2.0 * d.r * max(P.heat3.z, 1.0));
+            st = FREE;
+            break;
+        }
+        if (sd < rim) {
+            vec2 nrm = gs / max(length(gs), 1e-6);
+            d.pos += nrm * (rim - sd);
+            d.vel -= nrm * min(dot(d.vel, nrm), 0.0);
+        }
+        if (d.life <= 0.0 || any(lessThan(d.pos, vec2(0.0))) || any(greaterThanEqual(d.pos, vec2(P.grid)))) st = FREE;
+    }
+    d.info = (d.info & ~3u) | st;
+    dpart[i] = d;
+    if (st == FREE) { pool_return(0u, 0u, SP.cap + SP.dust_cap, i); return; }
+    if (st == FOAM) {
+        ivec2 c = clamp(ivec2(d.pos), ivec2(0), P.grid - 1);
+        atomicAdd(dcount[copy_out * uint(P.grid.x * P.grid.y) + uint(cidx(c))], 1u);
+    }
+    uint k = atomicAdd(dctl[4], 6u) / 6u;
+    if (k < SP.cap + SP.dust_cap) dctl[8u + k] = i;
+}
+
+void main() {
+    if (SP.stage == 0u) make();
+    else move();
+}

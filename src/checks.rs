@@ -262,20 +262,20 @@ fn l2(measured: &[f32], theory: &[f32]) -> f32 {
 /// static shape yield-stress theory predicts, and gravity-driven flow down a vertical slot
 /// against the Bingham and Carreau velocity profiles.
 pub fn rheology(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
-    println!("\nRheology (sludge slump vs yield-stress theory; Bingham and Carreau slot flow)");
-    // ---- slump: a 20 x 20 cm column of sludge on a 1 cm grid ------------------------------
+    println!("\nRheology (clay slump vs yield-stress theory; Bingham and Carreau slot flow)");
+    // ---- slump: a 20 x 20 cm column of clay on a 1 cm grid ------------------------------
     let grid = [256, 144];
     let (side, x_mid) = (20.0f32, 128.0f32);
-    let ps = block(grid, [x_mid - side * 0.5, 0.0, x_mid + side * 0.5, WALL + side], Material::Sludge);
+    let ps = block(grid, [x_mid - side * 0.5, 0.0, x_mid + side * 0.5, WALL + side], Material::Clay);
     let mut w = build(gpu, grid, apply, Vec::new(), ps, &|_| {});
     run(&mut w, 8.0);
     r.shot(&w, "slump");
     let sp = w.sim.params;
     let ps = w.sim.download_particles();
-    let sludge = sp.mat[Material::Sludge.index()];
+    let clay = sp.mat[Material::Clay.index()];
     // Static shape of a yield-stress layer (Liu & Mei 1989; Coussot 1997):
     // tau_y = rho g h |dh/dx|, h(x) = sqrt(2 tau_y (L - x) / (rho g)); its area fixes L.
-    let lc = 2.0 * sludge.yield_stress / (sludge.density * sp.gravity) / sp.cell_size;
+    let lc = 2.0 * clay.yield_stress / (clay.density * sp.gravity) / sp.cell_size;
     let half_area = side * side * 0.5;
     let run_out = (1.5 * half_area / lc.sqrt()).powf(2.0 / 3.0);
     let peak = (lc * run_out).sqrt();
@@ -311,13 +311,13 @@ pub fn rheology(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) 
         (profile(&ps, [150.0, 220.0], x_c - a, x_c + a, 20), w.sim.params)
     };
     // Bingham: plug of half-width y_p = tau_y / (rho g) in the middle, parabola outside it.
-    let (bing, sp) = slot(gpu, Material::Sludge, a, 0.15, &|p: &mut SimParams| {
-        let m = &mut p.mat[Material::Sludge.index()];
+    let (bing, sp) = slot(gpu, Material::Clay, a, 0.15, &|p: &mut SimParams| {
+        let m = &mut p.mat[Material::Clay.index()];
         m.flow_index = 1.0;
         m.yield_stress = 20.0;
         m.viscosity = 0.02;
     });
-    let m = sp.mat[Material::Sludge.index()];
+    let m = sp.mat[Material::Clay.index()];
     let g = sp.gravity / sp.cell_size;
     let nu = m.viscosity / (sp.cell_size * sp.cell_size);
     let yp = m.yield_stress / (m.density * sp.gravity) / sp.cell_size;
@@ -795,12 +795,12 @@ pub fn metals(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     r.check("gallium: the oxide skin holds a stretched blob", format!("aspect ratio after 0.5 s: {with:.2} with skin, {without:.2} without (start 5.0)"), "with > 4, without < 3", with > 4.0 && without < 3.0);
 }
 
-/// Mixing conserves every component: ink, mud, blood, milk and syrup stirred into water.
+/// Mixing conserves every component: ink, mud, blood, milk and honey stirred into water.
 pub fn mixing(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
-    println!("\nMixing (ink, mud, blood, milk, syrup and brine stirred into water, 10 s)");
+    println!("\nMixing (ink, mud, blood, milk, honey and brine stirred into water, 10 s)");
     let grid = [256, 144];
     let mut ps = block(grid, [0.0, 0.0, 256.0, 60.0], Material::Water);
-    let blobs = [(Material::Ink, 30.0), (Material::Mud, 70.0), (Material::Blood, 110.0), (Material::Milk, 150.0), (Material::Syrup, 190.0), (Material::Brine, 230.0)];
+    let blobs = [(Material::Ink, 30.0), (Material::Mud, 70.0), (Material::Blood, 110.0), (Material::Milk, 150.0), (Material::Honey, 190.0), (Material::Brine, 230.0)];
     for (m, x) in blobs {
         ps.extend(block(grid, [x - 10.0, 62.0, x + 10.0, 82.0], m));
     }

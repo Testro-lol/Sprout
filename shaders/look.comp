@@ -1,0 +1,172 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+#include "air.glsl"
+#include "optics.glsl"
+
+// What a particle carries for the look (README, "Particles in the liquid"). Each particle of a
+// liquid whose fine particles are platelets (`cloud_shape` well below 1) keeps, in a side
+// buffer that the periodic sort permutes with the particles (sort.comp), the orientation of
+// the many platelets it stands for:
+//
+//   A  the second moment <n n> of their normals, isotropic (I / 3) when it enters. It evolves
+//      by Jeffery's equation (1922) averaged over them, with the quadratic closure (Advani &
+//      Tucker 1987): dA/dt = W A - A W + B (E A + A E - 2 (A:E) A) - 6 Dr (A - I / 3), W and
+//      E the rotation and strain rate of the velocity gradient (the particle's APIC matrix),
+//      B = (r^2 - 1) / (r^2 + 1) the Bretherton constant of platelets of thickness over
+//      diameter r, and Dr their rotational diffusion, 3 kT / (4 eta d^3) for discs of
+//      diameter d (Stokes-Einstein-Debye; material.rs works both out). In a plane flow only
+//      A_xx, A_yy, A_xy change (A_zz = 1 - A_xx - A_yy). Shear lines the platelets up and
+//      turns them on edge, Brownian rotation undoes it: 15 µm mica keeps the flow's pattern
+//      for minutes (a rheoscopic fluid), 1 µm platelets lose it within a second.
+//
+// Four words: the particle's id (a slot whose id differs holds a new particle, which is given
+// its state then, whichever way it came in), unused, A_xx, A_yy, A_xy at 10 bits each, unused.
+// Each is rounded stochastically, so that small turns per frame still add up.
+//
+// A new particle of a liquid with specks (`dust`) also brings its share of them into the tank:
+// the liquid's drawn specks per cell (`fx2.z`) over the particles per cell, as entries of
+// spray.comp's pool, which carries them from then on (they settle out of it).
+
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 57) readonly buffer OptBuf { Optics optics[]; };
+layout(std430, set = 0, binding = 90) buffer LookBuf { uvec4 plook[]; };
+// Draw command (vertex count, instances, first vertex, first instance) of the look splat, an
+// unused one, then the list of particle slots, `cap` entries.
+layout(std430, set = 0, binding = 93) buffer LookListBuf { uint lctl[]; };
+
+// spray.comp's pool: its entries and its hand-out counters ([1]: the specks').
+struct Diffuse { vec2 pos; vec2 vel; float life; float r; uint info; float z; };
+layout(std430, set = 0, binding = 94) buffer DiffuseBuf { Diffuse dpart[]; };
+layout(std430, set = 0, binding = 95) buffer DiffuseCtl { uint dctl[]; };
+
+layout(push_constant) uniform LPC {
+    float dt;        // simulated time since the last update, s
+    float now;       // simulated time, s
+    uint cap;        // entries in the look list (the particle capacity)
+    uint dust_base;  // the specks' part of the pool: first entry, count
+    uint dust_cap;
+} L;
+
+#include "pool.glsl"
+
+// spray.comp: the states and flags of an entry.
+const uint BUBBLE = 1u, DUST = 8u;
+
+float rnd(uint h) { return float(h >> 8) / 16777216.0; }
+
+// The platelets' sheen weight and the specks drawn per cell of a particle's material, by
+// its concentration in its diluent.
+vec2 look_of(uint row, float s) {
+    Optics o = optics[row];
+    vec2 l = vec2(o.opt.y, o.fx2.z);
+    if (o.idx.x >= 0) {
+        Optics d = optics[o.idx.x];
+        l = mix(vec2(d.opt.y, d.fx2.z), l, clamp(s, 0.0, 1.0));
+    }
+    return l;
+}
+
+uint quant(float v, uint bits, uint h) {
+    float m = float((1u << bits) - 1u);
+    return uint(clamp(floor(clamp(v, 0.0, 1.0) * m + rnd(h)), 0.0, m));
+}
+
+// A unit normal in hemi-octahedral form, 10 + 10 bits (a disc's normal and its opposite are
+// one orientation; spray.comp keeps a speck's this way).
+uint pack_n(vec3 n, uint h) {
+    if (n.z < 0.0) n = -n;
+    vec2 p = n.xy / max(abs(n.x) + abs(n.y) + n.z, 1e-6);
+    vec2 q = vec2(p.x + p.y, p.x - p.y) * 0.5 + 0.5;
+    return quant(q.x, 10u, hash(h)) | (quant(q.y, 10u, hash(h ^ 0x68e31da4u)) << 10);
+}
+// A_xx, A_yy in [0, 1], A_xy in [-0.5, 0.5].
+uint pack_a(vec3 a, uint h) {
+    return quant(a.x, 10u, hash(h ^ 0x1b873593u)) | (quant(a.y, 10u, hash(h ^ 0xcc9e2d51u)) << 10)
+         | (quant(a.z + 0.5, 10u, hash(h ^ 0xe6546b64u)) << 20);
+}
+vec3 unpack_a(uint b) {
+    return vec3(float(b & 1023u), float((b >> 10) & 1023u), float((b >> 20) & 1023u)) / 1023.0 - vec3(0.0, 0.0, 0.5);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.n_slots) return;
+    Particle p = particles[i];
+    uint low = p.kind & 255u;
+    if (p.kind == KIND_DEAD || low == 0u) return;
+    uint row = low - 1u;
+    vec2 lk = look_of(row, p.s);
+    if (max(lk.x, lk.y) <= 0.0) return;
+    uvec4 st = plook[i];
+    bool fresh = st.x != p.id;
+    uint h = hash(p.id * 0x9e3779b1u ^ hash(P.frame * 0x85ebca6bu + 0x165667b1u));
+    // Specks it brings in: as many as its share of the liquid's drawn specks per cell.
+    if (fresh && lk.y > 0.0 && L.dust_cap > 0u) {
+        Optics o = optics[row];
+        // (A concentrate's specks are its own: its diluent has none of them.)
+        int src = o.fx2.z > 0.0 ? int(row) : o.idx.x;
+        float e = lk.y * P.inv_ppc;
+        int n = int(floor(e + rnd(hash(h ^ 0x2545f491u))));
+        for (int k = 0; k < min(n, 8); k++) {
+            uint hk = hash(h + uint(k) * 0x9e3779b9u);
+            int slot = pool_take(1u, L.dust_base, L.dust_cap, L.dust_base + L.dust_cap);
+            if (slot < 0) break;
+            Optics ds = optics[max(src, 0)];
+            float u1 = rnd(hash(hk ^ 0x2c1b3c6du)), u2 = rnd(hash(hk ^ 0x297a2d39u));
+            float z = u1, a = 6.2831853 * u2, rr = sqrt(max(1.0 - z * z, 0.0));
+            vec3 nrm = vec3(rr * cos(a), rr * sin(a), z);
+            Diffuse d;
+            d.pos = p.pos + (vec2(rnd(hash(hk ^ 0x51ed270bu)), rnd(hash(hk ^ 0x7feb352du))) - 0.5) * 0.9;
+            d.vel = p.vel;
+            d.life = uintBitsToFloat(pack_n(nrm, hk));
+            d.r = ds.dust2.x / P.misc.z;
+            d.info = BUBBLE | DUST | (uint(max(src, 0) + 1) << 8) | (hash(hk ^ 0x68e31da4u) & 0xffff8000u);
+            d.z = rnd(hash(hk ^ 0xb5297a4du));
+            dpart[slot] = d;
+        }
+    }
+    if (lk.x <= 0.0) {
+        if (fresh) plook[i] = uvec4(p.id, 0u, pack_a(vec3(1.0 / 3.0, 1.0 / 3.0, 0.0), h), 0u);
+        return;
+    }
+    vec3 A;   // A_xx, A_yy, A_xy
+    if (fresh) {
+        A = vec3(1.0 / 3.0, 1.0 / 3.0, 0.0);
+    } else {
+        A = unpack_a(st.z);
+        float dt = L.dt;
+        if (dt > 0.0) {
+            Optics o = optics[row];
+            float Bc = o.opt2.z;
+            // The velocity gradient: L_ij = du_i / dx_j (APIC: du/dx, du/dy, dv/dx, dv/dy).
+            float w = 0.5 * (p.c.z - p.c.y);             // rotation rate (anticlockwise), 1 / s
+            // (Only the shear part of the in-plane strain: the divergence of a particle's
+            // gradient is numerical, splashes squeeze and stretch it, and it would turn
+            // the platelets to face the viewer.)
+            float dv = 0.5 * (p.c.x + p.c.w);
+            float exx = p.c.x - dv, eyy = p.c.w - dv, exy = 0.5 * (p.c.y + p.c.z);
+            float rate = abs(w) + abs(exx) + abs(eyy) + abs(exy);
+            int sub = clamp(int(ceil(rate * dt / 0.15)), 1, 8);
+            float h1 = dt / float(sub);
+            float ezz = 0.0;
+            for (int k = 0; k < sub; k++) {
+                float a = A.x, b = A.y, c = A.z, z = 1.0 - a - b;
+                float AE = exx * a + eyy * b + 2.0 * exy * c + ezz * z;
+                vec3 rot = vec3(-2.0 * w * c, 2.0 * w * c, w * (a - b));
+                vec3 str = vec3(2.0 * (exx * a + exy * c), 2.0 * (exy * c + eyy * b), c * (exx + eyy) + exy * (a + b)) - 2.0 * AE * A;
+                A += h1 * (rot + Bc * str);
+            }
+            // Rotational diffusion (at the liquid's reference viscosity).
+            float Dr = o.opt2.y;
+            A = mix(A, vec3(1.0 / 3.0, 1.0 / 3.0, 0.0), 1.0 - exp(-6.0 * Dr * dt));
+            A.xy = clamp(A.xy, 0.0, 1.0);
+            A.z = clamp(A.z, -0.5, 0.5);
+        }
+    }
+    plook[i] = uvec4(p.id, 0u, pack_a(A, h), 0u);
+    // Listed for the look splat (look.vert: three vertices each).
+    uint k = atomicAdd(lctl[0], 3u) / 3u;
+    if (k < L.cap) lctl[8u + k] = i;
+}

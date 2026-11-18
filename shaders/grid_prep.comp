@@ -68,10 +68,11 @@ void main() {
     for (int q = 0; q < nmix; q++) mixb[i * nmix + q] = -1.0;
     bool settle = has_cap(CAP_SETTLE);
     if (settle) for (int q = 0; q < P.n_fam; q++) famocc[i * P.n_fam + q] = 0.0;
+    if (cw <= 0 && has_cap(CAP_REACT)) rmask[i] = 0u;
     if (cw > 0) {
         // The first row's weight is what the explicit channels leave of the cell weight. If
         // the tank has a primary family (P.primary: the first concentrate of the first row,
-        // syrup in water), the two share that remainder and are one liquid here, at the
+        // honey in water), the two share that remainder and are one liquid here, at the
         // concentration of the pair: the diluent takes part in the exchange directly.
         int others = 0;
         for (int j = 0; j < P.n_present; j++) {
@@ -105,6 +106,15 @@ void main() {
                 float em = mats[r].th2.y;
                 emis += sh[j] * (ia.y >= 0 ? mix(mats[ia.y].th2.y, em, sc[j]) : em);
             }
+        }
+        // Which materials the cell holds, for the reactions (particles.comp).
+        if (has_cap(CAP_REACT)) {
+            uint mask = 0u;
+            for (int j = 0; j < P.n_present; j++) {
+                ivec4 ia = mats[present_row(j)].ia;
+                if (sh[j] * (ia.y >= 0 ? sc[j] : 1.0) > REACT_MIN) mask |= 1u << uint(j);
+            }
+            rmask[i] = mask;
         }
         // The temperature of each phase group present, from its own particles: liquids of
         // different groups meet at a sharp interface and keep their own temperatures (they
@@ -149,7 +159,7 @@ void main() {
                     frozen += share * fs;
                 }
             }
-            if ((mats[r].ib.y != 0 || mats[r].temp.w > 0.0) && share > nn.x) nn = vec4(share, float(r), s, 0.0);
+            if ((mats[r].ib.y != 0 || mats[r].temp.w > 0.0 || mats[r].gr.x > 0.0) && share > nn.x) nn = vec4(share, float(r), s, 0.0);
             if (r == int(ROW_STEAM)) fv = share;
             else if (share > top_share) {
                 top_share = share;

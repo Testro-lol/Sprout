@@ -6,7 +6,7 @@
 // with D = (grad u + grad u^T) / 2 the strain rate. That is the full stress tensor
 // div(mu (grad u + grad u^T)), not the Laplacian mu lap(u): it conserves angular momentum
 // (a rigid rotation is not damped), gives traction-free free surfaces and is consistent
-// across jumps in viscosity, such as between water and syrup.
+// across jumps in viscosity, such as between water and honey.
 //
 // Discretisation: D_xx, D_yy at cell centres (weight 2 dt mu), D_xy at cell corners (weight
 // 4 dt mu V, V the liquid share of the four cells around). Samples touching air are dropped

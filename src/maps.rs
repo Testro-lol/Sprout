@@ -109,7 +109,7 @@ impl MapBuilder {
 pub const MAPS: &[MapDef] = &[
     MapDef {
         name: "Playground",
-        blurb: "A pool, a few obstacles, and oil and syrup about to fall in.",
+        blurb: "A pool, a few obstacles, and oil and honey about to fall in.",
         width_m: 0.0,
         build: |m| {
             m.fill(0.0, 0.0, 160.0, 22.0, Material::Water);
@@ -117,7 +117,7 @@ pub const MAPS: &[MapDef] = &[
             m.circle(102.0, 40.0, 8.0);
             m.rect(126.0, 30.0, 150.0, 33.0);
             m.fill(18.0, 64.0, 44.0, 84.0, Material::Oil);
-            m.fill(92.0, 56.0, 112.0, 82.0, Material::Syrup);
+            m.fill(92.0, 56.0, 112.0, 82.0, Material::Honey);
         },
     },
     MapDef {
@@ -132,22 +132,22 @@ pub const MAPS: &[MapDef] = &[
     },
     MapDef {
         name: "Upside Down",
-        blurb: "Syrup over water over oil: the layers overturn into their stable order.",
+        blurb: "Honey over water over oil: the layers overturn into their stable order.",
         width_m: 0.0,
         build: |m| {
             m.fill(0.0, 0.0, 160.0, 20.0, Material::Oil);
             m.fill(0.0, 20.0, 160.0, 40.0, Material::Water);
-            m.fill(0.0, 40.0, 160.0, 58.0, Material::Syrup);
+            m.fill(0.0, 40.0, 160.0, 58.0, Material::Honey);
         },
     },
     MapDef {
         name: "Three Columns",
-        blurb: "Oil, water and syrup side by side: syrup slides under, oil rides over.",
+        blurb: "Oil, water and honey side by side: honey slides under, oil rides over.",
         width_m: 0.0,
         build: |m| {
             m.fill(0.0, 0.0, 53.0, 58.0, Material::Oil);
             m.fill(53.0, 0.0, 107.0, 58.0, Material::Water);
-            m.fill(107.0, 0.0, 160.0, 58.0, Material::Syrup);
+            m.fill(107.0, 0.0, 160.0, 58.0, Material::Honey);
         },
     },
     MapDef {
@@ -162,7 +162,7 @@ pub const MAPS: &[MapDef] = &[
             m.circle(133.0, 15.0, 4.0);
             m.circle(147.0, 7.0, 4.0);
             m.fill(2.0, 73.0, 36.0, 88.0, Material::Water);
-            m.fill(128.0, 54.0, 158.0, 76.0, Material::Syrup);
+            m.fill(128.0, 54.0, 158.0, 76.0, Material::Honey);
             m.fill(2.0, 33.0, 26.0, 46.0, Material::Oil);
         },
     },
@@ -175,7 +175,7 @@ pub const MAPS: &[MapDef] = &[
 
     MapDef {
         name: "Terrace Falls",
-        blurb: "A hillside of spill pools: blue waterfalls race the slow syrup tributary.",
+        blurb: "A hillside of spill pools: blue waterfalls race the slow honey tributary.",
         width_m: 0.0,
         build: |m| {
             // Stepped bedrock leaves a broad plunge pool on the right.
@@ -189,7 +189,7 @@ pub const MAPS: &[MapDef] = &[
             m.fill(77.0, 24.0, 98.0, 36.0, Material::Oil);
             m.plank(158.0, 65.0, 124.0, 53.0, 2.5);
             m.plank(116.0, 40.0, 143.0, 32.0, 2.5);
-            m.fill(134.0, 67.0, 157.0, 85.0, Material::Syrup);
+            m.fill(134.0, 67.0, 157.0, 85.0, Material::Honey);
             m.circle(110.0, 12.0, 5.0);
             m.circle(136.0, 8.0, 4.0);
             m.wedge(148.0, 0.0, 160.0, 17.0, true);
@@ -215,7 +215,7 @@ pub const MAPS: &[MapDef] = &[
                 m.circle(x, 9.0, 2.0);
             }
             m.fill(7.0, 76.0, 52.0, 87.0, Material::Water);
-            m.fill(58.0, 73.0, 102.0, 87.0, Material::Syrup);
+            m.fill(58.0, 73.0, 102.0, 87.0, Material::Honey);
             m.fill(108.0, 76.0, 153.0, 87.0, Material::Oil);
             m.fill(2.0, 2.0, 158.0, 6.0, Material::Water);
         },
@@ -232,7 +232,7 @@ pub const MAPS: &[MapDef] = &[
             m.rect(84.5, 39.0, 87.5, 45.0);
             m.fill(6.0, 74.0, 154.0, 80.0, Material::Water);
             m.fill(6.0, 80.0, 154.0, 87.0, Material::Oil);
-            m.fill(37.0, 62.0, 123.0, 74.0, Material::Syrup);
+            m.fill(37.0, 62.0, 123.0, 74.0, Material::Honey);
             m.wedge(57.0, 23.0, 80.0, 33.0, true);
             m.wedge(80.0, 23.0, 103.0, 33.0, false);
             m.circle(45.0, 17.0, 4.0);
@@ -260,7 +260,7 @@ pub const MAPS: &[MapDef] = &[
             }
             m.wedge(0.0, 0.0, 15.0, 18.0, false);
             m.wedge(145.0, 0.0, 160.0, 18.0, true);
-            m.fill(3.0, 2.0, 75.0, 9.0, Material::Syrup);
+            m.fill(3.0, 2.0, 75.0, 9.0, Material::Honey);
             m.fill(85.0, 2.0, 157.0, 9.0, Material::Water);
         },
     },
@@ -280,8 +280,8 @@ pub const MAPS: &[MapDef] = &[
             m.plank(85.0, 39.0, 106.0, 30.0, 2.5);
             m.plank(25.0, 25.0, 46.0, 19.0, 2.5);
             m.plank(135.0, 25.0, 114.0, 19.0, 2.5);
-            m.fill(15.0, 54.0, 34.0, 67.0, Material::Syrup);
-            m.fill(126.0, 54.0, 145.0, 67.0, Material::Syrup);
+            m.fill(15.0, 54.0, 34.0, 67.0, Material::Honey);
+            m.fill(126.0, 54.0, 145.0, 67.0, Material::Honey);
             m.plank(80.0, 20.0, 63.0, 4.0, 3.0);
             m.plank(80.0, 20.0, 97.0, 4.0, 3.0);
             for x in [16.0, 39.0, 121.0, 144.0] {
@@ -292,7 +292,7 @@ pub const MAPS: &[MapDef] = &[
     },
     MapDef {
         name: "Sunken Ruins",
-        blurb: "A breaking wave threads ruined towers while oil and syrup spill from the rooftops.",
+        blurb: "A breaking wave threads ruined towers while oil and honey spill from the rooftops.",
         width_m: 0.0,
         build: |m| {
             m.fill(2.0, 2.0, 30.0, 85.0, Material::Water);
@@ -304,7 +304,7 @@ pub const MAPS: &[MapDef] = &[
             }
             m.plank(37.0, 66.0, 66.0, 58.0, 2.5);
             m.fill(40.0, 69.0, 63.0, 85.0, Material::Oil);
-            m.fill(86.0, 51.0, 103.0, 76.0, Material::Syrup);
+            m.fill(86.0, 51.0, 103.0, 76.0, Material::Honey);
             m.plank(114.0, 61.0, 145.0, 52.0, 2.5);
             m.fill(122.0, 65.0, 145.0, 82.0, Material::Oil);
             m.circle(36.0, 8.0, 3.0);
@@ -332,11 +332,11 @@ pub const MAPS: &[MapDef] = &[
             m.fill(74.0, 4.0, 78.0, 8.0, Material::Oil);
             m.fill(100.0, 12.0, 102.0, 14.0, Material::Oil);
             m.fill(118.0, 18.0, 119.6, 19.6, Material::Oil);
-            // Oil and syrup falling in from above.
+            // Oil and honey falling in from above.
             m.fill(24.0, 60.0, 27.5, 63.5, Material::Oil);
             m.fill(62.0, 66.0, 66.0, 70.0, Material::Oil);
             m.fill(92.0, 58.0, 94.5, 60.5, Material::Oil);
-            m.fill(132.0, 62.0, 136.0, 66.0, Material::Syrup);
+            m.fill(132.0, 62.0, 136.0, 66.0, Material::Honey);
             // A shelf with two water drops and an oil drop resting on it.
             m.rect(104.0, 48.0, 156.0, 50.0);
             m.fill(110.0, 50.0, 114.0, 53.0, Material::Water);
@@ -386,11 +386,11 @@ pub const MAPS: &[MapDef] = &[
     },
     MapDef {
         name: "Mud Flats",
-        blurb: "Mud slumps and settles out, a pile of sludge holds its shape, oobleck takes a falling ball of mercury.",
+        blurb: "Mud slumps and settles out, a pile of clay holds its shape, oobleck takes a falling ball of mercury.",
         width_m: 0.0,
         build: |m| {
             m.fill(4.0, 0.0, 40.0, 30.0, Material::Mud);
-            m.fill(58.0, 0.0, 78.0, 28.0, Material::Sludge);
+            m.fill(58.0, 0.0, 78.0, 28.0, Material::Clay);
             m.fill(100.0, 0.0, 156.0, 16.0, Material::Oobleck);
             m.fill(124.0, 60.0, 130.0, 66.0, Material::Mercury);
             m.fill(40.0, 0.0, 56.0, 6.0, Material::Water);
@@ -557,7 +557,7 @@ mod tests {
     fn fills_are_rest_density_and_stay_inside_the_walls() {
         let scene = Scene::new([64, 64]);
         let mut out = Vec::new();
-        fill_rect(&scene, [0.0, 0.0, 64.0, 23.0], Material::Syrup, &mut out);
+        fill_rect(&scene, [0.0, 0.0, 64.0, 23.0], Material::Honey, &mut out);
         // The frame takes WALL cells off each side and the bottom.
         assert_eq!(out.len(), (58 * 20 * PPC) as usize);
         assert!(out.iter().all(|p| p.s == crate::sim::SPAWN_S && p.pos[0] > WALL && p.pos[0] < 64.0 - WALL && p.pos[1] > WALL));

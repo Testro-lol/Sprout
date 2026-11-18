@@ -22,7 +22,7 @@ struct Particle {
 
 // The simulation's material table (common.glsl: Mat): the phase group of each material.
 struct Mat {
-    ivec4 ia; ivec4 ib; vec4 a; vec4 b; vec4 rheo; vec4 temp; vec4 th; vec4 th2; vec4 el; vec4 misc;
+    ivec4 ia; ivec4 ib; vec4 a; vec4 b; vec4 rheo; vec4 temp; vec4 th; vec4 th2; vec4 el; vec4 misc; ivec4 ic; vec4 rx; vec4 gr;
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer ParticleBuf { Particle particles[]; };
@@ -51,7 +51,7 @@ layout(location = 2) flat out vec4 v_conc;
 layout(location = 3) flat out vec3 v_share;
 // common.glsl: ROW_STEAM. Steam still in the liquid has no look of its own (cell_optics.comp
 // leaves it out): it lays down nothing here.
-const uint ROW_STEAM = 19u;
+const uint ROW_STEAM = 57u;
 
 // The triangle circumscribed about the unit disc.
 const vec2 CORNER[3] = vec2[3](vec2(0.0, 2.0), vec2(-1.7320508, -1.0), vec2(1.7320508, -1.0));
@@ -61,7 +61,7 @@ const float STREAK_MAX = 1.5;
 void main() {
     Particle p = particles[gl_VertexIndex / 3];
     // Dead slots and puffs of escaped steam (low byte 0: steam.vert draws them). Steam still
-    // in the liquid (row 19, material.rs: Steam) is part of the body here, in its group
+    // in the liquid (row 57, material.rs: Steam) is part of the body here, in its group
     // (aqueous): the liquid stays whole around a bubble, and the vapour field (steam.vert,
     // composite.frag) draws the bubble inside it. (Drawn as the holes they leave, a boiling
     // pool showed the dark back wall between its bubbles.)

@@ -36,6 +36,11 @@ impl Spout {
         Spout::new(jet_direction(degrees), JET_SPEED, rate, radius)
     }
 
+    /// A faucet: the pour's stream (the flow sets its speed), aimed like a jet.
+    pub fn faucet(degrees: f32, rate: f32, radius: f32) -> Spout {
+        Spout { direction: jet_direction(degrees), ..Spout::pour(rate, radius) }
+    }
+
     fn new(direction: [f32; 2], speed: f32, rate: f32, radius: f32) -> Spout {
         Spout { direction, speed, width: (rate / (PPC * speed)).min(2.0 * radius) }
     }
@@ -115,6 +120,13 @@ pub const SPRAY_SHARE: f32 = 0.15;
 /// Spacing of spray droplets, cells: sparse from birth, rather than a dense fill whose
 /// opposing velocities cancel in the particle-to-grid transfer.
 pub const SPRAY_SPACING: f32 = 1.5;
+
+/// Speed raindrops fall at when they leave the cloud, cells/s.
+pub const RAIN_SPEED: f32 = 200.0;
+/// Rain emits this share of the pour rate.
+pub const RAIN_SHARE: f32 = 0.3;
+/// Half-width of the rain cloud, in brush radii.
+pub const RAIN_SPAN: f32 = 3.0;
 
 /// Lattice points (spaced `spacing` apart, aligned to the grid) inside a swept disk (a
 /// capsule) from `from` to `to`. The same points come out however the stroke is cut into

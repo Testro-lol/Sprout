@@ -3,7 +3,7 @@
 #include "common.glsl"
 
 // Settling of suspensions (README, "Suspensions"): the grains of a concentrate (mud,
-// sludge, oobleck) fall through its diluent at the terminal velocity of a grain of
+// clay, oobleck) fall through its diluent at the terminal velocity of a grain of
 // diameter `grain` (the drag law the oil droplets use, particles.comp), as a flux of
 // concentration between vertically adjacent cells of the family:
 //     F = v_t s_above (1 - s_below) min(occupancy above, occupancy below)

@@ -146,6 +146,8 @@ pub fn shot(gpu: Arc<Gpu>, o: ShotOptions, apply: &dyn Fn(&mut crate::sim::SimPa
         }
         let path = if o.times.len() == 1 { o.out.clone() } else { o.out.replace(".png", &format!("_{k}.png")) };
         if o.with_ui {
+            // As the app frames it: the tank above the dock.
+            let view = View::fit_above(world.sim.grid, off.size, ui::DOCK_INSET);
             ui_frame(&gpu, &mut off, &mut world, view, Path::new(&path));
         } else {
             off.save_png(&world.sim, view, Path::new(&path));
@@ -186,14 +188,42 @@ fn ui_frame(gpu: &Arc<Gpu>, off: &mut Offscreen, world: &mut World, view: View, 
         state.editor.duplicate(world, Material::Chocolate.index());
         state.editor.draft.viscosity *= 3.0;
     }
-    for frame in 0..30 {
-        let input = egui::RawInput { time: Some(frame as f64 / 30.0), ..input.clone() };
+    // `SPROUT_UI_TOOL=name`: that tool selected; `SPROUT_UI_PAGE=world|display|solver|keys|
+    // maps|stats`: that window open; `SPROUT_UI_HOVER=x,y`: the pointer there (points).
+    if let Ok(name) = std::env::var("SPROUT_UI_TOOL")
+        && let Some(tool) = ui::Tool::all().find(|t| t.name().eq_ignore_ascii_case(&name))
+    {
+        state.select(tool);
+    }
+    match std::env::var("SPROUT_UI_PAGE").as_deref() {
+        Ok("world") => state.page = Some(ui::Page::World),
+        Ok("display") => state.page = Some(ui::Page::Display),
+        Ok("solver") => state.page = Some(ui::Page::Solver),
+        Ok("keys") => state.page = Some(ui::Page::Keys),
+        Ok("maps") => state.maps_open = true,
+        Ok("stats") => state.stats_open = true,
+        _ => {}
+    }
+    let hover: Option<egui::Pos2> = std::env::var("SPROUT_UI_HOVER").ok().and_then(|v| {
+        let (x, y) = v.split_once(',')?;
+        Some(egui::pos2(x.parse().ok()?, y.parse().ok()?))
+    });
+    for _ in 0..30 {
+        state.frame_times.push(1.0 / 144.0);
+    }
+    let ghost = ui::placement(&state, None, cursor, 1.0, false).map(|p| (p, false));
+    for frame in 0..60 {
+        let mut input = egui::RawInput { time: Some(1.0 + frame as f64 / 60.0), ..input.clone() };
+        if let Some(pos) = hover {
+            input.events.push(egui::Event::PointerMoved(pos));
+        }
         let out = ctx.run(input, |ctx| {
             ui::build(ctx, &mut state, world, &mut swatches);
-            if frame == 0 {
+            if frame == 0 && hover.is_none() && std::env::var_os("SPROUT_UI_TOOL").is_none() {
                 overlay.toast_map(ctx, world.map);
             }
-            overlay.draw(ctx, &state, view, size, Some(cursor), false, false, None, world.currents(), world.sim.magnets());
+            let canvas = ui::Canvas { view, size, cursor: Some(cursor), pressed: false, grabbing: false, ghost, target: None, world };
+            overlay.draw(ctx, &state, &canvas);
         });
         deltas.push(out.textures_delta);
         shapes = out.shapes;
@@ -597,6 +627,9 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
     let save = |world: &World, name: &str, view: View| {
         off.borrow_mut().save_png(&world.sim, view, &Path::new(dir).join(format!("{name}.png")));
         println!("{name:<22} t = {:5.2} s   ({:.1} s wall)", world.sim.sim_time(), start.elapsed().as_secs_f32());
+        if std::env::var_os("SPROUT_DEBUG_LOOK").is_some() {
+            println!("    look/flakes/diffuse draw commands {:?}, slots {}", world.sim.debug_look_counts(), world.sim.slots());
+        }
     };
     let map = |name: &str, grid: [u32; 2], t: f64| {
         let index = crate::maps::MAPS.iter().position(|m| m.name == name).expect("built-in map");
@@ -646,11 +679,11 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         save(&w, "water_dam", fit);
         save(&w, "water_dam_zoom", zoom([300.0, 60.0], 3.0));
     }
-    if wants("syrup") {
-        let mut w = pool(&[([150.0, 0.0, 250.0, 150.0], Material::Syrup)], &[crate::scene::Shape::Circle { c: [330.0, 30.0], r: 22.0 }]);
+    if wants("honey") {
+        let mut w = pool(&[([150.0, 0.0, 250.0, 150.0], Material::Honey)], &[crate::scene::Shape::Circle { c: [330.0, 30.0], r: 22.0 }]);
         w.sim.advance_blocking(2.5, ToolState::default());
-        save(&w, "syrup_slump", fit);
-        save(&w, "syrup_slump_zoom", zoom([300.0, 45.0], 3.0));
+        save(&w, "honey_slump", fit);
+        save(&w, "honey_slump_zoom", zoom([300.0, 45.0], 3.0));
     }
     if wants("oil") {
         let mut w = pool(&[([150.0, 0.0, 250.0, 150.0], Material::Oil)], &[crate::scene::Shape::Circle { c: [330.0, 30.0], r: 22.0 }]);
@@ -663,7 +696,7 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         let w = map("Playground", G, 1.3);
         save(&w, "playground_impact", fit);
         save(&w, "playground_impact_zoom", zoom([130.0, 45.0], 3.0));
-        save(&w, "playground_syrup_zoom", zoom([330.0, 60.0], 3.0));
+        save(&w, "playground_honey_zoom", zoom([330.0, 60.0], 3.0));
     }
     if wants("overturn") {
         let mut w = map("Upside Down", G, 5.0);
@@ -679,9 +712,9 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
     }
     if wants("mix") {
         let mut w = pool(&[([0.0, 0.0, 512.0, 110.0], Material::Water)], &[]);
-        hold(&mut w, Source::Pour, Material::Syrup, [256.0, 200.0], 9.0, 12000.0, 2.0);
-        save(&w, "mix_syrup_pour", fit);
-        save(&w, "mix_syrup_pour_zoom", zoom([256.0, 75.0], 3.0));
+        hold(&mut w, Source::Pour, Material::Honey, [256.0, 200.0], 9.0, 12000.0, 2.0);
+        save(&w, "mix_honey_pour", fit);
+        save(&w, "mix_honey_pour_zoom", zoom([256.0, 75.0], 3.0));
     }
     // Blood stirred into water: a dispersing, half-mixed plume (per-cell concentration).
     if wants("mix") {
@@ -695,7 +728,7 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
     // Blood poured onto honey over water (two liquids of one phase group that a concentration
     // alone does not tell apart), and ferrofluid stirred into oil.
     if wants("mix") {
-        let mut w = pool(&[([0.0, 0.0, 512.0, 50.0], Material::Water), ([0.0, 50.0, 512.0, 100.0], Material::Syrup)], &[]);
+        let mut w = pool(&[([0.0, 0.0, 512.0, 50.0], Material::Water), ([0.0, 50.0, 512.0, 100.0], Material::Honey)], &[]);
         hold(&mut w, Source::Pour, Material::Blood, [256.0, 200.0], 9.0, 12000.0, 1.5);
         wait(&mut w, 2.0);
         save(&w, "mix_blood_honey", zoom([256.0, 70.0], 3.0));
@@ -707,8 +740,8 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         wait(&mut w, 1.5);
         save(&w, "mix_ferro_oil", zoom([256.0, 50.0], 3.0));
     }
-    // Ferrofluid poured into the Playground's pool after the syrup has fallen in (the user's
-    // screenshot of 2026-11-16: dark outlines round the ferrofluid in the syrup and water).
+    // Ferrofluid poured into the Playground's pool after the honey has fallen in (the user's
+    // screenshot of 2026-11-16: dark outlines round the ferrofluid in the honey and water).
     if wants("ferro_pool") {
         let mut w = map("Playground", G, 4.0);
         hold(&mut w, Source::Pour, Material::Ferrofluid, [300.0, 150.0], 9.0, 8000.0, 3.0);
@@ -800,7 +833,7 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         save(&w, "fx_blood_stains_zoom8", zoom([325.0, 40.0], 8.0));
         // Honey over a ball, close.
         let mut w = pool(&[], &[crate::scene::Shape::Circle { c: [256.0, 80.0], r: 30.0 }]);
-        hold(&mut w, Source::Pour, Material::Syrup, [250.0, 200.0], 7.0, 8000.0, 2.5);
+        hold(&mut w, Source::Pour, Material::Honey, [250.0, 200.0], 7.0, 8000.0, 2.5);
         save(&w, "fx_honey", zoom([256.0, 100.0], 4.0));
         save(&w, "fx_honey_zoom8", zoom([240.0, 112.0], 8.0));
         // A thin layer of oil on water.
@@ -954,7 +987,7 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         save(&w, "jet_impact_zoom", zoom([200.0, 60.0], 2.5));
     }
     if wants("current") {
-        let mut w = pool(&[([0.0, 0.0, 512.0, 80.0], Material::Water), ([0.0, 80.0, 512.0, 105.0], Material::Oil), ([0.0, 0.0, 512.0, WALL + 18.0], Material::Syrup)], &[]);
+        let mut w = pool(&[([0.0, 0.0, 512.0, 80.0], Material::Water), ([0.0, 80.0, 512.0, 105.0], Material::Oil), ([0.0, 0.0, 512.0, WALL + 18.0], Material::Honey)], &[]);
         w.add_current(Current::new([256.0, 55.0], 16.0, 90.0, 1.0));
         w.sim.advance_blocking(3.0, ToolState::default());
         save(&w, "current_in_pool", fit);
@@ -962,9 +995,9 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
     }
     if wants("pour") {
         let mut w = pool(&[], &[crate::scene::Shape::Circle { c: [256.0, 80.0], r: 30.0 }]);
-        hold(&mut w, Source::Pour, Material::Syrup, [250.0, 200.0], 7.0, 8000.0, 2.5);
-        save(&w, "pour_syrup_on_ball", fit);
-        save(&w, "pour_syrup_on_ball_zoom", zoom([256.0, 90.0], 3.0));
+        hold(&mut w, Source::Pour, Material::Honey, [250.0, 200.0], 7.0, 8000.0, 2.5);
+        save(&w, "pour_honey_on_ball", fit);
+        save(&w, "pour_honey_on_ball_zoom", zoom([256.0, 90.0], 3.0));
         let mut w = pool(&[], &[crate::scene::Shape::Circle { c: [256.0, 80.0], r: 30.0 }]);
         hold(&mut w, Source::Pour, Material::Water, [250.0, 200.0], 7.0, 8000.0, 1.2);
         save(&w, "pour_water_on_ball", fit);
@@ -990,7 +1023,7 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         // Each liquid poured over a ball and left to run off: what it leaves behind.
         let ball = |x: f32| crate::scene::Shape::Circle { c: [x, 90.0], r: 24.0 };
         let mut w = pool(&[], &[ball(110.0), ball(256.0), ball(402.0)]);
-        hold(&mut w, Source::Pour, Material::Syrup, [398.0, 190.0], 6.0, 6000.0, 1.0);
+        hold(&mut w, Source::Pour, Material::Honey, [398.0, 190.0], 6.0, 6000.0, 1.0);
         hold(&mut w, Source::Pour, Material::Oil, [252.0, 190.0], 6.0, 6000.0, 1.0);
         hold(&mut w, Source::Pour, Material::Water, [106.0, 190.0], 6.0, 6000.0, 1.0);
         wait(&mut w, 0.25);
@@ -1069,6 +1102,210 @@ pub fn gallery(gpu: Arc<Gpu>, dir: &str, only: Option<&str>, apply: &dyn Fn(&mut
         hold(&mut w, Source::Pour, Material::Slime, [256.0, 120.0], 3.0, 3000.0, 2.0);
         wait(&mut w, 0.5);
         save(&w, "slime_pour", zoom([256.0, 70.0], 2.2));
+    }
+    // The look carried by the particles and the bubbles and foam (README, "Look", "Carried by
+    // the particles", "Bubbles and foam"): stirred, then left, and side by side in the light.
+    if wants("look") {
+        use crate::scene::Shape;
+        let wall = |x: f32| Shape::Box { c: [x, 50.0], half: [4.0, 48.0], angle: 0.0 };
+        let cup = [wall(176.0), wall(336.0)];
+        let stir = |w: &mut World, at: [f32; 2], seconds: f32| {
+            let tool = ToolState::whirl(at, 24.0, false);
+            for _ in 0..(seconds * 60.0).round() as usize {
+                w.sim.advance_blocking(1.0 / 60.0, tool);
+                off.borrow_mut().track(&w.sim);
+            }
+        };
+        for (m, name) in [(Material::Soap, "look_pearl"), (Material::Snowy, "look_snow"), (Material::Polish, "look_glitter"), (Material::Honey, "look_honey")] {
+            let mut w = pool(&[([180.0, WALL, 332.0, 72.0], m)], &cup);
+            wait(&mut w, 0.5);
+            save(&w, &format!("{name}_still"), zoom([256.0, 45.0], 3.0));
+            stir(&mut w, [256.0, 40.0], 2.0);
+            save(&w, &format!("{name}_stirred"), zoom([256.0, 45.0], 3.0));
+            wait(&mut w, 2.0);
+            save(&w, &format!("{name}_after"), zoom([256.0, 45.0], 3.0));
+        }
+        // Water poured into water: white water and bubbles; beer into a glass: a head.
+        let mut w = pool(&[([180.0, WALL, 332.0, 40.0], Material::Water)], &cup);
+        hold(&mut w, Source::Pour, Material::Water, [256.0, 140.0], 5.0, 6000.0, 1.5);
+        save(&w, "look_splash", zoom([256.0, 45.0], 3.0));
+        save(&w, "look_splash_zoom", zoom([256.0, 40.0], 8.0));
+        wait(&mut w, 1.5);
+        save(&w, "look_splash_after", zoom([256.0, 45.0], 3.0));
+        let mut w = pool(&[], &cup);
+        hold(&mut w, Source::Pour, Material::Beer, [256.0, 130.0], 5.0, 6000.0, 2.5);
+        wait(&mut w, 3.0);
+        save(&w, "look_beer", zoom([256.0, 45.0], 3.0));
+        save(&w, "look_beer_zoom", zoom([256.0, 60.0], 8.0));
+        // Light under the surface: milk, blood, honey, mud and water side by side.
+        let mut w = pool(&[
+            ([40.0, WALL, 120.0, 60.0], Material::Milk),
+            ([136.0, WALL, 216.0, 60.0], Material::Blood),
+            ([232.0, WALL, 312.0, 60.0], Material::Honey),
+            ([328.0, WALL, 408.0, 60.0], Material::Mud),
+            ([424.0, WALL, 504.0, 60.0], Material::Water),
+        ], &[wall(128.0), wall(224.0), wall(320.0), wall(416.0)]);
+        wait(&mut w, 1.0);
+        save(&w, "look_light", zoom([256.0, 40.0], 1.6));
+    }
+    // Debug: how soon after a reset and a pour the bubbles, foam and specks start
+    // (SPROUT_DEBUG_LOOK=1 prints the draw counts each frame).
+    if only == Some("delay") {
+        let mut w = map("Playground", G, 0.0);
+        for round in 0..2 {
+            for f in 0..90 {
+                let src = if f < 60 { Some(Source::Pour) } else { None };
+                if let Some(sr) = src {
+                    w.emit(sr, Material::Mud, [256.0, 200.0], 5.0, 4000.0, 1.0 / 60.0);
+                    w.sim.advance_blocking(1.0 / 60.0, sr.nozzle([256.0, 200.0], 5.0, 4000.0));
+                } else {
+                    w.sim.advance_blocking(1.0 / 60.0, ToolState::default());
+                }
+                off.borrow_mut().track(&w.sim);
+                if f % 5 == 0 {
+                    let c = w.sim.debug_look_counts();
+                    println!("round {round} frame {f:3} t {:.2}: look verts {} sprite verts {} handed bubbles {} specks {}", w.sim.sim_time(), c[0], c[12], c[8], c[9]);
+                }
+            }
+            w.end_stroke();
+            w.load_map(0);
+        }
+        return;
+    }
+    // Films, stains and drips (README, "Films, stains and drips"): liquids poured over a ledge
+    // run, drip off its edge and dry; sprayed at the wall they spatter; lava cooling.
+    if wants("films") {
+        use crate::scene::Shape;
+        // A funnel: two walls on a floor with a gap in the middle, so the liquid drains out
+        // and leaves its coat on the walls and the back wall as its level falls; a ledge
+        // across the gap's outflow catches the stream, which runs and drips off its edges.
+        let funnel = [
+            Shape::Box { c: [180.0, 130.0], half: [4.0, 60.0], angle: 0.0 },
+            Shape::Box { c: [332.0, 130.0], half: [4.0, 60.0], angle: 0.0 },
+            Shape::Box { c: [212.0, 72.0], half: [40.0, 3.0], angle: -0.25 },
+            Shape::Box { c: [300.0, 72.0], half: [40.0, 3.0], angle: 0.25 },
+            Shape::Box { c: [256.0, 30.0], half: [30.0, 3.0], angle: 0.0 },
+        ];
+        for (m, name) in [(Material::Blood, "film_blood"), (Material::Honey, "film_honey"), (Material::Mud, "film_mud"), (Material::Water, "film_water"), (Material::Oil, "film_oil"), (Material::Brine, "film_brine"), (Material::Milk, "film_milk"), (Material::Ink, "film_ink")] {
+            let mut w = pool(&[([186.0, 90.0, 326.0, 170.0], m)], &funnel);
+            wait(&mut w, 1.5);
+            save(&w, &format!("{name}_1"), zoom([256.0, 100.0], 2.2));
+            hold(&mut w, Source::Spray, m, [256.0, 175.0], 14.0, 3000.0, 1.0);
+            wait(&mut w, 5.0);
+            save(&w, &format!("{name}_2"), zoom([256.0, 100.0], 2.2));
+            save(&w, &format!("{name}_zoom"), zoom([300.0, 70.0], 7.0));
+            wait(&mut w, 25.0);
+            save(&w, &format!("{name}_3"), zoom([256.0, 100.0], 2.2));
+        }
+        // Lava poured out cools from white through yellow and orange to a dull red under its crust.
+        let mut w = pool(&[], &[]);
+        hold(&mut w, Source::Pour, Material::Lava, [256.0, 150.0], 8.0, 5000.0, 2.0);
+        for k in 0..3 {
+            wait(&mut w, 4.0);
+            save(&w, &format!("film_lava_{k}"), zoom([256.0, 30.0], 3.0));
+        }
+    }
+    // Particles in the liquid (README, "Particles in the liquid"): cloudiness by size, platelets
+    // in the flow, specks settling and stirred up, foam coloured by its liquid.
+    if wants("particles") {
+        use crate::scene::Shape;
+        let wall = |x: f32| Shape::Box { c: [x, 50.0], half: [4.0, 48.0], angle: 0.0 };
+        let cup = [wall(176.0), wall(336.0)];
+        let stir = |w: &mut World, at: [f32; 2], seconds: f32| {
+            let tool = ToolState::whirl(at, 24.0, false);
+            for _ in 0..(seconds * 60.0).round() as usize {
+                w.sim.advance_blocking(1.0 / 60.0, tool);
+                off.borrow_mut().track(&w.sim);
+            }
+        };
+        // Milk, blood, mud and ink each poured into water and stirred: dilute clouds.
+        for (m, name) in [(Material::Milk, "par_milk_in_water"), (Material::Blood, "par_blood_in_water"), (Material::Mud, "par_mud_in_water"), (Material::Ink, "par_ink_in_water")] {
+            let mut w = pool(&[([180.0, WALL, 332.0, 60.0], Material::Water)], &cup);
+            hold(&mut w, Source::Pour, m, [256.0, 110.0], 3.0, 3000.0, 0.6);
+            stir(&mut w, [256.0, 30.0], 1.5);
+            wait(&mut w, 1.0);
+            save(&w, name, zoom([256.0, 40.0], 3.0));
+            if m == Material::Mud {
+                wait(&mut w, 8.0);
+                save(&w, "par_mud_settled", zoom([256.0, 40.0], 3.0));
+            }
+        }
+        // Platelets, glitter, snow: stirred, then left.
+        for (m, name) in [(Material::Pearly, "par_pearly"), (Material::Glitter, "par_glitter"), (Material::Snowy, "par_snow"), (Material::Polish, "par_polish")] {
+            let mut w = pool(&[([180.0, WALL, 332.0, 72.0], m)], &cup);
+            wait(&mut w, 1.0);
+            save(&w, &format!("{name}_still"), zoom([256.0, 45.0], 3.0));
+            stir(&mut w, [256.0, 40.0], 2.0);
+            save(&w, &format!("{name}_stirred"), zoom([256.0, 45.0], 3.0));
+            save(&w, &format!("{name}_zoom"), zoom([256.0, 40.0], 8.0));
+            wait(&mut w, 6.0);
+            save(&w, &format!("{name}_after"), zoom([256.0, 45.0], 3.0));
+        }
+        // Foam of beer, blood, milk and soap: poured in, then aged.
+        for (m, name) in [(Material::Beer, "par_foam_beer"), (Material::Blood, "par_foam_blood"), (Material::Milk, "par_foam_milk"), (Material::Soap, "par_foam_soap")] {
+            let mut w = pool(&[([180.0, WALL, 332.0, 30.0], m)], &cup);
+            hold(&mut w, Source::Pour, m, [256.0, 130.0], 5.0, 6000.0, 2.0);
+            wait(&mut w, 0.5);
+            save(&w, name, zoom([256.0, 50.0], 4.0));
+            save(&w, &format!("{name}_zoom"), zoom([256.0, 45.0], 10.0));
+            wait(&mut w, 6.0);
+            save(&w, &format!("{name}_aged"), zoom([256.0, 45.0], 10.0));
+        }
+    }
+    // The properties of 2026-11-16 (README, "New properties"), each in a scene that shows it.
+    if wants("new") {
+        use crate::scene::Shape;
+        let wall = |x: f32| Shape::Box { c: [x, 50.0], half: [4.0, 48.0], angle: 0.0 };
+        let cup = [wall(196.0), wall(316.0)];
+        let ball = [Shape::Circle { c: [256.0, 60.0], r: 26.0 }];
+        // Beer poured into a cup: streams of bubbles, and a head that stays.
+        let mut w = pool(&[], &cup);
+        hold(&mut w, Source::Pour, Material::Beer, [256.0, 130.0], 5.0, 6000.0, 2.5);
+        wait(&mut w, 4.0);
+        save(&w, "new_beer", zoom([256.0, 50.0], 4.0));
+        save(&w, "new_beer_zoom8", zoom([256.0, 28.0], 8.0));
+        // Liquid soap poured into water: pearl, and lather where it splashes.
+        let mut w = pool(&[([200.0, WALL, 312.0, 30.0], Material::Water)], &cup);
+        hold(&mut w, Source::Pour, Material::Soap, [256.0, 130.0], 4.0, 4000.0, 2.0);
+        wait(&mut w, 1.5);
+        save(&w, "new_soap", zoom([256.0, 50.0], 4.0));
+        // Glitter polish, the snow globe and the rheoscopic liquid over a ball.
+        for (m, name) in [(Material::Polish, "new_glitter"), (Material::Snowy, "new_snow"), (Material::Pearly, "new_pearl")] {
+            let mut w = pool(&[], &ball);
+            hold(&mut w, Source::Pour, m, [250.0, 170.0], 6.0, 6000.0, 2.5);
+            save(&w, name, zoom([256.0, 60.0], 3.5));
+        }
+        // Glow-stick fluid poured into water.
+        let mut w = pool(&[([0.0, 0.0, 512.0, 50.0], Material::Water)], &[]);
+        hold(&mut w, Source::Pour, Material::GlowFluid, [256.0, 150.0], 5.0, 5000.0, 1.5);
+        wait(&mut w, 1.0);
+        save(&w, "new_glow", zoom([256.0, 50.0], 2.5));
+        // Lye poured into battery acid: salt water, and heat.
+        let mut w = pool(&[([200.0, WALL, 312.0, 40.0], Material::Acid)], &cup);
+        hold(&mut w, Source::Pour, Material::Lye, [256.0, 130.0], 4.0, 4000.0, 2.0);
+        wait(&mut w, 2.0);
+        save(&w, "new_reaction", zoom([256.0, 50.0], 4.0));
+        // Liquid nitrogen poured onto water.
+        let mut w = pool(&[([150.0, WALL, 362.0, 40.0], Material::Water)], &[wall(146.0), wall(366.0)]);
+        hold(&mut w, Source::Pour, Material::Nitrogen, [256.0, 120.0], 5.0, 5000.0, 2.0);
+        wait(&mut w, 1.0);
+        save(&w, "new_nitrogen", zoom([256.0, 60.0], 3.0));
+        // A granular liquid (Grainy) poured into a pile, and into a pool.
+        let mut w = pool(&[([330.0, WALL, 508.0, 50.0], Material::Water)], &[wall(326.0)]);
+        hold(&mut w, Source::Pour, Material::Grainy, [200.0, 120.0], 5.0, 6000.0, 3.0);
+        wait(&mut w, 2.0);
+        hold(&mut w, Source::Pour, Material::Grainy, [420.0, 150.0], 4.0, 4000.0, 1.5);
+        wait(&mut w, 2.0);
+        save(&w, "new_grainy", zoom([320.0, 60.0], 2.2));
+        // The two parts of the resin.
+        let mut w = pool(&[([200.0, WALL, 312.0, 30.0], Material::PartA)], &cup);
+        hold(&mut w, Source::Pour, Material::PartB, [256.0, 120.0], 4.0, 4000.0, 1.5);
+        wait(&mut w, 3.0);
+        save(&w, "new_resin", zoom([256.0, 50.0], 4.0));
+        // A volatile liquid, three seconds on.
+        let mut w = pool(&[([200.0, WALL, 312.0, 40.0], Material::Vanishing)], &cup);
+        wait(&mut w, 3.0);
+        save(&w, "new_vanishing", zoom([256.0, 60.0], 3.0));
     }
     // Every liquid on its own: a block dropped into a cup with a peg, 1.6 s later.
     for (row, b) in crate::sim::BUILTINS.iter().enumerate() {

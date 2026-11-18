@@ -165,6 +165,19 @@ impl Library {
     }
 }
 
+/// Keys of built-ins that were renamed on 2026-11-16, for files saved before.
+pub fn renamed(key: &str) -> &str {
+    match key {
+        "syrup" => "honey",
+        // Wet sand was removed on 2026-11-16 (sand will be a solid of its own): its files load as mud.
+        "sand" => "mud",
+        "sludge" => "clay",
+        // The marbled liquid went with the made-up looks on 2026-11-17; its row is the snow globe.
+        "marbled" => "snowy",
+        k => k,
+    }
+}
+
 /// Reference to a table row in the file: a built-in's id or a custom liquid's.
 fn row_ref(row: i32, ids: &[String]) -> Value {
     if row < 0 {
@@ -191,6 +204,12 @@ fn liquid_to_json(c: &CustomLiquid, ids: &[String]) -> Value {
     props.insert("residue".into(), row_ref(c.props.residue, ids));
     props.insert("color".into(), json!(c.props.color));
     props.insert("color_solid".into(), json!(c.props.color_solid));
+    props.insert("glow_color".into(), json!(c.props.glow_color));
+    props.insert("color_hot".into(), json!(c.props.color_hot));
+    props.insert("cloud_color".into(), json!(c.props.cloud_color));
+    props.insert("dust_color".into(), json!(c.props.dust_color));
+    props.insert("react_with".into(), row_ref(c.props.react_with, ids));
+    props.insert("react_into".into(), row_ref(c.props.react_into, ids));
     json!({ "id": c.id, "name": c.name, "base": c.base, "props": Value::Object(props) })
 }
 
@@ -227,6 +246,7 @@ pub fn parse(text: &str) -> (Vec<CustomLiquid>, Vec<String>) {
     // First pass: ids and bases, so that references between custom liquids resolve.
     let mut out: Vec<CustomLiquid> = Vec::new();
     let mut refs: Vec<(Option<String>, Option<String>)> = Vec::new();
+    let mut reacts: Vec<(bool, Option<String>, Option<String>)> = Vec::new();
     for (k, item) in list.iter().enumerate().take(MAX_CUSTOM) {
         let id = item.get("id").and_then(Value::as_str).map(str::to_string);
         let name = item.get("name").and_then(Value::as_str).unwrap_or("Unnamed").to_string();
@@ -238,7 +258,7 @@ pub fn parse(text: &str) -> (Vec<CustomLiquid>, Vec<String>) {
             }
         };
         let base = item.get("base").and_then(Value::as_str).unwrap_or("water").to_string();
-        let base_row = BUILTINS.iter().position(|b| b.key == base).unwrap_or_else(|| {
+        let base_row = BUILTINS.iter().position(|b| b.key == renamed(&base)).unwrap_or_else(|| {
             warnings.push(format!("\"{name}\": unknown base \"{base}\", using water"));
             0
         });
@@ -272,10 +292,17 @@ pub fn parse(text: &str) -> (Vec<CustomLiquid>, Vec<String>) {
                 None => warnings.push(format!("\"{name}\": {field} missing or not three numbers")),
             }
         }
+        // (The colours of 2026-11-16; a file without them keeps its base's.)
+        for (field, value) in [("glow_color", &mut props.glow_color), ("color_hot", &mut props.color_hot), ("cloud_color", &mut props.cloud_color), ("dust_color", &mut props.dust_color)] {
+            if let Some(c) = colour(obj.and_then(|o| o.get(field))) {
+                *value = c.map(|x| x.clamp(0.0, 1.0));
+            }
+        }
         // (`color_mid`, the colour of a half-diluted concentrate, was dropped on 2026-11-14:
         // mixtures now take their colour from absorption, and files that have it ignore it.)
         let reference = |key: &str| obj.and_then(|o| o.get(key)).and_then(Value::as_str).map(str::to_string);
         refs.push((reference("diluent"), reference("residue")));
+        reacts.push((obj.is_some_and(|o| o.contains_key("react_with")), reference("react_with"), reference("react_into")));
         out.push(CustomLiquid { id, name, base, props, deleted: false });
     }
     // Second pass: diluent and residue references, to built-ins or to liquids in the file.
@@ -283,6 +310,7 @@ pub fn parse(text: &str) -> (Vec<CustomLiquid>, Vec<String>) {
     let resolve = |r: &Option<String>| -> Option<i32> {
         let r = r.as_ref()?;
         if let Some(key) = r.strip_prefix("builtin.") {
+            let key = renamed(key);
             return BUILTINS.iter().position(|b| b.key == key).map(|i| i as i32);
         }
         ids.iter().position(|id| id == r).map(|k| custom_row(k) as i32)
@@ -300,6 +328,12 @@ pub fn parse(text: &str) -> (Vec<CustomLiquid>, Vec<String>) {
             _ => -1,
         };
         out[k].props.residue = resolve(res).unwrap_or(-1);
+        // A reaction: as the file has it; a file from before reactions keeps its base's.
+        let (has, with, into) = &reacts[k];
+        if *has {
+            out[k].props.react_with = resolve(with).filter(|&r| r != me).unwrap_or(-1);
+            out[k].props.react_into = resolve(into).unwrap_or(-1);
+        }
     }
     (out, warnings)
 }
@@ -316,7 +350,7 @@ mod tests {
         sea.diluent = 0;
         Library {
             custom: vec![
-                CustomLiquid { id: "custom-a".into(), name: "Honey".into(), base: "syrup".into(), props: honey, deleted: false },
+                CustomLiquid { id: "custom-a".into(), name: "Honey".into(), base: "honey".into(), props: honey, deleted: false },
                 CustomLiquid { id: "custom-b".into(), name: "Sea water".into(), base: "brine".into(), props: sea, deleted: false },
             ],
             path: PathBuf::new(),

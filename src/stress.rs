@@ -317,7 +317,7 @@ pub fn abuse(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
         w.end_stroke();
     }
     for at in [[0.0, 0.0], [512.0, 288.0], [-40.0, 140.0], [256.0, 290.0]] {
-        added += w.stamp(Material::Syrup, at, 15.0) as i64;
+        added += w.stamp(Material::Honey, at, 15.0) as i64;
     }
     w.sim.advance_blocking(2.0, ToolState::default());
     let end = Health::of(&w);
@@ -411,7 +411,7 @@ pub fn abuse(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) {
     let start = Health::of(&w);
     let mut added = 0i64;
     for (k, (row, _)) in BUILTINS.iter().enumerate().filter(|(row, _)| pickable(*row)).enumerate() {
-        let at = [30.0 + 452.0 * k as f32 / 17.0, 250.0];
+        let at = [30.0 + 452.0 * (k % 18) as f32 / 17.0, 250.0];
         for _ in 0..12 {
             added += w.emit(Source::Pour, Material(row as u8), at, 6.0, 8000.0, 1.0 / 60.0) as i64;
             w.sim.advance_blocking(1.0 / 60.0, Source::Pour.nozzle(at, 6.0, 8000.0));
@@ -445,7 +445,7 @@ pub fn extremes(gpu: &Arc<Gpu>, apply: &dyn Fn(&mut SimParams), r: &mut Report) 
     println!("\nParameters at the ends of their ranges (Playground, 1 s each)");
     let keys = [
         "gravity", "cfl", "dt_max", "speed_cap", "correction_max", "crowd_jitter", "apic_clamp", "viscosity_water",
-        "viscosity_syrup", "tension_water", "tension_oil_water", "contact_angle_water", "droplet_cells", "mix_rate",
+        "viscosity_honey", "tension_water", "tension_oil_water", "contact_angle_water", "droplet_cells", "mix_rate",
         "density_oil", "spray_cfl", "curvature_max", "pressure_tol", "viscosity_tol", "heat_rate",
     ];
     for key in keys {

@@ -17,7 +17,7 @@
 use bytemuck::{Pod, Zeroable};
 
 /// Rows of the live material table (and of the GPU table).
-pub const MAX_MATERIALS: usize = 64;
+pub const MAX_MATERIALS: usize = 96;
 /// Most materials a tank can hold at once: each needs accumulator channels on the grid.
 pub const MAX_PRESENT: usize = 12;
 /// Immiscible phase groups.
@@ -32,13 +32,16 @@ pub struct Material(pub u8);
 
 #[allow(non_upper_case_globals)]
 impl Material {
+    // The built-in rows, in table order (presets.rs: BUILTINS). Water is row 0 (common.glsl:
+    // ROW_WATER); Salt, Steam and Resin are never offered by the picker (what evaporating brine
+    // leaves, what boiling water turns into, what the two-part liquids set into).
     pub const Water: Material = Material(0);
-    pub const Syrup: Material = Material(1);
+    pub const Honey: Material = Material(1);
     pub const Oil: Material = Material(2);
     pub const Mud: Material = Material(3);
     pub const Ink: Material = Material(4);
     pub const Chocolate: Material = Material(5);
-    pub const Sludge: Material = Material(6);
+    pub const Clay: Material = Material(6);
     pub const Blood: Material = Material(7);
     pub const Mercury: Material = Material(8);
     pub const Lava: Material = Material(9);
@@ -50,11 +53,47 @@ impl Material {
     pub const Wax: Material = Material(15);
     pub const Oobleck: Material = Material(16);
     pub const Gallium: Material = Material(17);
-    /// Dry salt: what evaporating brine leaves behind. Not a liquid the picker offers.
-    pub const Salt: Material = Material(18);
-    /// Water vapour: what boiling aqueous liquid turns into (README, "Steam"). Not a liquid
-    /// the picker offers.
-    pub const Steam: Material = Material(19);
+    pub const Beer: Material = Material(18);
+    pub const Soap: Material = Material(19);
+    pub const Alcohol: Material = Material(20);
+    pub const Nitrogen: Material = Material(21);
+    pub const Acid: Material = Material(22);
+    pub const Lye: Material = Material(23);
+    pub const GlowFluid: Material = Material(24);
+    pub const Iron: Material = Material(25);
+    pub const Polish: Material = Material(26);
+    pub const Blank: Material = Material(27);
+    pub const Thick: Material = Material(28);
+    pub const Heavy: Material = Material(29);
+    pub const Light: Material = Material(30);
+    pub const Beady: Material = Material(31);
+    pub const Creeper: Material = Material(32);
+    pub const Putty: Material = Material(33);
+    pub const Paste: Material = Material(34);
+    pub const Thinner: Material = Material(35);
+    pub const Jammer: Material = Material(36);
+    pub const Magnetic: Material = Material(37);
+    pub const Glowing: Material = Material(38);
+    pub const Fizzy: Material = Material(39);
+    pub const Sudsy: Material = Material(40);
+    pub const Vanishing: Material = Material(41);
+    pub const Grainy: Material = Material(42);
+    pub const Warming: Material = Material(43);
+    pub const Setting: Material = Material(44);
+    pub const Mirror: Material = Material(45);
+    pub const Pearly: Material = Material(46);
+    pub const Glitter: Material = Material(47);
+    pub const Snowy: Material = Material(48);
+    pub const Mood: Material = Material(49);
+    pub const Dye: Material = Material(50);
+    pub const Silt: Material = Material(51);
+    pub const PartA: Material = Material(52);
+    pub const PartB: Material = Material(53);
+    pub const Ember: Material = Material(54);
+    pub const Sheen: Material = Material(55);
+    pub const Salt: Material = Material(56);
+    pub const Steam: Material = Material(57);
+    pub const Resin: Material = Material(58);
 
     pub fn index(self) -> usize {
         self.0 as usize
@@ -202,42 +241,103 @@ pub struct MatProps {
 
     // ---- optics (README, "Look") ------------------------------------------------------------------
     // A liquid's colour comes from how it absorbs and scatters light (Beer-Lambert), so that
-    // mixtures add up as real solutions do: a little syrup in water is pale gold, a little
-    // blood a pink-red cloud, never a hue in between the two colours (until 2026-11-14 blends
-    // averaged hues in OKLab: syrup or blood in water passed through violet).
-    /// Body colour, gamma space. For a clear liquid (`scatter` 0), the colour of light that
-    /// has come through `tint_depth` cells of it; for a scattering one, the colour of a deep
-    /// layer of it in light (its diffuse albedo).
+    // mixtures add up as real solutions do: a little honey in water is pale gold, a little
+    // blood a pink-red cloud, never a hue in between the two colours. What it absorbs is its
+    // dissolved colour (`color`, `opacity`) plus its suspended particles (`cloud_*`); what it
+    // scatters comes from those particles alone (README, "Particles in the liquid").
+    /// Colour of what is dissolved in it, gamma space: the colour of light that has come
+    /// through `tint_depth` cells of the liquid without its particles.
     pub color: [f32; 3],
     /// Colour when frozen.
     pub color_solid: [f32; 3],
-    /// 0 clear .. 1 opaque: how deep the colour builds up, `tint_depth` = 0.5 + 30 (1 - opacity)²
-    /// cells (water 30, honey 3, blood half a cell).
+    /// 0 clear .. 1 opaque: how deep the dissolved colour builds up, `tint_depth` =
+    /// 0.5 + 30 (1 - opacity)² cells (water 30, honey 3, ink half a cell).
     pub opacity: f32,
-    /// 0 clear .. 1 milky: how strongly it scatters light. A scattering liquid shows its own
-    /// colour lit from the front (milk, mud, blood, chocolate); a clear one shows light that
-    /// has come through it, darker and deeper in hue the further it went (water, honey, oil).
-    pub scatter: f32,
     /// 0 dielectric .. 1 mirror metal.
     pub metal: f32,
     /// Strength of the specular streak.
     pub gloss: f32,
-    /// Width of the translucent rim / fullness of the surface (thick liquids).
-    pub body: f32,
     /// 1: fast, thin liquid turns to white water.
     pub foam: f32,
-    /// Seconds a film of it stays on a solid.
-    pub dry_time: f32,
-    /// 0 none .. 1 blood: how fast it leaves a lasting stain on solids and the back wall,
-    /// which only other liquids wash off.
-    pub stain: f32,
-    /// 0 none .. 1 honey: fine glints and a moving sheen on its surface, carried by the flow.
-    pub glint: f32,
-    /// 0 none .. 1 oil: thin-film colours on its surface and thin layers.
-    pub iridescence: f32,
-    /// 0 none .. 1 lava: as it cools below a bright glow, a dark crust in plates with
-    /// glowing seams, carried by the flow.
-    pub crackle: f32,
+    /// Volume fraction of what is dissolved in it and does not evaporate (sugar in honey
+    /// 0.8, salt in brine 0.12, plasma proteins in blood 0.08, dye in ink 0.05). With its
+    /// particles, it is what a film of it leaves behind when it dries (README, "Films, stains
+    /// and drips"). A liquid that never boils does not dry at all.
+    pub solids: f32,
+
+    // ---- particles in the liquid (README, "Particles in the liquid") -------------------------
+    // Two populations, each described as the real material is: how much there is (volume
+    // fraction), how big the particles are, their refractive index or reflectance, their own
+    // colour and shape. Everything they look like follows from that: how cloudy the liquid is
+    // and in which colour (Rayleigh to Mie scattering: fine particles scatter blue and pass
+    // orange, coarse ones scatter white and mostly forwards), whether platelets show the flow
+    // (Jeffery orbits against Brownian rotation), how specks settle, pile up and are stirred
+    // up again (Stokes drag, Shields), and how much of them shows through the liquid.
+    /// Volume fraction of fine particles (colloids, droplets, pigment): the cloudiness.
+    pub cloud: f32,
+    /// Their diameter, m (casein micelles 0.1 µm, milk fat 3 µm, red cells 7.5 µm).
+    pub cloud_size: f32,
+    /// Their refractive index (fat 1.46, clay 1.56, titanium white 2.6): how strongly they
+    /// scatter against the liquid's own `ior`. Equal to it: they vanish.
+    pub cloud_ior: f32,
+    /// Their own colour, gamma space: the colour of a deep layer of them (a powder of them,
+    /// or the liquid where they dominate). Sets how much light they absorb.
+    pub cloud_color: [f32; 3],
+    /// Their thickness over their diameter: 1 spheres, small values platelets (mica 0.05),
+    /// which the flow lines up so that the liquid shows its shear.
+    pub cloud_shape: f32,
+    /// Volume fraction of coarse particles, seen one by one as specks: grains, flakes, glitter.
+    pub dust: f32,
+    /// Their diameter, m.
+    pub dust_size: f32,
+    /// Their density, kg/m³: they settle through (or rise in) the liquid at their terminal
+    /// velocity, rest on what is below them and are stirred up by a fast enough flow.
+    pub dust_density: f32,
+    /// Their colour, gamma space (also the tint of what a shiny one reflects).
+    pub dust_color: [f32; 3],
+    /// Their thickness over their diameter: 1 grains, small values flakes that tumble in the
+    /// flow and flash as they turn to the light.
+    pub dust_shape: f32,
+    /// How much of the light that meets their face they reflect like a mirror (quartz 0.05,
+    /// mica 0.2, aluminised glitter 0.9).
+    pub dust_reflect: f32,
+
+    // ---- the 2026-11-16 properties (README, "New properties") -------------------------------
+    /// Heat the liquid makes inside itself, W/kg (a radioactive or slowly reacting liquid).
+    pub self_heat: f32,
+    /// Share of the liquid exposed at a free surface that evaporates per second at 20 °C
+    /// (doubling every 10 K), below its boiling point. 0: only boiling removes it.
+    pub volatility: f32,
+    /// Internal friction (tan of the friction angle) of a granular liquid: a yield stress of
+    /// `friction` x the pressure, so it piles up at its angle of repose. Scales with the
+    /// concentration cubed for a concentrate (a granular paste flows when watered down).
+    pub friction: f32,
+    /// A reaction: in a cell that also holds `react_with` (a row, -1: none) the liquid turns
+    /// into `react_into` (a row; -1: it is used up) at `react_rate` per second, giving off
+    /// `react_heat` J/kg.
+    pub react_with: i32,
+    pub react_into: i32,
+    pub react_rate: f32,
+    pub react_heat: f32,
+    /// Seconds the foam it makes lasts (water: half a second of white water; beer: a head).
+    pub froth: f32,
+    /// 0 none .. 1 soda: bubbles of dissolved gas rise through it and feed its foam.
+    pub fizz: f32,
+    /// 0 none .. 1: how much visible vapour it gives off where it evaporates or boils away.
+    pub fume: f32,
+    /// 0 none .. 2: light of its own (`glow_color`), whatever its temperature.
+    pub luminous: f32,
+    pub glow_color: [f32; 3],
+    /// 0 .. 1: the share of that light it gives only where it is stirred (bioluminescence).
+    pub glow_shear: f32,
+    /// Thermochromic: its colour turns from `color` at `thermo_lo` to `color_hot` at
+    /// `thermo_hi` (°C). Off while `thermo_hi` <= `thermo_lo`.
+    pub color_hot: [f32; 3],
+    pub thermo_lo: f32,
+    pub thermo_hi: f32,
+    /// Refractive index: how much its surface reflects at each angle (Fresnel) and how far
+    /// it bends what is seen through it (water 1.33).
+    pub ior: f32,
 }
 
 impl Default for MatProps {
@@ -285,16 +385,38 @@ impl Default for MatProps {
             color: [0.17, 0.52, 0.94],
             color_solid: [0.8, 0.9, 1.0],
             opacity: 0.0,
-            scatter: 0.0,
             metal: 0.0,
             gloss: 0.3,
-            body: 0.0,
             foam: 0.0,
-            dry_time: 2.0,
-            stain: 0.0,
-            glint: 0.25,
-            iridescence: 0.0,
-            crackle: 0.0,
+            solids: 0.0,
+            cloud: 0.0,
+            cloud_size: 1.0e-6,
+            cloud_ior: 1.5,
+            cloud_color: [0.95, 0.95, 0.95],
+            cloud_shape: 1.0,
+            dust: 0.0,
+            dust_size: 3.0e-4,
+            dust_density: 2650.0,
+            dust_color: [0.80, 0.75, 0.65],
+            dust_shape: 1.0,
+            dust_reflect: 0.05,
+            self_heat: 0.0,
+            volatility: 0.0,
+            friction: 0.0,
+            react_with: -1,
+            react_into: -1,
+            react_rate: 0.0,
+            react_heat: 0.0,
+            froth: 0.0,
+            fizz: 0.0,
+            fume: 0.0,
+            luminous: 0.0,
+            glow_color: [0.4, 1.0, 0.5],
+            glow_shear: 0.0,
+            color_hot: [0.95, 0.35, 0.45],
+            thermo_lo: 0.0,
+            thermo_hi: 0.0,
+            ior: 1.33,
         }
     }
 }
@@ -328,687 +450,18 @@ impl MatProps {
         self.density * self.heat_capacity
     }
 
+    /// Whether the liquid makes or needs heat by itself, so that a tank holding it carries
+    /// temperatures from the start.
+    pub fn makes_heat(&self) -> bool {
+        self.self_heat > 0.0 || (self.react_with >= 0 && self.react_heat != 0.0)
+    }
+
     pub fn phase_group(&self) -> PhaseGroup {
         PhaseGroup::from_index(self.group)
     }
 }
 
-/// Key, display name and sources of a built-in.
-pub struct Builtin {
-    /// Name in `--set` keys (`density_<key>`, `<key>.density`) and the stable id `builtin.<key>`.
-    pub key: &'static str,
-    pub name: &'static str,
-    /// Where it appears in the picker.
-    pub category: &'static str,
-    pub props: fn() -> MatProps,
-}
-
-fn water() -> MatProps {
-    MatProps {
-        // Standard 20 °C values; viscosity follows the Vogel form of the IAPWS correlation
-        // (nu = 1.0e-6 at 20 °C, 0.29e-6 at 100 °C).
-        temp_model: TEMP_VFT,
-        temp_b: 578.9,
-        temp_c: 137.5,
-        melt_lo: -0.5,
-        melt_hi: 0.0,
-        latent: 334.0e3,
-        density_solid: 917.0,
-        boil: 100.0,
-        latent_vap: 2257.0e3,
-        emissivity: 0.96,
-        foam: 1.0,
-        gloss: 0.35,
-        color: [0.04, 0.38, 0.70],
-        color_solid: [0.78, 0.90, 0.98],
-        dry_time: 2.0,
-        glint: 0.3,
-        ..Default::default()
-    }
-}
-
-fn syrup() -> MatProps {
-    MatProps {
-        diluent: Material::Water.0 as i32,
-        density: 1.4 * 998.0,
-        viscosity: 0.06,
-        // Strongly temperature dependent, as honey and golden syrup are: an Arrhenius law
-        // with B = 10500 K halves the viscosity every 6 K near room temperature (a sandbox
-        // choice inside the measured range for honey, 9000 - 12000 K).
-        temp_model: TEMP_ARRHENIUS,
-        temp_b: 10500.0,
-        tension: 0.076,
-        mix_rate: 1.5,
-        heat_capacity: 2300.0,
-        conductivity: 0.35,
-        expansion: 5.0e-4,
-        melt_lo: -1.0e9,
-        melt_hi: -1.0e9,
-        boil: 110.0,
-        latent_vap: 2257.0e3,
-        color: [0.92, 0.58, 0.10],
-        opacity: 0.55,
-        gloss: 0.9,
-        body: 1.0,
-        dry_time: 30.0,
-        glint: 1.0,
-        scatter: 0.04,
-        ..Default::default()
-    }
-}
-
-fn oil() -> MatProps {
-    MatProps {
-        group: PhaseGroup::Oily as u32,
-        density: 0.9 * 998.0,
-        viscosity: 6.0e-5,
-        // Olive oil: 84 mPa s at 20 °C, 12 mPa s at 70 °C  ->  B = 3900 K.
-        temp_model: TEMP_ARRHENIUS,
-        temp_b: 3900.0,
-        tension: 0.032,
-        heat_capacity: 1970.0,
-        conductivity: 0.17,
-        expansion: 7.0e-4,
-        melt_lo: -8.0,
-        melt_hi: -4.0,
-        latent: 150.0e3,
-        density_solid: 925.0,
-        color: [0.95, 0.80, 0.30],
-        color_solid: [0.93, 0.86, 0.55],
-        opacity: 0.25,
-        gloss: 1.0,
-        body: 0.4,
-        dry_time: 12.0,
-        glint: 0.5,
-        iridescence: 1.0,
-        ..Default::default()
-    }
-}
-
-fn mud() -> MatProps {
-    MatProps {
-        // A suspension: the concentrate is packed silt (60 % grains by volume, 2000 kg/m³),
-        // emitted at concentration 0.5 (half water), so fresh mud is 1500 kg/m³ (natural muds and
-        // debris-flow slurries: 1300 - 1700, Coussot 1997). Grains of 50 µm settle out of
-        // it at about a millimetre per second (Stokes). Sandbox choices.
-        diluent: Material::Water.0 as i32,
-        density: 2000.0,
-        viscosity: 0.05,
-        rheology: RHEO_CARREAU,
-        flow_index: 0.6,
-        shear_time: 1.0,
-        visc_ratio: 0.2,
-        grain: 50.0e-6,
-        load: 0.5,
-        heat_capacity: 1500.0,
-        conductivity: 1.5,
-        expansion: 3.0e-4,
-        latent: 0.0,
-        freeze_shift: 0.0,
-        boil: 100.0,
-        latent_vap: 2257.0e3,
-        tension: 0.07,
-        color: [0.40, 0.29, 0.18],
-        color_solid: [0.50, 0.42, 0.33],
-        opacity: 1.0,
-        scatter: 1.0,
-        gloss: 0.25,
-        body: 0.6,
-        dry_time: 40.0,
-        stain: 0.35,
-        glint: 0.1,
-        ..Default::default()
-    }
-}
-
-fn ink() -> MatProps {
-    MatProps {
-        // Water-based ink: dye and pigment dissolved or finely dispersed, a little denser
-        // than water (India ink 1.0 - 1.1 g/cm³), water-like viscosity. Its mixing rate is
-        // a sandbox choice, slow enough for plumes to show.
-        diluent: Material::Water.0 as i32,
-        density: 1050.0,
-        viscosity: 2.0e-6,
-        mix_rate: 0.25,
-        tension: 0.06,
-        heat_capacity: 4000.0,
-        conductivity: 0.58,
-        latent: 330.0e3,
-        boil: 101.0,
-        latent_vap: 2257.0e3,
-        color: [0.05, 0.07, 0.16],
-        color_solid: [0.20, 0.22, 0.30],
-        opacity: 1.0,
-        gloss: 0.4,
-        dry_time: 25.0,
-        stain: 0.8,
-        glint: 0.3,
-        ..Default::default()
-    }
-}
-
-fn chocolate() -> MatProps {
-    MatProps {
-        // Molten dark chocolate: fat-continuous, so it keeps an interface with water.
-        // 1250 kg/m³; Casson plastic viscosity 2 - 10 Pa s and yield stress 5 - 20 Pa at
-        // 40 - 45 °C (Afoakwa et al. 2007; ICA method 46), here Bingham: 6 Pa s and 10 Pa at
-        // 45 °C. Cocoa butter (form V) melts at 33.8 °C; chocolate sets between 27 and 32 °C
-        // with ~45 kJ/kg (about a third of cocoa butter's 150 kJ/kg). c = 1.6 kJ/(kg K),
-        // k = 0.2 W/(m K) (Tscheuschner). The temperature law is a sandbox choice
-        // (Arrhenius, B = 4000 K: a third thinner per 10 K).
-        group: PhaseGroup::Oily as u32,
-        density: 1250.0,
-        density_solid: 1290.0,
-        viscosity: 4.8e-3,
-        rheology: RHEO_HERSCHEL_BULKLEY,
-        yield_stress: 10.0,
-        temp_model: TEMP_ARRHENIUS,
-        temp_b: 4000.0,
-        temp_ref: 45.0,
-        tension: 0.035,
-        heat_capacity: 1600.0,
-        conductivity: 0.2,
-        expansion: 6.0e-4,
-        melt_lo: 27.0,
-        melt_hi: 32.0,
-        latent: 45.0e3,
-        emissivity: 0.9,
-        spawn_temp: 45.0,
-        color: [0.33, 0.17, 0.09],
-        color_solid: [0.38, 0.22, 0.13],
-        opacity: 1.0,
-        gloss: 1.0,
-        body: 1.0,
-        dry_time: 60.0,
-        stain: 0.45,
-        glint: 0.7,
-        scatter: 1.0,
-        ..Default::default()
-    }
-}
-
-fn sludge() -> MatProps {
-    MatProps {
-        // Thick, fine-grained sludge (dewatered sewage sludge, drilling mud, slurry):
-        // 1450 kg/m³, Herschel-Bulkley with a 60 Pa yield stress (sludges: 10 - 100 Pa,
-        // Eshtiaghi et al. 2013), n = 0.5, consistency 30 Pa s^n. Its grains (20 µm) hardly
-        // settle. Diluted, it loses its strength steeply (the yield stress follows the
-        // concentration; viscosity blends with the exponent override in `MIX_OVERRIDES`).
-        diluent: Material::Water.0 as i32,
-        density: 1450.0,
-        viscosity: 0.02,
-        rheology: RHEO_HERSCHEL_BULKLEY,
-        yield_stress: 60.0,
-        flow_index: 0.5,
-        grain: 20.0e-6,
-        heat_capacity: 3000.0,
-        conductivity: 0.6,
-        expansion: 3.0e-4,
-        latent: 250.0e3,
-        boil: 100.0,
-        latent_vap: 2257.0e3,
-        tension: 0.06,
-        color: [0.24, 0.23, 0.17],
-        color_solid: [0.34, 0.32, 0.26],
-        opacity: 1.0,
-        scatter: 1.0,
-        gloss: 0.35,
-        body: 1.0,
-        dry_time: 90.0,
-        stain: 0.5,
-        glint: 0.15,
-        ..Default::default()
-    }
-}
-
-fn blood() -> MatProps {
-    MatProps {
-        // Whole blood, 1060 kg/m³; Carreau fit of Cho & Kensey (1991): mu0 = 56 mPa s,
-        // mu_inf = 3.45 mPa s, lambda = 3.313 s, n = 0.3568. Surface tension 0.058 N/m
-        // (Hrncir & Rosina 1997); c = 3.6 kJ/(kg K), k = 0.52 W/(m K). Disperses in water.
-        diluent: Material::Water.0 as i32,
-        density: 1060.0,
-        viscosity: 5.28e-5,
-        rheology: RHEO_CARREAU,
-        flow_index: 0.3568,
-        shear_time: 3.313,
-        visc_ratio: 0.0616,
-        mix_rate: 0.4,
-        tension: 0.058,
-        heat_capacity: 3617.0,
-        conductivity: 0.52,
-        latent: 300.0e3,
-        freeze_shift: -0.6,
-        boil: 101.0,
-        latent_vap: 2257.0e3,
-        color: [0.40, 0.02, 0.035],
-        color_solid: [0.30, 0.05, 0.06],
-        opacity: 0.97,
-        gloss: 0.8,
-        body: 0.3,
-        dry_time: 45.0,
-        stain: 1.0,
-        glint: 0.55,
-        scatter: 0.7,
-        ..Default::default()
-    }
-}
-
-fn mercury() -> MatProps {
-    MatProps {
-        // CRC Handbook (25 °C): 13 534 kg/m³, 1.526 mPa s, 0.485 N/m against air;
-        // contact angle on glass ~140°; melts at -38.83 °C (11.4 kJ/kg; solid 14 184 kg/m³),
-        // boils at 356.7 °C (295 kJ/kg); c = 139.5 J/(kg K), k = 8.3 W/(m K); polished
-        // emissivity ~0.1.
-        group: PhaseGroup::Metal as u32,
-        density: 13534.0,
-        density_solid: 14184.0,
-        viscosity: 1.13e-7,
-        tension: 0.485,
-        contact_angle: 140.0,
-        heat_capacity: 139.5,
-        conductivity: 8.3,
-        expansion: 1.8e-4,
-        melt_lo: -39.0,
-        melt_hi: -38.8,
-        latent: 11.4e3,
-        emissivity: 0.1,
-        boil: 356.7,
-        latent_vap: 295.0e3,
-        color: [0.80, 0.82, 0.85],
-        color_solid: [0.70, 0.72, 0.75],
-        opacity: 1.0,
-        metal: 1.0,
-        gloss: 1.0,
-        body: 1.0,
-        dry_time: 0.5,
-        glint: 0.6,
-        scatter: 1.0,
-        ..Default::default()
-    }
-}
-
-fn lava() -> MatProps {
-    MatProps {
-        // Basaltic lava: 2700 kg/m³ (solid 2900), ~135 Pa s at 1200 °C rising tenfold by
-        // ~1100 °C (Arrhenius, B = 56 000 K; measured basalts: 10² - 10⁴ Pa s at 1100 -
-        // 1200 °C, Giordano et al. 2008). It crystallises between 1000 and 1150 °C
-        // (400 kJ/kg); below ~1090 °C it is past `rigid_viscosity` and moves as a crust.
-        // c = 1.2 kJ/(kg K), k = 1.5 W/(m K), emissivity 0.95 (Harris 2013).
-        group: PhaseGroup::Silicate as u32,
-        density: 2700.0,
-        density_solid: 2900.0,
-        viscosity: 0.05,
-        temp_model: TEMP_ARRHENIUS,
-        temp_b: 56000.0,
-        temp_ref: 1200.0,
-        tension: 0.35,
-        contact_angle: 60.0,
-        heat_capacity: 1200.0,
-        conductivity: 1.5,
-        expansion: 1.0e-4,
-        melt_lo: 1000.0,
-        melt_hi: 1150.0,
-        latent: 400.0e3,
-        emissivity: 0.95,
-        spawn_temp: 1200.0,
-        color: [0.10, 0.07, 0.06],
-        color_solid: [0.16, 0.14, 0.13],
-        opacity: 1.0,
-        gloss: 0.3,
-        body: 1.0,
-        dry_time: 120.0,
-        stain: 0.3,
-        glint: 0.0,
-        crackle: 1.0,
-        scatter: 1.0,
-        ..Default::default()
-    }
-}
-
-fn glass() -> MatProps {
-    MatProps {
-        // Soda-lime glass: VFT fit log10(eta / Pa s) = -2.585 + 4519 / (T - 263 °C)
-        // (Lakatos et al. 1972 type fit; Shelby, "Introduction to Glass Science"):
-        // B = 10 406 K, C = 536 K; 0.27 m²/s at 1100 °C, past `rigid_viscosity` below
-        // ~1050 °C, so it sets without a latent heat. Melt 2450 kg/m³, 0.3 N/m;
-        // c = 1.3 kJ/(kg K), effective k = 1.2 W/(m K).
-        group: PhaseGroup::Silicate as u32,
-        density: 2450.0,
-        viscosity: 0.267,
-        temp_model: TEMP_VFT,
-        temp_b: 10406.0,
-        temp_c: 536.0,
-        temp_ref: 1100.0,
-        tension: 0.3,
-        contact_angle: 45.0,
-        heat_capacity: 1300.0,
-        conductivity: 1.2,
-        expansion: 5.0e-5,
-        emissivity: 0.9,
-        spawn_temp: 1200.0,
-        color: [0.80, 0.93, 0.88],
-        color_solid: [0.80, 0.93, 0.88],
-        opacity: 0.08,
-        gloss: 1.0,
-        body: 1.0,
-        dry_time: 120.0,
-        glint: 0.8,
-        ..Default::default()
-    }
-}
-
-fn milk() -> MatProps {
-    MatProps {
-        // Whole milk: 1030 kg/m³, ~2 mPa s at 20 °C (Fox & McSweeney), an emulsion of fat
-        // globules (~4 µm) that is opaque white by scattering. It dilutes with water.
-        // Creaming takes hours, so its grains are left out (grain 0).
-        diluent: Material::Water.0 as i32,
-        density: 1030.0,
-        viscosity: 1.94e-6,
-        temp_model: TEMP_ARRHENIUS,
-        temp_b: 2500.0,
-        mix_rate: 0.8,
-        tension: 0.045,
-        heat_capacity: 3930.0,
-        conductivity: 0.55,
-        latent: 300.0e3,
-        freeze_shift: -0.55,
-        boil: 100.5,
-        latent_vap: 2257.0e3,
-        color: [0.96, 0.95, 0.91],
-        color_solid: [0.97, 0.97, 0.95],
-        opacity: 0.9,
-        scatter: 1.0,
-        gloss: 0.35,
-        body: 0.3,
-        dry_time: 20.0,
-        glint: 0.15,
-        ..Default::default()
-    }
-}
-
-fn slime() -> MatProps {
-    MatProps {
-        // PVA-borax slime: 1030 kg/m³, a Maxwell liquid with G ~ 100 Pa and a relaxation
-        // time ~1 s (Cassagnau & Michel; Koopmans' measurements of "silly putty"-like
-        // gels span 0.1 - 10 s). Its viscosity at short times (the solvent's, beside the
-        // network's G lambda = 100 Pa s) is 10 Pa s: slime made from white PVA glue, which
-        // runs at several Pa s itself. At 1 Pa s (until 2026-11-14) a dropped blob stored
-        // its impact elastically and flung it back out as sheets that tore into hundreds of
-        // droplets (README, "Viscoelasticity"). The viscosity is also what holds it to walls
-        // (no-slip comes from the viscosity solve).
-        density: 1030.0,
-        viscosity: 1.0e-2,
-        shear_modulus: 100.0,
-        relax_time: 1.0,
-        tension: 0.06,
-        heat_capacity: 3900.0,
-        conductivity: 0.55,
-        melt_lo: -1.0,
-        melt_hi: -0.5,
-        latent: 300.0e3,
-        boil: 100.0,
-        latent_vap: 2257.0e3,
-        color: [0.36, 0.86, 0.32],
-        color_solid: [0.55, 0.85, 0.55],
-        opacity: 0.45,
-        gloss: 1.0,
-        body: 1.0,
-        dry_time: 60.0,
-        stain: 0.3,
-        glint: 0.85,
-        scatter: 0.15,
-        ..Default::default()
-    }
-}
-
-fn ferrofluid() -> MatProps {
-    MatProps {
-        // Ferrotec EFH1 (hydrocarbon carrier, oil-like): 1210 kg/m³, 6 mPa s, initial
-        // susceptibility 2.64 (SI), saturation 44 mT; surface tension ~0.029 N/m.
-        group: PhaseGroup::Oily as u32,
-        density: 1210.0,
-        viscosity: 5.0e-6,
-        tension: 0.029,
-        susceptibility: 2.64,
-        saturation: 0.044,
-        heat_capacity: 1800.0,
-        conductivity: 0.15,
-        expansion: 7.0e-4,
-        melt_lo: -60.0,
-        melt_hi: -55.0,
-        latent: 100.0e3,
-        // Glossy black: what shows is the reflection of its surroundings, so it is drawn
-        // as a dark mirror (metal) over a very dark body, not as a black body with a
-        // quarter of a mirror, which vanished against the dark tank (2026-11-14).
-        color: [0.10, 0.10, 0.115],
-        color_solid: [0.12, 0.12, 0.13],
-        opacity: 1.0,
-        metal: 0.85,
-        gloss: 1.0,
-        body: 0.7,
-        dry_time: 30.0,
-        stain: 0.12,
-        glint: 0.7,
-        iridescence: 0.15,
-        scatter: 1.0,
-        ..Default::default()
-    }
-}
-
-fn brine() -> MatProps {
-    MatProps {
-        // Saturated NaCl brine (26 % by mass): 1200 kg/m³, 1.9 mPa s (CRC). Salt lowers the
-        // freezing point along the liquidus to the eutectic, -21.1 °C at 23.3 % (here
-        // linear in concentration, -21 K at saturation). Saturated brine boils at 108.8 °C
-        // and leaves 312 kg of salt per m³ (14 % of its volume as crystals of 2165 kg/m³).
-        diluent: Material::Water.0 as i32,
-        density: 1200.0,
-        viscosity: 1.6e-6,
-        mix_rate: 1.0,
-        tension: 0.082,
-        heat_capacity: 3300.0,
-        conductivity: 0.57,
-        latent: 250.0e3,
-        freeze_shift: -21.0,
-        boil: 108.8,
-        latent_vap: 2257.0e3,
-        residue: Material::Salt.0 as i32,
-        residue_share: 0.144,
-        color: [0.14, 0.50, 0.62],
-        color_solid: [0.90, 0.94, 0.96],
-        opacity: 0.05,
-        gloss: 0.35,
-        dry_time: 6.0,
-        glint: 0.3,
-        ..Default::default()
-    }
-}
-
-fn wax() -> MatProps {
-    MatProps {
-        // Paraffin wax: ~780 kg/m³ molten, ~900 solid (both float on water); melts between
-        // 52 and 62 °C with ~200 kJ/kg; molten ~3 mPa s at 70 °C; c = 2.9 kJ/(kg K) liquid,
-        // k = 0.25 W/(m K) (CRC; Sharma et al. 2009 review of PCMs).
-        group: PhaseGroup::Oily as u32,
-        density: 780.0,
-        density_solid: 900.0,
-        viscosity: 3.8e-6,
-        temp_model: TEMP_ARRHENIUS,
-        temp_b: 2500.0,
-        temp_ref: 70.0,
-        tension: 0.028,
-        heat_capacity: 2900.0,
-        conductivity: 0.25,
-        expansion: 1.0e-3,
-        melt_lo: 52.0,
-        melt_hi: 62.0,
-        latent: 200.0e3,
-        emissivity: 0.9,
-        spawn_temp: 75.0,
-        color: [0.97, 0.90, 0.72],
-        color_solid: [0.95, 0.94, 0.88],
-        opacity: 0.3,
-        scatter: 0.6,
-        gloss: 0.8,
-        body: 0.6,
-        dry_time: 80.0,
-        stain: 0.4,
-        glint: 0.4,
-        ..Default::default()
-    }
-}
-
-fn oobleck() -> MatProps {
-    MatProps {
-        // Cornstarch in water (~55 % starch by mass): 1550 kg/m³. Shear thickening, a
-        // sandbox fit: 3 Pa s at rest, (1 + (0.5 g)^2) times that above 2 /s, so it jams
-        // (passes `rigid_viscosity`) above ~45 /s: it flows when stirred gently and holds
-        // like a solid when hit (Fall et al. 2008; Brown & Jaeger 2014). Starch grains
-        // (15 µm) settle slowly out of diluted oobleck.
-        diluent: Material::Water.0 as i32,
-        density: 1550.0,
-        viscosity: 2.0e-3,
-        rheology: RHEO_THICKENING,
-        flow_index: 3.0,
-        shear_time: 0.5,
-        visc_ratio: 2000.0,
-        grain: 15.0e-6,
-        heat_capacity: 2800.0,
-        conductivity: 0.5,
-        expansion: 3.0e-4,
-        latent: 150.0e3,
-        boil: 100.0,
-        latent_vap: 2257.0e3,
-        tension: 0.06,
-        color: [0.93, 0.91, 0.85],
-        color_solid: [0.95, 0.94, 0.90],
-        opacity: 0.95,
-        scatter: 1.0,
-        gloss: 0.2,
-        body: 1.0,
-        dry_time: 50.0,
-        stain: 0.2,
-        glint: 0.1,
-        ..Default::default()
-    }
-}
-
-fn gallium() -> MatProps {
-    MatProps {
-        // Liquid gallium: 6095 kg/m³ at its melting point, 29.76 °C (80.1 kJ/kg); it expands
-        // 3.1 % on freezing (solid 5904 kg/m³). 1.98 mPa s, 0.708 N/m clean; in air an oxide
-        // skin with a surface yield stress of ~0.5 N/m holds irregular shapes (Dickey et al.
-        // 2008). c = 410 J/(kg K), k = 29 W/(m K) (CRC).
-        group: PhaseGroup::Metal as u32,
-        density: 6095.0,
-        density_solid: 5904.0,
-        viscosity: 3.25e-7,
-        tension: 0.708,
-        contact_angle: 130.0,
-        skin: 0.5,
-        heat_capacity: 410.0,
-        conductivity: 29.0,
-        expansion: 1.2e-4,
-        melt_lo: 29.5,
-        melt_hi: 29.8,
-        latent: 80.1e3,
-        emissivity: 0.1,
-        boil: 2400.0,
-        latent_vap: 3700.0e3,
-        spawn_temp: 40.0,
-        color: [0.72, 0.74, 0.78],
-        color_solid: [0.62, 0.64, 0.68],
-        opacity: 1.0,
-        metal: 1.0,
-        gloss: 0.8,
-        body: 1.0,
-        dry_time: 1.0,
-        glint: 0.6,
-        scatter: 1.0,
-        ..Default::default()
-    }
-}
-
-fn salt() -> MatProps {
-    MatProps {
-        // Halite: 2165 kg/m³, melts at 801 °C; what evaporating brine leaves behind. It is
-        // solid at every temperature the sandbox reaches and does not redissolve.
-        density: 2165.0,
-        viscosity: 1.0e-3,
-        heat_capacity: 880.0,
-        conductivity: 6.5,
-        expansion: 1.0e-4,
-        melt_lo: 800.0,
-        melt_hi: 801.0,
-        latent: 482.0e3,
-        tension: 0.07,
-        color: [0.94, 0.94, 0.92],
-        color_solid: [0.94, 0.94, 0.92],
-        opacity: 1.0,
-        scatter: 1.0,
-        gloss: 0.2,
-        dry_time: 120.0,
-        glint: 0.0,
-        ..Default::default()
-    }
-}
-
-fn steam() -> MatProps {
-    MatProps {
-        // Saturated steam at 100 °C: 0.60 kg/m³, dynamic viscosity 1.2e-5 Pa s. A particle of
-        // steam stands for the vapour of the water parcel it boiled from: it carries that
-        // parcel's mass and heat (its heat capacity per particle is water's, sim/mod.rs:
-        // `gpu_materials`), so it condenses back into exactly that water. Its density is the
-        // vapour's, so it is buoyant; its volume is one particle's, not the 1600 times more
-        // the vapour of that much water would fill (README, Limitations). Conductivity and
-        // surface tension are water's: what the bubble exchanges heat through, and what its
-        // surface is, is the water film around it.
-        density: 0.6,
-        viscosity: 2.0e-5,
-        expansion: 0.0,
-        boil: 100.0,
-        latent_vap: 2257.0e3,
-        emissivity: 0.0,
-        color: [0.92, 0.94, 0.96],
-        color_solid: [0.92, 0.94, 0.96],
-        gloss: 0.0,
-        glint: 0.0,
-        dry_time: 0.0,
-        ..Default::default()
-    }
-}
-
-/// The built-in materials, in table order (`Material::Water` ...).
-pub static BUILTINS: [Builtin; 20] = [
-    Builtin { key: "water", name: "Water", category: "Everyday", props: water },
-    Builtin { key: "syrup", name: "Syrup", category: "Everyday", props: syrup },
-    Builtin { key: "oil", name: "Oil", category: "Everyday", props: oil },
-    Builtin { key: "mud", name: "Mud", category: "Earth", props: mud },
-    Builtin { key: "ink", name: "Ink", category: "Everyday", props: ink },
-    Builtin { key: "chocolate", name: "Molten chocolate", category: "Kitchen", props: chocolate },
-    Builtin { key: "sludge", name: "Sludge", category: "Earth", props: sludge },
-    Builtin { key: "blood", name: "Blood", category: "Body", props: blood },
-    Builtin { key: "mercury", name: "Mercury", category: "Metal", props: mercury },
-    Builtin { key: "lava", name: "Lava", category: "Hot", props: lava },
-    Builtin { key: "glass", name: "Molten glass", category: "Hot", props: glass },
-    Builtin { key: "milk", name: "Milk", category: "Kitchen", props: milk },
-    Builtin { key: "slime", name: "Slime", category: "Strange", props: slime },
-    Builtin { key: "ferrofluid", name: "Ferrofluid", category: "Strange", props: ferrofluid },
-    Builtin { key: "brine", name: "Brine", category: "Everyday", props: brine },
-    Builtin { key: "wax", name: "Molten wax", category: "Hot", props: wax },
-    Builtin { key: "oobleck", name: "Oobleck", category: "Strange", props: oobleck },
-    Builtin { key: "gallium", name: "Liquid gallium", category: "Metal", props: gallium },
-    Builtin { key: "salt", name: "Salt", category: "Residue", props: salt },
-    Builtin { key: "steam", name: "Steam", category: "Vapour", props: steam },
-];
-
-/// Rows the liquid picker offers (Salt is only ever left behind by evaporating brine, steam
-/// only by boiling).
-pub fn pickable(row: usize) -> bool {
-    row != Material::Salt.index() && row != Material::Steam.index()
-}
+pub use super::presets::{BUILTINS, pickable};
 
 /// Explicit exceptions to the mixing rules (README, "Mixing rules"), keyed by
 /// (concentrate, diluent). By default a concentrate's viscosity blends with its diluent's
@@ -1021,9 +474,9 @@ pub struct MixOverride {
 }
 
 pub static MIX_OVERRIDES: &[MixOverride] = &[
-    // Sludge and oobleck lose their gel / jammed structure steeply when watered down
+    // Clay and oobleck lose their gel / jammed structure steeply when watered down
     // (viscosity of concentrated suspensions rises steeply near packing, Krieger-Dougherty).
-    MixOverride { concentrate: Material::Sludge, diluent: Material::Water, visc_exponent: 2.0 },
+    MixOverride { concentrate: Material::Clay, diluent: Material::Water, visc_exponent: 2.0 },
     MixOverride { concentrate: Material::Oobleck, diluent: Material::Water, visc_exponent: 3.0 },
 ];
 
@@ -1081,34 +534,82 @@ pub struct GpuMat {
     /// Shear modulus / rho_water (cells²/s²); relaxation time (s); susceptibility; residue share.
     pub el: [f32; 4],
     /// Freeze shift per unit concentration (K); load; viscosity blending exponent against
-    /// the diluent (`MIX_OVERRIDES`); unused.
+    /// the diluent (`MIX_OVERRIDES`); thermal expansion (1/K).
     pub misc: [f32; 4],
+    /// Reaction: partner row (-1 none), product row (-1: used up), the partner's family index
+    /// in this tank (-1: none) and its phase group.
+    pub ic: [i32; 4],
+    /// Reaction rate (1/s); its heat as degrees of this liquid (J/kg / c); self-heating (K/s);
+    /// volatility (1/s).
+    pub rx: [f32; 4],
+    /// Friction coefficient; fume; fizz; unused.
+    pub gr: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<GpuMat>() == 160);
+const _: () = assert!(std::mem::size_of::<GpuMat>() == 208);
 
 /// One row of the optics table (`struct Optics` in optics.glsl): what a material looks like,
-/// in the form the render shaders blend (cell_optics.comp).
+/// in the form the render shaders blend (cell_optics.comp). Coefficients are per cell, at the
+/// tank's `cell_size`: the particles' are physical (per metre, times the cell), so that a map
+/// of millimetre cells sees milk as a tenth as opaque per cell as one of centimetre cells.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GpuOptics {
-    /// Absorption coefficient (linear RGB) and scattering coefficient, 1/cell (`absorption`).
+    /// Absorption coefficient (linear RGB: dissolved colour and particles) and the mean
+    /// reduced scattering coefficient of the fine particles, 1/cell (`coefficients`).
     absorb: [f32; 4],
     /// Colour when frozen, linear RGB; tint depth, cells.
     solid: [f32; 4],
-    /// Opacity, scattering, metal, gloss.
+    /// Opacity, platelet sheen (how much of what it scatters comes from platelets the flow
+    /// lines up), metal, gloss.
     opt: [f32; 4],
-    /// Body (thickness of the look), foam, drying time (s), emissivity.
+    /// Fullness of its shapes (from viscosity and contact angle, `fullness`), foam, time
+    /// its coat takes to dry (s), emissivity.
     sty: [f32; 4],
-    /// Diluent row (-1 none), phase group.
+    /// Diluent row (-1 none), phase group, how much more a dried film of it scatters (x 1000,
+    /// `dry_scatter`).
     idx: [i32; 4],
-    /// Stain, glint, iridescence, crackle.
+    /// Volatile share (`volatile_share`), the coat it leaves (FILM_UNITs, `coat_thickness`),
+    /// thin-film colours (`iridescence`), crust (`crust`).
     fx: [f32; 4],
+    /// Froth (s); fizz; specks drawn per cell of it (`DUST_DRAW_MAX` at most); drainage time
+    /// of its foam's films (s).
+    fx2: [f32; 4],
+    /// Its own light (linear RGB x `luminous`), and the share of it that needs stirring.
+    lum: [f32; 4],
+    /// Absorption and scattering coefficients at `thermo_hi` (as `absorb`, from `color_hot`).
+    hot: [f32; 4],
+    /// Thermochromic range lo, hi (°C; hi <= lo: none); how well it wets (`wetting`); 1 if it
+    /// is a soapy aqueous liquid that washes any film.
+    thermo: [f32; 4],
+    /// The spectral shape of the scattering: the reduced scattering coefficient in red,
+    /// green, blue over its mean (they sum to 3), and the asymmetry g of the fine particles.
+    scat: [f32; 4],
+    /// Refractive index; rotational diffusion of its platelets, rad²/s; their Bretherton
+    /// constant; evaporation of a film of it, FILM_UNITs/s (`evaporation`).
+    opt2: [f32; 4],
+    /// What one drawn speck stands for in the liquid around it, 1/cell: absorption (RGB) and
+    /// reduced scattering of the specks too many to draw (spray.comp adds it where it lies).
+    dust: [f32; 4],
+    /// Speck radius (m), density (kg/m³), thickness over diameter, mirror reflectance.
+    dust2: [f32; 4],
+    /// Speck colour (linear RGB); drawn specks per cell where they lie packed.
+    dcol: [f32; 4],
 }
+
+const _: () = assert!(std::mem::size_of::<GpuOptics>() == 240);
 
 /// sRGB (gamma) to linear.
 pub fn linear(c: [f32; 3]) -> [f32; 3] {
     c.map(|v| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) })
+}
+
+/// Linear to sRGB (gamma).
+pub fn gamma(c: [f32; 3]) -> [f32; 3] {
+    c.map(|v| {
+        let v = v.clamp(0.0, 1.0);
+        if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+    })
 }
 
 /// Cells of liquid through which a clear one shows its `color` (`MatProps::opacity`).
@@ -1117,47 +618,429 @@ pub fn tint_depth(m: &MatProps) -> f32 {
     0.5 + 30.0 * clear * clear
 }
 
-/// Absorption (linear RGB) and scattering coefficients of a material, 1/cell. A clear one
-/// absorbs so that `tint_depth` cells pass `color`. A scattering one scatters `3 scatter /
-/// tint_depth` per cell (mostly opaque within its tint depth) and absorbs what makes the
-/// diffuse reflectance of a deep layer equal to `color`: per channel, from R = (1 - q)/(1 + q),
-/// q = sqrt(1 - albedo) (two-stream, Hapke), the single-scattering albedo is 1 - ((1-R)/(1+R))²;
-/// between the two, the absorption blends by `scatter`.
-/// Coefficients add over a mixture by share, as concentrations do in Beer's law.
-pub fn absorption(m: &MatProps) -> [f32; 4] {
-    let lin = linear(m.color).map(|v| v.clamp(1e-3, 0.995));
-    let depth = tint_depth(m);
-    if m.scatter <= 0.0 {
-        let a = lin.map(|v| -v.ln() / depth);
-        return [a[0], a[1], a[2], 0.0];
+/// Effective wavelengths of the red, green and blue primaries in vacuum, m.
+pub const WAVELENGTHS: [f32; 3] = [610.0e-9, 550.0e-9, 465.0e-9];
+/// Thickness of a body of liquid along the view, cells (composite.frag: LV_BODY).
+pub const LV_BODY: f32 = 16.0;
+/// Most specks of one liquid drawn per cell (spray.comp's pool holds `DUST_MAX` of them); a
+/// denser dust is drawn as this many, and the rest is part of the liquid's colour.
+pub const DUST_DRAW_MAX: f32 = 4.0;
+/// Volume fraction of specks lying packed on the floor (random close packing of grains).
+pub const DUST_PACKING: f32 = 0.6;
+/// Drainage time of the films of water's foam, s; it scales with the viscosity (Reynolds
+/// thinning of a film between two bubbles, h(t) = h0 / sqrt(1 + t / tau), tau ~ mu).
+pub const FOAM_DRAIN_WATER: f32 = 0.02;
+/// Boltzmann's constant times room temperature, J.
+const KT: f32 = 1.380_649e-23 * 293.15;
+
+/// Shape of a particle of diameter `d` (m) and thickness over diameter `r`: its mean
+/// projected area over its volume (Cauchy: a quarter of its surface, 1/m), its mean chord
+/// through it scaled so that a sphere's is its diameter, and the diameter of the sphere of
+/// its volume. Above r = 2/3 it is taken as a sphere.
+fn particle_shape(d: f32, r: f32) -> (f32, f32, f32) {
+    let d = d.max(1e-9);
+    if r >= 2.0 / 3.0 {
+        return (1.5 / d, d, d);
     }
-    // A weakly scattering liquid (honey) is mostly seen by the light through it: its
-    // absorption blends from the clear one's to the one its albedo asks for, by `scatter`.
-    let sc = m.scatter.clamp(0.0, 1.0);
-    let ss = 3.0 * sc / depth;
-    let a = lin.map(|r| {
+    let t = d * r.max(0.005);
+    let area_over_vol = (0.5 * d + t) / (d * t);
+    let chord = 1.5 * d * t / (0.5 * d + t);
+    (area_over_vol, chord, d * (1.5 * r.max(0.005)).cbrt())
+}
+
+/// Scattering efficiency of a particle of relative refractive index `m`: Rayleigh's for
+/// size parameter `x_vol` (of its volume's sphere) where that is the smaller, the anomalous
+/// diffraction of van de Hulst (phase shift 2 x (m - 1) along a chord of size parameter
+/// `x_path`) where the particle is large. Rayleigh's x⁴ makes fine particles scatter blue.
+pub fn scattering_efficiency(x_vol: f32, x_path: f32, m: f32) -> f32 {
+    let m = m.max(1e-3);
+    let k = (m * m - 1.0) / (m * m + 2.0);
+    let qr = 8.0 / 3.0 * x_vol.powi(4) * k * k;
+    let rho = 2.0 * x_path * (m - 1.0).abs();
+    let qa = if rho < 1e-2 { 0.5 * rho * rho } else { 2.0 - 4.0 / rho * rho.sin() + 4.0 / (rho * rho) * (1.0 - rho.cos()) };
+    if qr <= 0.0 || qa <= 0.0 {
+        return 0.0;
+    }
+    1.0 / (1.0 / qr + 1.0 / qa)
+}
+
+/// Asymmetry of the light a particle scatters (mean cosine): none for a small one, mostly
+/// forwards for a large one, the more so the nearer its index is to the liquid's (red cells
+/// in plasma 0.98, milk fat 0.95, titanium white ~0.5).
+pub fn asymmetry(x: f32, m: f32) -> f32 {
+    let large = (1.0 - 0.6 * (m - 1.0).abs()).clamp(0.3, 0.98);
+    large * x * x / (x * x + 2.5)
+}
+
+/// Single-scattering albedo from the colour of a deep layer of a medium (two-stream /
+/// Hapke: R = (1 - q) / (1 + q), q = sqrt(1 - albedo)), per channel, linear.
+fn albedo_of(color: [f32; 3]) -> [f32; 3] {
+    linear(color).map(|r| {
+        let r = r.clamp(1e-3, 0.995);
         let q = (1.0 - r) / (1.0 + r);
-        let w = (1.0 - q * q).max(1e-4);
-        let clear = -r.ln() / depth;
-        clear + sc * (ss * (1.0 - w) / w - clear)
+        (1.0 - q * q).max(1e-4)
+    })
+}
+
+/// The fine particles' reduced scattering per channel (1/cell, `cell` m) and their
+/// asymmetry, in a liquid of refractive index `n_med`.
+pub fn cloud_scattering(m: &MatProps, cell: f32) -> ([f32; 3], f32) {
+    if m.cloud <= 0.0 {
+        return ([0.0; 3], 0.0);
+    }
+    let (a_v, chord, d_eq) = particle_shape(m.cloud_size, m.cloud_shape);
+    let n_med = m.ior.max(1.0);
+    let rel = m.cloud_ior / n_med;
+    let mut s = [0.0; 3];
+    let mut g_sum = 0.0;
+    for c in 0..3 {
+        let k = std::f32::consts::PI * n_med / WAVELENGTHS[c];
+        let q = scattering_efficiency(k * d_eq, k * chord, rel);
+        let g = asymmetry(k * d_eq, rel);
+        g_sum += g;
+        s[c] = m.cloud.clamp(0.0, 0.74) * a_v * q * (1.0 - g) * cell;
+    }
+    (s, g_sum / 3.0)
+}
+
+/// Absorption (linear RGB, 1/cell) and the scattering coefficients per channel of a
+/// material with dissolved colour `color`: what is dissolved absorbs so that `tint_depth`
+/// cells of it pass `color`; the fine particles scatter (`cloud_scattering`) and absorb what
+/// makes a deep layer of them `cloud_color` (albedo w per channel: a = s (1 - w) / w).
+/// A metal is drawn by the colour of what it reflects: its coefficients blend, by `metal`,
+/// to those of a deep layer of colour `color` (six scatterings per cell).
+pub fn coefficients(m: &MatProps, color: [f32; 3], cell: f32) -> ([f32; 3], [f32; 3]) {
+    let depth = tint_depth(m);
+    let lin = linear(color).map(|v| v.clamp(1e-3, 0.995));
+    let (s, _) = cloud_scattering(m, cell);
+    let w = albedo_of(m.cloud_color);
+    let mut a = [0.0; 3];
+    let mut sc = s;
+    for c in 0..3 {
+        a[c] = -lin[c].ln() / depth + s[c] * (1.0 - w[c]) / w[c];
+    }
+    if m.metal > 0.0 {
+        let wm = albedo_of(color);
+        let k = m.metal.clamp(0.0, 1.0);
+        for c in 0..3 {
+            let sm = 6.0;
+            a[c] += k * (sm * (1.0 - wm[c]) / wm[c] - a[c]);
+            sc[c] += k * (sm - sc[c]);
+        }
+    }
+    // (Beyond this a cell is opaque many times over; the cell optics are half floats.)
+    (a.map(|v| v.min(MAX_COEFFICIENT)), sc.map(|v| v.min(MAX_COEFFICIENT)))
+}
+
+/// Largest absorption or scattering coefficient kept, 1/cell.
+pub const MAX_COEFFICIENT: f32 = 2000.0;
+
+/// `coefficients` packed as the shaders take them: absorption (RGB) and the mean scattering.
+fn packed(a: [f32; 3], s: [f32; 3]) -> [f32; 4] {
+    [a[0], a[1], a[2], (s[0] + s[1] + s[2]) / 3.0]
+}
+
+/// What the liquid looks like as a few cells of it lit from the front over a pale ground,
+/// sRGB: its swatch colour in the interface (optics.glsl: film_colour).
+pub fn appearance(m: &MatProps, cell: f32) -> [f32; 3] {
+    let (a, s) = coefficients(m, m.color, cell);
+    let film = 1.5;
+    let mut out = [0.0; 3];
+    for c in 0..3 {
+        let w = s[c] / (a[c] + s[c]).max(1e-6);
+        let q = (1.0 - w).max(0.0).sqrt();
+        let r_inf = (1.0 - q) / (1.0 + q);
+        let tv = (-2.0 * (a[c] + s[c]) * film).exp();
+        out[c] = r_inf * (1.0 - tv) + 0.8 * tv * (-2.0 * a[c] * film).exp();
+    }
+    gamma(out)
+}
+
+/// How full and rounded a liquid's shapes are drawn (0 .. 1): a viscous liquid holds fat,
+/// rounded forms (honey), one that does not wet beads up (mercury); water neither.
+pub fn fullness(m: &MatProps) -> f32 {
+    let ss = |x: f32, lo: f32, hi: f32| {
+        let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    ss(m.viscosity.max(1e-9).log10(), -5.3, -2.7).max(ss(m.contact_angle, 100.0, 145.0))
+}
+
+/// Unit of film thickness, m (film.comp: 0.1 mm).
+pub const FILM_UNIT: f32 = 1.0e-4;
+/// Evaporation rate of water at 20 °C from a thin film or a small drop in room air, m/s
+/// (diffusion-limited: D c_sat / L over features millimetres to centimetres wide, 1e-7 - 1e-6;
+/// a still pond, a few millimetres a day, is ten times slower).
+pub const EVAP_WATER: f32 = 1.0e-7;
+/// Speed of the liquid leaving a surface for the coat it leaves behind, m/s.
+pub const COAT_SPEED: f32 = 0.05;
+
+/// Share of the liquid that evaporates when a film of it dries: all but its dissolved solids
+/// and particles; nothing of a liquid that never boils (oil, the simple liquids).
+pub fn volatile_share(m: &MatProps) -> f32 {
+    if m.boil >= 1.0e8 && m.volatility <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - m.solids - m.cloud - m.dust).clamp(0.0, 1.0)
+}
+
+/// Saturation vapour pressure at `t` (°C) over that at the normal boiling point
+/// (Clausius-Clapeyron with Trouton's rule, L = 88 J/(mol K) x T_b: ln p = 10.6 (1 - T_b / T)).
+pub fn vapour_pressure(m: &MatProps, t: f32) -> f32 {
+    if m.boil >= 1.0e8 {
+        return 0.0;
+    }
+    let tb = m.boil + 273.15;
+    let tk = (t + 273.15).max(1.0);
+    (10.6 * (1.0 - tb / tk)).clamp(-60.0, 5.0).exp()
+}
+
+/// How fast a film of it thins by evaporation at `t` (°C), FILM_UNITs per second, at
+/// `speed` times real time: water's rate scaled by its vapour pressure (alcohol dries faster,
+/// liquid nitrogen at once, oil never).
+pub fn evaporation(m: &MatProps, t: f32, speed: f32) -> f32 {
+    let water = MatProps { boil: 100.0, ..Default::default() };
+    let rel = vapour_pressure(m, t) / vapour_pressure(&water, crate::sim::material::T_REF).max(1e-12);
+    let vol = if m.boil >= 1.0e8 && m.volatility > 0.0 { m.volatility * 50.0 } else { rel };
+    EVAP_WATER * vol * speed / FILM_UNIT
+}
+
+/// Whether the liquid freezes on a surface at room temperature at once (a melt: solidus
+/// above 300 °C): it skins over against it instead of leaving a film that runs.
+pub fn freezes_on_contact(m: &MatProps) -> bool {
+    m.freezes() && m.melt_lo > 300.0
+}
+
+/// Share of a surface a liquid wets: (1 + cos theta) / 2 of its contact angle (1 spreads,
+/// 0 beads and rolls off: mercury leaves no film). A melt leaves none.
+pub fn wetting(m: &MatProps) -> f32 {
+    if freezes_on_contact(m) {
+        return 0.0;
+    }
+    let w = 0.5 * (1.0 + m.contact_angle.to_radians().cos());
+    ((w - 0.15) / 0.85).clamp(0.0, 1.0)
+}
+
+/// Thickness of the coat a liquid leaves on a surface it drains from, FILM_UNITs
+/// (Landau-Levich-Derjaguin: h = 0.94 l_c Ca^(2/3), Ca = mu U / sigma, at most the capillary
+/// length l_c = sqrt(sigma / (rho g)); water ~20 µm, blood ~0.3 mm, honey a few mm), times
+/// how well it wets.
+pub fn coat_thickness(m: &MatProps, gravity: f32) -> f32 {
+    if freezes_on_contact(m) {
+        return 0.0;
+    }
+    let sigma = m.tension.max(1e-3);
+    let rho = m.density.max(1.0);
+    let lc = (sigma / (rho * gravity.max(0.1))).sqrt();
+    let ca = (m.viscosity * rho * COAT_SPEED / sigma).min(1.0);
+    let wet = 0.5 * (1.0 + m.contact_angle.to_radians().cos());
+    0.94 * lc * ca.powf(2.0 / 3.0) * wet / FILM_UNIT
+}
+
+/// How much more (or less) a dried deposit of the liquid scatters than its wet film. Rigid
+/// grains (dust; fine particles of index 1.5 and above: minerals, pigment, crystals) are left
+/// in air: their index step grows from n_p - n to n_p - 1, and they scatter
+/// ((n_p - 1) / (n_p - n))² as much (at most 6x): dried mud and salt lighten. Soft particles
+/// (cells, fat globules, below 1.5) coalesce with what is dissolved into a continuous glassy
+/// layer that scatters a third as much: dried blood is a darker, deeper red than wet.
+pub fn dry_scatter(m: &MatProps) -> f32 {
+    let rigid_cloud = m.cloud_ior >= 1.5;
+    let n = m.ior.max(1.0);
+    let gain = |np: f32| (((np - 1.0) / (np - n).abs().max(0.02)).powi(2)).clamp(1.0, 6.0);
+    let wr = m.dust + if rigid_cloud { m.cloud } else { 0.0 };
+    let ws = if rigid_cloud { 0.0 } else { m.cloud };
+    if wr + ws <= 0.0 {
+        return 1.0;
+    }
+    (wr * gain(if m.dust > 0.0 && !rigid_cloud { 1.55 } else { m.cloud_ior.max(1.55) }) + ws * 0.33) / (wr + ws)
+}
+
+/// Thin-film colours on a liquid that spreads over water as a thin layer (spreading
+/// coefficient S = sigma_water - sigma - sigma_against_water > 0, oil ~0.015 N/m) and bends
+/// light differently from it: how strongly they show (0 .. 1). Only on clear liquids.
+pub fn iridescence(m: &MatProps, pair: f32, cell: f32) -> f32 {
+    if m.group == PhaseGroup::Aqueous as u32 || m.group == PhaseGroup::Metal as u32 {
+        return 0.0;
+    }
+    let spread = 0.072 - m.tension - pair;
+    let (a, s) = coefficients(m, m.color, cell);
+    let murk = (a[0] + a[1] + a[2]) / 3.0 + (s[0] + s[1] + s[2]) / 3.0;
+    (spread / 0.01).clamp(0.0, 1.0) * ((m.ior - 1.33).abs() / 0.1).clamp(0.0, 1.0) * (1.0 - (murk / 1.5).clamp(0.0, 1.0))
+}
+
+/// A crust on a glowing melt: any liquid that freezes from incandescence (solidus above
+/// ~500 °C) skins over where its surface cools below its solidus (cell_optics.comp works out
+/// the skin's temperature).
+pub fn crust(m: &MatProps) -> f32 {
+    if !m.freezes() {
+        return 0.0;
+    }
+    ((m.melt_lo - 400.0) / 400.0).clamp(0.0, 1.0)
+}
+
+/// The specks of a material: how many are drawn per cell of it, and what each drawn one
+/// stands for in the liquid's colour (absorption RGB, reduced scattering; 1/cell).
+/// A column `LV_BODY` cells deep shows `(1 - exp(-tau)) / A` specks per cell of the view (A
+/// their mean projected area in cells², tau the column's optical depth): all of them when
+/// they are few, a face of them where they hide each other. Those not drawn are dust in the
+/// liquid's colour, laid down where the drawn ones are.
+pub fn dust_specks(m: &MatProps, cell: f32) -> (f32, [f32; 4]) {
+    if m.dust <= 0.0 {
+        return (0.0, [0.0; 4]);
+    }
+    let (a_v, _, _) = particle_shape(m.dust_size, m.dust_shape);
+    let phi = m.dust.clamp(0.0, 0.6);
+    // Geometric optics: an efficiency of 2 (half of it diffraction, sent forwards).
+    let sigma = phi * a_v * 2.0 * cell;
+    let s_red = 0.5 * sigma;
+    let area = m.dust_size * m.dust_size * mean_area_factor(m.dust_shape) / (cell * cell);
+    let tau = sigma * LV_BODY;
+    let n_vis = (1.0 - (-tau).exp()) / area.max(1e-9);
+    let n = n_vis.min(DUST_DRAW_MAX);
+    if n <= 1e-6 {
+        return (0.0, [0.0; 4]);
+    }
+    let undrawn = (1.0 - n / n_vis).max(0.0);
+    let w = albedo_of(m.dust_color);
+    let r0 = m.dust_reflect.clamp(0.0, 1.0);
+    let per = undrawn / n;
+    let a = w.map(|w| {
+        let w = r0 + (1.0 - r0) * w;
+        s_red * (1.0 - w) / w.max(1e-4) * per
     });
-    [a[0], a[1], a[2], ss]
+    (n, [a[0], a[1], a[2], s_red * per])
+}
+
+/// Mean projected area of a particle over its diameter squared (a quarter of its surface).
+fn mean_area_factor(r: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    if r >= 2.0 / 3.0 { 0.25 * pi } else { 0.25 * (0.5 * pi + pi * r.max(0.005)) }
 }
 
 /// The optics table for the live material table.
 pub fn optics_table(p: &super::SimParams) -> Vec<GpuOptics> {
+    let cell = p.cell_size;
     (0..MAX_MATERIALS)
         .map(|r| {
             let m: &MatProps = &p.mat[r];
             let sl = linear(m.color_solid);
+            let (a, s) = coefficients(m, m.color, cell);
+            let (ah, sh) = coefficients(m, m.color_hot, cell);
+            let mean = (s[0] + s[1] + s[2]) / 3.0;
+            let (_, g) = cloud_scattering(m, cell);
+            let ratio = if mean > 1e-9 { s.map(|v| v / mean) } else { [1.0; 3] };
+            // Platelets: the share of its look that is light they send back, and how they turn.
+            let plate_k = (1.0 - (m.cloud_shape / (2.0 / 3.0)).min(1.0)).max(0.0);
+            let am = (a[0] + a[1] + a[2]) / 3.0;
+            let plate = if m.cloud > 0.0 { plate_k * (1.0 - (-4.0 * mean).exp()) * mean / (mean + am + 1e-6) } else { 0.0 };
+            let eta = (m.viscosity * m.density).max(1e-6);
+            let dsz = m.cloud_size.max(1e-9);
+            let dr = if plate_k > 0.0 { 3.0 * KT / (4.0 * eta * dsz * dsz * dsz) } else { 0.0 };
+            let ar = m.cloud_shape.clamp(0.005, 1.0);
+            let bretherton = (ar * ar - 1.0) / (ar * ar + 1.0);
+            let (n_draw, per) = dust_specks(m, cell);
+            let dl = linear(m.dust_color);
+            let pack = if m.dust > 0.0 { n_draw * DUST_PACKING / m.dust.max(1e-6) } else { 0.0 };
+            let drain = FOAM_DRAIN_WATER * eta / 1.0e-3;
+            // Films (film.comp): what evaporates, how fast, and the coat it leaves.
+            let vshare = volatile_share(m);
+            let evap = evaporation(m, p.ambient_temp, p.drying);
+            let coat = coat_thickness(m, p.gravity);
+            let coat_dry_time = if vshare > 0.0 && evap > 0.0 { (coat.max(0.2) * vshare / evap).clamp(0.2, 600.0) } else { 600.0 };
             GpuOptics {
-                absorb: absorption(m),
+                absorb: packed(a, s),
                 solid: [sl[0], sl[1], sl[2], tint_depth(m)],
-                opt: [m.opacity, m.scatter, m.metal, m.gloss],
-                sty: [m.body, m.foam, m.dry_time, m.emissivity],
-                idx: [m.diluent, m.group as i32, 0, 0],
-                fx: [m.stain, m.glint, m.iridescence, m.crackle],
+                opt: [m.opacity, plate, m.metal, m.gloss],
+                sty: [fullness(m), m.foam, coat_dry_time, m.emissivity],
+                idx: [m.diluent, m.group as i32, (dry_scatter(m) * 1000.0).round() as i32, 0],
+                fx: [vshare, coat, iridescence(m, p.pair_tension[0][(m.group as usize).min(GROUPS - 1)], cell), crust(m)],
+                fx2: [m.froth, m.fizz, n_draw, drain],
+                lum: {
+                    let g = linear(m.glow_color);
+                    [g[0] * m.luminous, g[1] * m.luminous, g[2] * m.luminous, m.glow_shear]
+                },
+                hot: packed(ah, sh),
+                thermo: [m.thermo_lo, m.thermo_hi, wetting(m), if m.group == 0 && m.tension < 0.04 { 1.0 } else { 0.0 }],
+                scat: [ratio[0], ratio[1], ratio[2], g],
+                opt2: [m.ior, dr, bretherton, evap],
+                dust: per,
+                dust2: [0.5 * m.dust_size, m.dust_density, m.dust_shape, m.dust_reflect],
+                dcol: [dl[0], dl[1], dl[2], pack],
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fine particles scatter blue more than red (Rayleigh); coarse ones about evenly.
+    #[test]
+    fn fine_particles_scatter_blue() {
+        let fine = MatProps { cloud: 0.01, cloud_size: 0.05e-6, cloud_ior: 1.6, ..Default::default() };
+        let (s, g) = cloud_scattering(&fine, 0.01);
+        assert!(s[2] > 2.5 * s[0], "{s:?}");
+        assert!(g < 0.1);
+        let coarse = MatProps { cloud: 0.01, cloud_size: 20e-6, cloud_ior: 1.6, ..Default::default() };
+        let (s, g) = cloud_scattering(&coarse, 0.01);
+        assert!(s[2] < 1.3 * s[0], "{s:?}");
+        assert!(g > 0.8);
+        // Index matched: they vanish.
+        let matched = MatProps { cloud: 0.1, cloud_size: 2e-6, cloud_ior: 1.33, ..Default::default() };
+        assert!(cloud_scattering(&matched, 0.01).0[1] < 1e-6);
+    }
+
+    /// Milk's reduced scattering is about 2.5 per millimetre (fat globules, 3.5 %, 3 µm).
+    #[test]
+    fn milk_scatters_as_milk() {
+        let milk = MatProps { cloud: 0.035, cloud_size: 3e-6, cloud_ior: 1.46, ior: 1.35, ..Default::default() };
+        let (s, _) = cloud_scattering(&milk, 1e-3);
+        assert!(s[1] > 1.0 && s[1] < 6.0, "{s:?}");
+    }
+
+    /// A deep layer of a cloudy liquid has the colour of its particles.
+    #[test]
+    fn deep_layer_takes_the_particles_colour() {
+        let m = MatProps { cloud: 0.2, cloud_size: 2e-6, cloud_ior: 1.56, cloud_color: [0.6, 0.4, 0.2], color: [1.0; 3], ..Default::default() };
+        let (a, s) = coefficients(&m, m.color, 0.01);
+        let want = linear(m.cloud_color);
+        for c in 0..3 {
+            let w = s[c] / (a[c] + s[c]);
+            let q = (1.0 - w).sqrt();
+            let r = (1.0 - q) / (1.0 + q);
+            assert!((r - want[c]).abs() < 0.03, "{c}: {r} vs {}", want[c]);
+        }
+    }
+
+    /// Films: liquids dry in the order of their boiling points, a liquid that never boils not
+    /// at all; viscous liquids leave thicker coats; only the volatile part evaporates.
+    #[test]
+    fn films_follow_the_liquids() {
+        let b = |k: &str| (crate::sim::BUILTINS.iter().find(|x| x.key == k).unwrap().props)();
+        let e = |m: &MatProps| evaporation(m, T_REF, 1.0);
+        assert!(e(&b("nitrogen")) > e(&b("alcohol")) && e(&b("alcohol")) > e(&b("water")) && e(&b("water")) > 0.0);
+        assert_eq!(e(&b("oil")), 0.0);
+        let g = 9.81;
+        assert!(coat_thickness(&b("honey"), g) > coat_thickness(&b("blood"), g));
+        assert!(coat_thickness(&b("blood"), g) > 3.0 * coat_thickness(&b("water"), g));
+        assert!(coat_thickness(&b("mercury"), g) < coat_thickness(&b("water"), g));
+        assert_eq!(volatile_share(&b("water")), 1.0);
+        assert!(volatile_share(&b("blood")) < 0.6 && volatile_share(&b("blood")) > 0.3);
+        assert!(dry_scatter(&b("mud")) > 1.5 && dry_scatter(&b("blood")) < 1.0);
+    }
+
+    /// Specks: coarse and few are all drawn (nothing left for the colour); fine and many are
+    /// drawn up to the cap and the rest colours the liquid.
+    #[test]
+    fn specks_split_between_drawn_and_colour() {
+        let few = MatProps { dust: 1e-5, dust_size: 2e-3, ..Default::default() };
+        let (n, per) = dust_specks(&few, 0.01);
+        assert!(n > 0.0 && n < DUST_DRAW_MAX);
+        assert!(per[3] < 1e-6);
+        let many = MatProps { dust: 0.05, dust_size: 5e-5, ..Default::default() };
+        let (n, per) = dust_specks(&many, 0.01);
+        assert_eq!(n, DUST_DRAW_MAX);
+        assert!(per[3] > 0.1);
+    }
 }

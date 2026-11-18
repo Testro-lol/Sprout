@@ -7,7 +7,7 @@
 // that cell's mean temperature, so neighbouring cells jump: filtered bilinearly, ice was
 // drawn as staircases of whole cells and a half-mixed liquid as a grid of blocks and
 // diamonds. A 3 x 3 binomial kernel (sigma 0.7 cells) removes that cell-scale noise; 5 x 5
-// also blurred unmixed edges (a syrup stream in water) over two cells. Ice gets its crisp
+// also blurred unmixed edges (a honey stream in water) over two cells. Ice gets its crisp
 // outline back in the composite, from the smoothed frozen share.
 //
 // Every layer is premultiplied by the liquid's occupancy and share, and the composite divides
@@ -22,7 +22,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 58, rgba16f) uniform readonly image2DArray raw;
 layout(set = 0, binding = 60, rgba16f) uniform writeonly image2DArray smooth_out;
 
-const int LAYERS = 16;  // sim/mod.rs: CELL_OPTICS_LAYERS; layer 10 (drying time) only film.comp reads, unsmoothed
+const int LAYERS = 20;  // smoothed layers 0 - 19 (sim/mod.rs: CELL_OPTICS_LAYERS holds 24; 20 - 23 are sss.comp's); layer 10 (drying time) only film.comp reads, unsmoothed
 const int LIGHT_SPREAD = 14;     // cells each way
 const float LIGHT_SIGMA = 6.0;   // cells
 

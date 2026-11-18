@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use vulkano::{
-    command_buffer::{ClearColorImageInfo, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo},
+    command_buffer::{ClearColorImageInfo, DrawIndirectCommand, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo},
     descriptor_set::{DescriptorSet, WriteDescriptorSet},
     format::Format,
     image::{
@@ -85,6 +85,14 @@ impl View {
     pub fn fit(grid: [u32; 2], size: [u32; 2]) -> View {
         let zoom = (size[0] as f32 / grid[0] as f32).min(size[1] as f32 / grid[1] as f32);
         View { center: [grid[0] as f32 * 0.5, grid[1] as f32 * 0.5], zoom }
+    }
+
+    /// The view that shows the whole grid in the part of the target above its bottom
+    /// `below` pixels (which the interface's dock covers), centred in that part.
+    pub fn fit_above(grid: [u32; 2], size: [u32; 2], below: f32) -> View {
+        let height = (size[1] as f32 - below).max(size[1] as f32 * 0.25);
+        let zoom = (size[0] as f32 / grid[0] as f32).min(height / grid[1] as f32);
+        View { center: [grid[0] as f32 * 0.5, grid[1] as f32 * 0.5 - (size[1] as f32 - height) * 0.5 / zoom], zoom }
     }
 
     pub fn world_to_screen(&self, cells: [f32; 2], size: [u32; 2]) -> [f32; 2] {
@@ -169,7 +177,37 @@ struct CompositePc {
     film_layer: f32,
     flow_layer: f32,
     tint: f32,
+    look: f32,
+    sss: f32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LookPc {
+    scale: [f32; 2],
+    offset: [f32; 2],
+    radius: f32,
+    weight: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SpritePc {
+    scale: [f32; 2],
+    offset: [f32; 2],
+    half_res: [f32; 2],
+    grid: [i32; 2],
+    zoom: f32,
+    now: f32,
+    mode: u32,
+    cap: u32,
+    cell_size: f32,
+    sss: f32,
+}
+
+/// The look field (look.vert): kernel radius of a particle, cells. Narrower than the sharp
+/// field's so that a marble's veins and a film's swirls stay as fine as the particles.
+const LOOK_RADIUS: f32 = 1.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -229,6 +267,10 @@ struct Targets {
     composite_set: Arc<DescriptorSet>,
     /// The vapour field (steam.vert), laid out as `accum`: bubbles, puffs.
     vapour: Arc<Framebuffer>,
+    /// The look field (look.vert), laid out as `accum`: platelets' sheen, carried scalar,
+    /// grain, weight; and whether it was drawn into last (else it is cleared once).
+    look: Arc<Framebuffer>,
+    look_dirty: std::cell::Cell<bool>,
     /// Whether the vapour field may hold anything (it is drawn into, or new): without steam
     /// it is cleared once, not every frame (a 1080p clear costs ~0.1 ms).
     vapour_dirty: std::cell::Cell<bool>,
@@ -277,9 +319,14 @@ pub struct Renderer {
     /// stains, carried patterns. All share one layout.
     composite: Vec<Arc<GraphicsPipeline>>,
     steam: Arc<GraphicsPipeline>,
+    look_pipe: Arc<GraphicsPipeline>,
+    /// Bubbles, foam, spray and flakes over the shaded liquid (sprite.vert), in the final pass.
+    sprite: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
     splat_set: Option<Arc<DescriptorSet>>,
     steam_set: Option<Arc<DescriptorSet>>,
+    look_set: Option<Arc<DescriptorSet>>,
+    sprite_set: Option<Arc<DescriptorSet>>,
     accum: Option<Targets>,
     targets: Vec<(Arc<ImageView>, Arc<Framebuffer>)>,
     /// Profiling (`sprout profile`): a timestamp after each pass of `render`.
@@ -472,7 +519,17 @@ impl Renderer {
                 .collect();
             jobs.into_iter().map(|j| j.join().unwrap()).collect()
         });
-        let steam = pipeline(&gpu, spirv!("steam.vert"), spirv!("steam.frag"), accum_subpass(), Some(additive));
+        let steam = pipeline(&gpu, spirv!("steam.vert"), spirv!("steam.frag"), accum_subpass(), Some(additive.clone()));
+        let look_pipe = pipeline(&gpu, spirv!("look.vert"), spirv!("look.frag"), accum_subpass(), Some(additive));
+        let premultiplied = AttachmentBlend {
+            src_color_blend_factor: BlendFactor::One,
+            dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
+            color_blend_op: BlendOp::Add,
+            src_alpha_blend_factor: BlendFactor::Zero,
+            dst_alpha_blend_factor: BlendFactor::One,
+            alpha_blend_op: BlendOp::Add,
+        };
+        let sprite = pipeline(&gpu, spirv!("sprite.vert"), spirv!("sprite.frag"), Subpass::from(final_pass.clone(), 0).unwrap(), Some(premultiplied));
         let sampler = Sampler::new(
             device,
             SamplerCreateInfo {
@@ -499,9 +556,13 @@ impl Renderer {
             blur,
             composite,
             steam,
+            look_pipe,
+            sprite,
             sampler,
             splat_set: None,
             steam_set: None,
+            look_set: None,
+            sprite_set: None,
             accum: None,
             targets: Vec::new(),
             timing: None,
@@ -525,6 +586,8 @@ impl Renderer {
         self.accum = None;
         self.splat_set = None;
         self.steam_set = None;
+        self.look_set = None;
+        self.sprite_set = None;
         self.wet = None;
     }
 
@@ -674,6 +737,7 @@ impl Renderer {
         )
         .unwrap();
         let (vapour_view, vapour) = self.field_target(extent);
+        let (look_view, look) = self.field_target(extent);
 
         let wide_extent = [
             (extent[0] as f32 / WIDE_MIN_FACTOR).ceil().max(1.0) as u32,
@@ -708,6 +772,7 @@ impl Renderer {
                 WriteDescriptorSet::image_view_sampler(11, sim.flow_view().0.clone(), self.sampler.clone()),
                 WriteDescriptorSet::image_view_sampler(12, conc_view, self.sampler.clone()),
                 WriteDescriptorSet::image_view_sampler(13, share_view, self.sampler.clone()),
+                WriteDescriptorSet::image_view_sampler(14, look_view, self.sampler.clone()),
             ],
             [],
         )
@@ -724,6 +789,8 @@ impl Renderer {
             composite_set,
             vapour,
             vapour_dirty: std::cell::Cell::new(true),
+            look,
+            look_dirty: std::cell::Cell::new(true),
         });
     }
 
@@ -762,6 +829,39 @@ impl Renderer {
                     self.gpu.descriptors.clone(),
                     self.steam.layout().set_layouts()[0].clone(),
                     [WriteDescriptorSet::buffer(0, sim.particle_buffer().clone())],
+                    [],
+                )
+                .unwrap(),
+            );
+        }
+        if self.look_set.is_none() {
+            let (lctl, plook, _) = sim.look_buffers();
+            self.look_set = Some(
+                DescriptorSet::new(
+                    self.gpu.descriptors.clone(),
+                    self.look_pipe.layout().set_layouts()[0].clone(),
+                    [
+                        WriteDescriptorSet::buffer(0, sim.particle_buffer().clone()),
+                        WriteDescriptorSet::buffer(1, plook.clone()),
+                        WriteDescriptorSet::buffer(2, lctl.clone()),
+                    ],
+                    [],
+                )
+                .unwrap(),
+            );
+        }
+        if self.sprite_set.is_none() {
+            let (dpart, dctl, _) = sim.diffuse_buffers();
+            self.sprite_set = Some(
+                DescriptorSet::new(
+                    self.gpu.descriptors.clone(),
+                    self.sprite.layout().set_layouts()[0].clone(),
+                    [
+                        WriteDescriptorSet::buffer(3, dpart.clone()),
+                        WriteDescriptorSet::buffer(4, dctl.clone()),
+                        WriteDescriptorSet::buffer(5, sim.optics_buffer().clone()),
+                        WriteDescriptorSet::image_view_sampler(6, sim.cell_optics_view().clone(), self.sampler.clone()),
+                    ],
                     [],
                 )
                 .unwrap(),
@@ -870,7 +970,7 @@ impl Renderer {
         // Pass 1b: the vapour field (bubbles and puffs of steam), in the same layout. Without
         // steam it is only cleared once: the composite pass binds it (and ignores it,
         // `vapour` 0), so it has to hold something.
-        let steam = sim.has_steam() && sim.slots() > 0;
+        let steam = sim.has_vapour() && sim.slots() > 0;
         if steam || t.vapour_dirty.replace(steam) {
             let (size, d) = (accum_size, div);
             let padded = [size[0] as f32 * d * 0.5, size[1] as f32 * d * 0.5];
@@ -897,6 +997,41 @@ impl Renderer {
                     .unwrap();
                 // SAFETY: as the splat: gl_VertexIndex / 3 stays below the slot count.
                 unsafe { b.draw(sim.slots() * 3, 1, 0, 0) }.unwrap();
+            }
+            b.end_render_pass(SubpassEndInfo::default()).unwrap();
+        }
+
+        // Pass 1c: the look field (look.vert), the particles look.comp listed, in the same
+        // layout. Without such a liquid it is cleared once (the composite binds it).
+        let (lctl, _, look_live) = sim.look_buffers();
+        if look_live || t.look_dirty.replace(look_live) {
+            let (size, d) = (accum_size, div);
+            let padded = [size[0] as f32 * d * 0.5, size[1] as f32 * d * 0.5];
+            let scale = [view.zoom / padded[0], -view.zoom / padded[1]];
+            b.begin_render_pass(clear(&t.look), inline()).unwrap();
+            if look_live {
+                let r = LOOK_RADIUS.max(SPLAT_MIN_TEXELS * d / view.zoom);
+                b.bind_pipeline_graphics(self.look_pipe.clone())
+                    .unwrap()
+                    .set_viewport(0, [viewport(size)].into_iter().collect())
+                    .unwrap()
+                    .bind_descriptor_sets(PipelineBindPoint::Graphics, self.look_pipe.layout().clone(), 0, self.look_set.clone().unwrap())
+                    .unwrap()
+                    .push_constants(
+                        self.look_pipe.layout().clone(),
+                        0,
+                        LookPc {
+                            scale,
+                            offset: [-view.center[0] * scale[0] + half[0] / padded[0] - 1.0, -view.center[1] * scale[1] + half[1] / padded[1] - 1.0],
+                            radius: r,
+                            weight: (LOOK_RADIUS / r).powi(2),
+                        },
+                    )
+                    .unwrap();
+                // SAFETY: look.comp writes at most `capacity` slots into the list and three
+                // vertices per entry into the command; the vertex shader reads entry
+                // gl_VertexIndex / 3.
+                unsafe { b.draw_indirect(lctl.clone().slice(0..4).reinterpret::<[DrawIndirectCommand]>()) }.unwrap();
             }
             b.end_render_pass(SubpassEndInfo::default()).unwrap();
         }
@@ -991,10 +1126,37 @@ impl Renderer {
                     film_layer: sim.film_views().2 as f32,
                     flow_layer: sim.flow_view().1 as f32,
                     tint: if tint_live { 1.0 } else { 0.0 },
+                    look: if look_live { 1.0 } else { 0.0 },
+                    sss: if sim.params.sss_iters > 0 { 1.0 } else { 0.0 },
                 },
             )
             .unwrap();
         unsafe { b.draw(3, 1, 0, 0) }.unwrap();
+        // Bubbles, foam, spray and specks over the shaded liquid (sprite.vert).
+        let (_, dctl, diffuse_live) = sim.diffuse_buffers();
+        if diffuse_live {
+            let scale = [view.zoom / half[0], -view.zoom / half[1]];
+            let pc = |mode: u32| SpritePc {
+                scale,
+                offset: [-view.center[0] * scale[0], -view.center[1] * scale[1]],
+                half_res: half,
+                grid: [sim.grid[0] as i32, sim.grid[1] as i32],
+                zoom: view.zoom,
+                now: sim.sim_time() as f32,
+                mode,
+                cap: sim.capacity,
+                cell_size: sim.params.cell_size,
+                sss: if sim.params.sss_iters > 0 { 1.0 } else { 0.0 },
+            };
+            b.bind_pipeline_graphics(self.sprite.clone())
+                .unwrap()
+                .bind_descriptor_sets(PipelineBindPoint::Graphics, self.sprite.layout().clone(), 0, self.sprite_set.clone().unwrap())
+                .unwrap();
+            b.push_constants(self.sprite.layout().clone(), 0, pc(0)).unwrap();
+            // SAFETY: spray.comp lists each live entry once (six vertices each) and the
+            // vertex shader reads entry gl_VertexIndex / 6.
+            unsafe { b.draw_indirect(dctl.clone().slice(4..8).reinterpret::<[DrawIndirectCommand]>()) }.unwrap();
+        }
         overlay(b);
         b.end_render_pass(SubpassEndInfo::default()).unwrap();
         stamp(b, 5, &timing);

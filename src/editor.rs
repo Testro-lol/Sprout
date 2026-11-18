@@ -26,6 +26,7 @@ use crate::{
     render::View,
     scene::Scene,
     sim::{BUILTINS, FluidSim, MAT_PARAMS, MatProps, Material, Particle, SimParams, ToolState, pickable},
+    ui::{icons::Icon, theme, widgets},
     world::World,
 };
 
@@ -271,16 +272,16 @@ fn tile(ui: &mut egui::Ui, tex: egui::TextureId, name: &str, selected: bool) -> 
     let (rect, r) = ui.allocate_exact_size(egui::vec2(TILE.x, TILE.y + label_h), egui::Sense::click());
     let img = egui::Rect::from_min_size(rect.min, TILE);
     let p = ui.painter();
-    let v = ui.style().interact_selectable(&r, selected);
-    p.rect_filled(img.expand(2.0), 5.0, v.weak_bg_fill);
+    let hover = widgets::glide_bool(ui.ctx(), r.id.with("h"), r.hovered(), 22.0);
+    p.rect_filled(img.expand(2.0), theme::leaf(9), if selected { theme::fade(theme::LEAF, 0.35) } else { theme::mix(theme::RAISED, theme::HOVER, hover) });
     // The swatch is a small tank with the drop on its floor: show the drop, not the walls.
     let uv = egui::Rect::from_min_max(egui::pos2(0.1, 0.36), egui::pos2(0.9, 0.95));
     p.image(tex, img, uv, Color32::WHITE);
-    if selected || r.hovered() {
-        p.rect_stroke(img.expand(2.0), 5.0, v.bg_stroke, egui::StrokeKind::Outside);
+    if selected {
+        p.rect_stroke(img.expand(2.0), theme::leaf(9), theme::stroke(1.5, theme::LEAF), egui::StrokeKind::Outside);
     }
-    let font = egui::FontId::proportional(11.0);
-    let colour = if selected { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    let font = theme::body(11.0);
+    let colour = if selected { theme::LEAF } else { theme::mix(theme::TEXT_WEAK, theme::TEXT, hover) };
     // One line, elided with "…" when the name is longer than the tile.
     let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), font, colour);
     job.wrap = egui::text::TextWrapping::truncate_at_width(TILE.x + 4.0);
@@ -308,25 +309,26 @@ pub fn picker(ctx: &egui::Context, ed: &mut LiquidEditor, sw: &mut Swatches, wor
     let width = TILE_COLUMNS as f32 * (TILE.x + 6.0) - 6.0;
     egui::Window::new("Liquids")
         .title_bar(false)
-        .default_pos([340.0, 14.0])
+        .default_pos([84.0, 70.0])
         .resizable(false)
         .min_width(width)
         .max_width(width)
         .frame(egui::Frame::window(&ctx.style()).inner_margin(10))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Liquids").strong());
+                ui.label(RichText::new("Liquids").font(theme::display(15.0)).color(theme::TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("×").on_hover_text("Close").clicked() {
+                    if widgets::icon_button(ui, Icon::Close, "Close  (Esc)", None).clicked() {
                         ed.picker_open = false;
                     }
-                    if ui.small_button("+ New").on_hover_text("A new liquid, starting from water").clicked() {
+                    if widgets::button(ui, "+ New", Some(theme::LEAF)).on_hover_text("A new liquid, starting from water").clicked() {
                         ed.duplicate(world, Material::Water.index());
                     }
                 });
             });
             ui.add(egui::TextEdit::singleline(&mut ed.search).hint_text("Search").desired_width(f32::INFINITY));
-            egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
+            let height = (ctx.screen_rect().height() - 330.0).clamp(160.0, 420.0);
+            egui::ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
                 let cats = picker_rows(world, &ed.search);
                 if cats.is_empty() {
@@ -334,7 +336,7 @@ pub fn picker(ctx: &egui::Context, ed: &mut LiquidEditor, sw: &mut Swatches, wor
                 }
                 for (category, rows) in cats {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(category.to_uppercase()).small().weak());
+                    ui.label(RichText::new(category).font(theme::display(11.0)).color(theme::fade(theme::LEAF, 0.85)));
                     ui.add_space(1.0);
                     for chunk in rows.chunks(TILE_COLUMNS) {
                         ui.horizontal(|ui| {
@@ -391,11 +393,11 @@ pub fn editor(ctx: &egui::Context, ed: &mut LiquidEditor, sw: &mut Swatches, wor
     let mut open = ed.open;
     let now = ctx.input(|i| i.time);
     let frame = egui::Frame::window(&ctx.style()).inner_margin(10);
-    egui::Window::new("Liquid editor").title_bar(false).frame(frame).default_pos([630.0, 14.0]).default_width(320.0).show(ctx, |ui| {
+    egui::Window::new("Liquid editor").title_bar(false).frame(frame).default_pos([372.0, 70.0]).default_width(320.0).show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Liquid editor").strong());
+            ui.label(RichText::new("Liquid editor").font(theme::display(15.0)).color(theme::TEXT));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("×").on_hover_text("Close").clicked() {
+                if widgets::icon_button(ui, Icon::Close, "Close  (Esc)", None).clicked() {
                     open = false;
                 }
             });
@@ -407,15 +409,15 @@ pub fn editor(ctx: &egui::Context, ed: &mut LiquidEditor, sw: &mut Swatches, wor
             ui.vertical(|ui| {
                 if st.builtin {
                     ui.label(RichText::new(&ed.name).strong());
-                    ui.label(RichText::new("Built-in: read-only").small().color(Color32::from_rgb(240, 180, 90)));
+                    ui.label(RichText::new("Built-in: read-only").small().color(theme::WARN));
                 } else {
                     ui.text_edit_singleline(&mut ed.name);
                 }
                 // Which state is being changed, said plainly.
                 let (text, colour) = match (st.unapplied, st.unsaved) {
-                    (true, _) => ("Editing the DRAFT: not applied to the tank yet", Color32::from_rgb(240, 180, 90)),
-                    (false, true) => ("LIVE in the tank, not saved to the file", Color32::from_rgb(110, 190, 255)),
-                    (false, false) => ("Live and saved", Color32::from_rgb(120, 228, 160)),
+                    (true, _) => ("Editing the DRAFT: not applied to the tank yet", theme::WARN),
+                    (false, true) => ("LIVE in the tank, not saved to the file", theme::WATER),
+                    (false, false) => ("Live and saved", theme::LEAF),
                 };
                 ui.label(RichText::new(text).small().color(colour));
             });
@@ -425,19 +427,26 @@ pub fn editor(ctx: &egui::Context, ed: &mut LiquidEditor, sw: &mut Swatches, wor
         let row = ed.row;
         ui.add_enabled_ui(!st.builtin, |ui| {
             egui::Grid::new("common").num_columns(2).show(ui, |ui| {
-                colour_row(ui, "Colour", &mut scratch.mat[row].color);
+                colour_row(ui, "Dissolved colour", &mut scratch.mat[row].color);
                 slider(ui, &mut scratch, row, "viscosity", "Thickness");
                 slider(ui, &mut scratch, row, "density", "Density");
                 slider(ui, &mut scratch, row, "spawn_temp", "Temperature");
                 slider(ui, &mut scratch, row, "opacity", "Opacity");
+                slider(ui, &mut scratch, row, "cloud", "Cloudiness");
+                slider(ui, &mut scratch, row, "dust", "Specks");
             });
-            let groups: [(&str, &[&str]); 7] = [
+            let groups: [(&str, &[&str]); 12] = [
                 ("Flow (rheology)", &["rheology", "yield_stress", "flow_index", "shear_time", "visc_ratio", "temp_model", "temp_b", "temp_c", "temp_ref"]),
                 ("Surface", &["tension", "contact_angle", "skin"]),
                 ("Heat and freezing", &["heat_capacity", "conductivity", "melt_lo", "melt_hi", "latent", "density_solid", "emissivity", "boil", "latent_vap"]),
-                ("Mixing and suspension", &["mix_rate", "grain", "load", "freeze_shift", "residue_share"]),
+                ("Mixing and suspension", &["mix_rate", "grain", "load", "solids", "freeze_shift", "residue_share"]),
                 ("Elastic and magnetic", &["shear_modulus", "relax_time", "susceptibility", "saturation"]),
-                ("Look", &["scatter", "metal", "gloss", "body", "foam", "dry_time", "stain", "glint", "iridescence", "crackle"]),
+                ("Look", &["ior", "metal", "gloss"]),
+                ("Cloudiness (fine particles)", &["cloud", "cloud_size", "cloud_ior", "cloud_shape"]),
+                ("Specks (coarse particles)", &["dust", "dust_size", "dust_density", "dust_shape", "dust_reflect"]),
+                ("Foam, bubbles and vapour", &["foam", "froth", "fizz", "volatility", "fume"]),
+                ("Light and heat colour", &["luminous", "glow_shear", "thermo_lo", "thermo_hi"]),
+                ("Grains, heat and reactions", &["friction", "self_heat", "react_rate", "react_heat"]),
                 ("Phase", &[]),
             ];
             for (title, keys) in groups {
@@ -448,6 +457,35 @@ pub fn editor(ctx: &egui::Context, ed: &mut LiquidEditor, sw: &mut Swatches, wor
                         }
                         if title == "Look" {
                             colour_row(ui, "Frozen colour", &mut scratch.mat[row].color_solid);
+                        }
+                        if title == "Cloudiness (fine particles)" {
+                            colour_row(ui, "Particle colour", &mut scratch.mat[row].cloud_color);
+                        }
+                        if title == "Specks (coarse particles)" {
+                            colour_row(ui, "Speck colour", &mut scratch.mat[row].dust_color);
+                        }
+                        if title == "Light and heat colour" {
+                            colour_row(ui, "Glow colour", &mut scratch.mat[row].glow_color);
+                            colour_row(ui, "Hot colour", &mut scratch.mat[row].color_hot);
+                        }
+                        if title == "Grains, heat and reactions" {
+                            // The partner and the product: any other liquid of the table.
+                            for (label, salt, product) in [("Reacts with", "react_with", false), ("Turns into", "react_into", true)] {
+                                ui.label(label);
+                                let cur = if product { scratch.mat[row].react_into } else { scratch.mat[row].react_with };
+                                let name_of = |r: i32| if r < 0 { "nothing".to_string() } else { world.library.name(r as usize) };
+                                let mut pick = cur;
+                                egui::ComboBox::from_id_salt(salt).selected_text(name_of(cur)).show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut pick, -1, "nothing");
+                                    for r in 0..scratch.mat_count {
+                                        if r != row {
+                                            ui.selectable_value(&mut pick, r as i32, name_of(r as i32));
+                                        }
+                                    }
+                                });
+                                if product { scratch.mat[row].react_into = pick } else { scratch.mat[row].react_with = pick }
+                                ui.end_row();
+                            }
                         }
                         if title == "Phase" {
                             ui.label("Phase group");
@@ -471,32 +509,35 @@ pub fn editor(ctx: &egui::Context, ed: &mut LiquidEditor, sw: &mut Swatches, wor
             }
         });
         ed.draft = scratch.mat[row];
-        ui.separator();
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
             if st.builtin {
-                if ui.button("Duplicate to edit").clicked() {
+                if widgets::button(ui, "Duplicate to edit", Some(theme::LEAF)).clicked() {
                     ed.duplicate(world, row);
                 }
             } else {
-                if ui.add_enabled(st.unapplied, egui::Button::new("Apply")).on_hover_text("Draft -> the liquid in the tank").clicked() {
-                    ed.apply(world);
-                }
-                if ui.button("Save").on_hover_text("Apply and write the liquids file").clicked() {
+                ui.add_enabled_ui(st.unapplied, |ui| {
+                    if widgets::button(ui, "Apply", None).on_hover_text("Draft -> the liquid in the tank").clicked() {
+                        ed.apply(world);
+                    }
+                });
+                if widgets::button(ui, "Save", Some(theme::LEAF)).on_hover_text("Apply and write the liquids file").clicked() {
                     ed.save(world);
                 }
-                if ui.button("Revert").on_hover_text("Draft <- the saved definition").clicked() {
+                if widgets::button(ui, "Revert", None).on_hover_text("Draft <- the saved definition").clicked() {
                     ed.revert(world);
                 }
-                if ui.button("Duplicate").clicked() {
+                if widgets::button(ui, "Duplicate", None).clicked() {
                     ed.duplicate(world, row);
                 }
-                if ui.button(RichText::new("Delete").color(Color32::from_rgb(255, 110, 96))).clicked() {
+                if widgets::button(ui, "Delete", Some(theme::DANGER)).clicked() {
                     ed.delete(world);
                 }
             }
         });
         if let Some((m, ok)) = &ed.message {
-            ui.label(RichText::new(m).small().color(if *ok { Color32::from_gray(190) } else { Color32::from_rgb(255, 110, 96) }));
+            ui.label(RichText::new(m).small().color(if *ok { theme::TEXT_WEAK } else { theme::DANGER }));
         }
     });
     ed.open = ed.open && open;

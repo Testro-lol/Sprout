@@ -24,19 +24,32 @@
 //   8  stain, glint, iridescence, crackle (the effects of composite.frag)
 //   9  the key light that reaches the cell through the liquid above it (linear RGB, filled
 //      in by light.comp), quenched skin share of a melt (below)
-//  10  drying time (s, for the film map: film.comp); not smoothed
+//  10  the coat the liquid leaves on a surface (FILM_UNITs, for the film map: film.comp); not
+//      smoothed (light.comp keeps yzw)
 //  11  absorption and scattering of the dense groups (liquid metals, melts) x their share;
 //      layer 1 then holds the oil-like group alone, 5 a their share and 6 a their frozen share
 //  12  the look key of the cell's liquid (optics.glsl: look_key of all its coefficients), 1,
 //      x the occupancy: composite.frag compares it with the key of the particles under a
 //      pixel (README, "Look")
-//  13  ferrofluid spikes (below): the field's direction x the spikes' height (cells), unused,
-//      the spikes' spacing (cells); written in every cell (the spikes stand in the air)
+//  13  ferrofluid spikes (below): the field's direction x the spikes' height (cells), the
+//      liquid's volatile share x the occupancy (film.comp), the spikes' spacing (cells);
+//      written in every cell (the spikes stand in the air)
 //  15  absorption (rgb) of the aqueous plain and diluent liquid x its share, that share; x
 //      the occupancy (composite.frag: the particles' colour, particle_absorb)
+//  16  froth (s), fizz (x the occupancy); the reduced scattering in red and in blue over its
+//      mean (1 where nothing scatters; not x the occupancy): the colour of the scattering
+//      (fine particles scatter blue)
+//  17  the liquid's own light (linear RGB; also part of the emission in layer 3, for the
+//      bloom), refractive index
+//  18  the specks' share of the colour: absorption (rgb) and scattering of the specks too many
+//      to draw, laid down where the drawn ones are (spray.comp: the dust field)
+//  19  absorption (rgb) and scattering for light passing through (light.comp, sss.comp), x
+//      the share, x the occupancy: as layers 0, 1, 11 together, but a clear plain liquid
+//      (no scattering, opacity under 0.2: water, brine, alcohol) takes no colour out of light
+//      (its tint is the look of a deep body; README, "Light and colour from absorption")
 //  14  where the spikes stand: cos and sin of 2 pi x the distance round the nearest magnet in
 //      spacings / SPIKE_PHASE_DIV (spike_phase), in every cell; the magnetisable share x the
-//      occupancy
+//      occupancy; the row + 1 of the liquid that holds most of the cell (film.comp)
 // A concentrate's coefficients blend with its diluent's linearly in its concentration, as a
 // dissolved dye's absorbance does (Beer's law), and so does every other property.
 // A frozen share loses gloss here; its colour is kept apart (layers 5 - 7) so that the
@@ -59,6 +72,7 @@ layout(push_constant) uniform OPC {
     float spike_gap;   // spacing of ferrofluid spikes, cells (0: no magnet or no magnetisable liquid)
     float spike_mc;    // mu0 Mc of the most susceptible liquid, T: the Rosensweig threshold
     float spike_k;     // height of a full spike over its spacing
+    float dust;        // 1: read the dust field (a liquid with specks in the tank)
 } OP;
 
 // Ferrofluid spikes (README, "Magnetism"). A magnetisable liquid whose surface faces a field
@@ -107,6 +121,9 @@ layout(set = 0, binding = 58, rgba16f) uniform writeonly image2DArray cellopt;
 // The film map's tile flags (film_tiles.comp): section 4, liquid (bit 0) and staining liquid
 // (bit 1) in the tile's cells; the caller clears it first.
 layout(std430, set = 0, binding = 74) buffer FilmTileBuf { uint ftile[]; };
+// The dust field (spray.comp): per cell, the specks' absorption (rgb) and scattering x DUST_FIX.
+layout(std430, set = 0, binding = 92) buffer DustBuf { int dfield[]; };
+const float DUST_FIX = 1024.0;   // spray.comp: the same
 
 
 // Occupancy of a cell (1 = rest), from its scattered weight.
@@ -144,13 +161,20 @@ float aq_share(ivec2 q) {
     return clamp(float(aqw) / float(cwq), 0.0, 1.0);
 }
 
-// render.rs had it per particle: the visible glow of a grey body at T (deg C).
+// The visible glow of a grey body at T (deg C), before its emissivity: the colour of a black
+// body (Planck in Wien's form at 610, 550 and 465 nm: green and blue against red rise as
+// (610 / lambda)^5 exp(-c2 / (lambda T)) relative to red, c2 = 0.014388 m K), and its
+// brightness against that at GLOW_REF, seen through a logarithmic exposure as the eye adapts
+// to a glowing tank (red at 1000 K is 1/230 of that at 1300 K but still a dull red; a
+// black body at the Draper point, 798 K, is just visible).
+const float GLOW_REF = 1300.0;   // K: brightness 1
 vec3 glow(float T) {
     float K = T + 273.15;
-    if (K < 800.0) return vec3(0.0);
-    float level = clamp(2.0 - 1600.0 / K, 0.0, 1.0);
-    vec3 c = vec3(1.0, 1.677 * exp(-2575.0 / K), 3.89 * exp(-7353.0 / K));
-    return c / max(c.r, max(c.g, c.b)) * level * level * 1.6;
+    if (K < 760.0) return vec3(0.0);
+    float rel = exp(23587.0 / GLOW_REF - 23587.0 / K);
+    float level = min(log(1.0 + 200.0 * rel) / log(201.0), 1.6);
+    vec3 c = vec3(1.0, 1.677 * exp(-2573.0 / K), 3.89 * exp(-7355.0 / K));
+    return c / max(c.r, max(c.g, c.b)) * level;
 }
 
 void main() {
@@ -162,6 +186,7 @@ void main() {
     vec4 o0 = vec4(0.0), o1 = vec4(0.0), o2 = vec4(0.0), o3 = vec4(0.0), o4 = vec4(0.0);
     vec4 o5 = vec4(0.0), o6 = vec4(0.0), o7 = vec4(0.0), o8 = vec4(0.0), o9 = vec4(0.0), o10 = vec4(0.0), o11 = vec4(0.0);
     vec4 o12 = vec4(0.0), o13 = vec4(0.0), o14 = vec4(0.0), o15 = vec4(0.0);
+    vec4 o16 = vec4(0.0), o17 = vec4(0.0), o18 = vec4(0.0), o19 = vec4(0.0);
     if (OP.spike_gap > 0.0) {
         vec2 B = magnet_field(vec2(c) + 0.5);
         float b = length(B);
@@ -209,10 +234,19 @@ void main() {
         vec4 aq_plain = vec4(0.0), aq_conc = vec4(0.0);
         float c_aq = 0.0;
         vec4 iaq = vec4(0.0), iot = vec4(0.0), fx = vec4(0.0);
+        // Froth, fizz, the scattering's red and blue; the liquid's own light. A liquid that
+        // glows where it is stirred does so by the cell's speed.
+        vec4 fx2 = vec4(0.0);
+        vec3 lum = vec3(0.0);
+        float ior_sum = 0.0;
+        float stirred = smoothstep(1.5, 12.0, length(vec2(face_live(vel[i].z) ? vel[i].x : 0.0, face_live(vel[i].w) ? vel[i].y : 0.0)));
         // The dense liquids (liquid metals, melts) apart from the oil-like ones: their
         // absorption, share and frozen share, so that a drop of lava in oil keeps its own
         // look instead of tinting the cells around it.
         vec4 dense = vec4(0.0);
+        // The liquid that holds most of the cell (the film it lays is named after it).
+        float best_sh = 0.0;
+        int best_row = -1;
         float wden = 0.0, fden = 0.0;
         // The magnetisable share.
         float mag = 0.0;
@@ -230,7 +264,10 @@ void main() {
             float sh = clamp(float(w) / float(cl), 0.0, 1.0);
             float s = (ia.y >= 0 && ia.w >= 0) ? clamp(float(acc[k + ia.w]) / float(w), 0.0, 1.0) : 1.0;
             Optics o = optics[r];
+            // Thermochromic: the colour turns with the temperature of its phase group.
+            if (o.thermo.y > o.thermo.x) o.absorb = mix(o.absorb, o.hot, smoothstep(o.thermo.x, o.thermo.y, Tg[ia.x]));
             vec4 lab = o.absorb, op = o.opt, st = o.sty, ef = o.fx;
+            vec4 e2 = vec4(o.fx2.xy, o.absorb.a * o.scat.r, o.absorb.a * o.scat.b), lm = o.lum;
             vec3 labs = o.solid.rgb;
             if (ia.y >= 0) {
                 Optics d = optics[ia.y];
@@ -240,7 +277,21 @@ void main() {
                 op = mix(d.opt, op, s);
                 st = mix(d.sty, st, s);
                 ef = mix(d.fx, ef, s);
+                e2 = mix(vec4(d.fx2.xy, d.absorb.a * d.scat.r, d.absorb.a * d.scat.b), e2, s);
+                lm = mix(d.lum, lm, s);
             }
+            // For light: a clear plain liquid's tint attenuates it without colour.
+            vec4 kl = o.absorb;
+            if (o.absorb.a <= 1e-3 && o.opt.x < 0.2) kl.rgb = vec3(dot(kl.rgb, vec3(0.3, 0.45, 0.25)));
+            if (ia.y >= 0) {
+                vec4 kd = optics[ia.y].absorb;
+                if (optics[ia.y].absorb.a <= 1e-3 && optics[ia.y].opt.x < 0.2) kd.rgb = vec3(dot(kd.rgb, vec3(0.3, 0.45, 0.25)));
+                kl = mix(kd, o.absorb, s);
+            }
+            o19 += sh * kl;
+            ior_sum += sh * (ia.y >= 0 ? mix(optics[ia.y].opt2.x, o.opt2.x, s) : o.opt2.x);
+            fx2 += sh * e2;
+            lum += sh * lm.rgb * mix(1.0, stirred, lm.a);
             mag += sh * mats[r].el.z;
             // Frozen share at its group's temperature (as grid_prep.comp has it).
             float Tm = Tg[ia.x];
@@ -307,6 +358,7 @@ void main() {
             }
             opt += sh * op;
             fx += sh * ef;
+            if (sh > best_sh) { best_sh = sh; best_row = r; }
             sty += sh * st;
             em += sh * glow(Tm) * st.w;
         }
@@ -317,8 +369,8 @@ void main() {
         // The diluent's own tint gives way far faster than its share, by the concentrate share
         // of the cell's aqueous liquid (dissolved, or in particles of their own beside it):
         // water's blue is the look of a body of clear water, many times stronger than its
-        // real absorption, and kept in proportion it turned a little syrup in it green, as a
-        // blue and a yellow filter do (a tenth of syrup is already pale gold).
+        // real absorption, and kept in proportion it turned a little honey in it green, as a
+        // blue and a yellow filter do (a tenth of honey is already pale gold).
         o15 = vec4(aq_plain.rgb, max(waq - c_aq, 0.0)) * occ;
         if (waq > 0.0) aq = aq_plain * exp(-DILUENT_FADE * c_aq / waq) + aq_conc;
         o0 = aq * occ;
@@ -327,7 +379,17 @@ void main() {
         // A quenched skin is far colder than the melt under it: it glows (and lights its
         // surroundings) only through its cracks.
         em *= 1.0 - 0.6 * clamp(skin, 0.0, 1.0);
-        o3 = vec4(em, speed) * occ;
+        o3 = vec4(em + lum, speed) * occ;
+        float s_mean = aq.a + ot.a + dense.a;
+        o16 = vec4(fx2.xy * occ, s_mean > 1e-5 ? fx2.zw / s_mean : vec2(1.0));
+        // The specks' share of the colour: per cell of the tank, so per unit of liquid it is
+        // that over the occupancy, and premultiplied by it again here.
+        if (OP.dust > 0.0 && occ > 0.02) {
+            o18 = vec4(dfield[4 * i], dfield[4 * i + 1], dfield[4 * i + 2], dfield[4 * i + 3]) / DUST_FIX;
+            o18 = min(o18, vec4(200.0) * occ);
+        }
+        o19 = o19 * occ + o18;
+        o17 = vec4(lum, ior_sum) * occ;
         o4 = vec4(sty.x, sty.y, waq, waq + wot) * occ;
         o5 = vec4(iaq.rgb, wden) * occ;
         o6 = vec4(iot.rgb, fden) * occ;
@@ -345,14 +407,18 @@ void main() {
             int tiles_x = (dimF.x + 15) / 16;
             uint nt = uint(tiles_x * ((dimF.y + 15) / 16));
             ivec2 tc = c * fres / 16;
-            uint bits = 1u | (fx.x > 0.15 ? 2u : 0u);   // (film.comp: STAIN_MIN)
+            // (Liquid; liquid that lays a coat.)
+            uint bits = 1u | (fx.y > 0.005 ? 2u : 0u);
             uint ti = 4u * nt + uint(tc.y * tiles_x + tc.x);
             if ((ftile[ti] & bits) != bits) atomicOr(ftile[ti], bits);
         }
         // The light reaching the cell (light.comp fills in rgb), the skin of a melt; its
         // drying time, for the film map.
         o9 = vec4(0.0, 0.0, 0.0, skin) * occ;
-        o10 = vec4(sty.z * occ, 0.0, 0.0, 0.0);
+        // What it lays on a surface (film.comp): its coat, volatile share, name.
+        o10 = vec4(fx.y * occ, 0.0, 0.0, 0.0);
+        o13.z = fx.x * occ;
+        o14.w = float(best_row + 1);
         float wl = waq + wot;
         o12 = wl > 0.0 ? vec4(look_key((aq + ot + dense) / wl), 1.0) * occ : vec4(0.0);
         o14.z = P.mag.y > 0.0 ? mag / P.mag.y * occ : 0.0;
@@ -373,4 +439,8 @@ void main() {
     imageStore(cellopt, ivec3(c, 13), o13);
     imageStore(cellopt, ivec3(c, 14), o14);
     imageStore(cellopt, ivec3(c, 15), o15);
+    imageStore(cellopt, ivec3(c, 16), o16);
+    imageStore(cellopt, ivec3(c, 17), o17);
+    imageStore(cellopt, ivec3(c, 18), o18);
+    imageStore(cellopt, ivec3(c, 19), o19);
 }

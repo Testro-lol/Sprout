@@ -18,12 +18,15 @@ pub struct Camera {
     anchor: Option<([f32; 2], [f32; 2])>,
     /// Whether the target is "the whole grid", so that it follows window resizes.
     fit: bool,
+    /// Pixels at the bottom of the window that the interface covers: the grid is fitted
+    /// into what is above them.
+    below: f32,
 }
 
 impl Camera {
     pub fn new(grid: [u32; 2], size: [u32; 2]) -> Camera {
         let view = View::fit(grid, size);
-        Camera { view, target: view, anchor: None, fit: true }
+        Camera { view, target: view, anchor: None, fit: true, below: 0.0 }
     }
 
     /// Where the camera is heading (what the user asked for), as opposed to `view`.
@@ -33,7 +36,7 @@ impl Camera {
 
     /// Shows the whole grid: eased, or at once (on a resize or a new grid).
     pub fn fit(&mut self, grid: [u32; 2], size: [u32; 2], animate: bool) {
-        self.target = View::fit(grid, size);
+        self.target = View::fit_above(grid, size, self.below);
         self.anchor = None;
         self.fit = true;
         if !animate {
@@ -48,9 +51,20 @@ impl Camera {
         }
     }
 
+    /// Reserves the bottom `below` pixels of the window for the interface (0 when it is
+    /// hidden). A fitted view glides to its new place; any other view stays where it is.
+    pub fn set_below(&mut self, below: f32, grid: [u32; 2], size: [u32; 2]) {
+        if below != self.below {
+            self.below = below;
+            if self.fit {
+                self.fit(grid, size, true);
+            }
+        }
+    }
+
     /// Zooms by `factor` about the pixel `px`, between half and 24 times the fitted zoom.
     pub fn zoom_at(&mut self, px: [f32; 2], factor: f32, grid: [u32; 2], size: [u32; 2]) {
-        let fit = View::fit(grid, size).zoom;
+        let fit = View::fit_above(grid, size, self.below).zoom;
         let anchor = self.anchor.map_or_else(|| self.view.screen_to_world(px, size), |(w, p)| {
             // A new notch mid-animation keeps the original anchor if the pointer has not moved.
             if p == px { w } else { self.view.screen_to_world(px, size) }
@@ -122,6 +136,31 @@ mod tests {
         }
         assert_eq!(cam.view.zoom, cam.target().zoom);
         assert!((cam.view.zoom / View::fit(GRID, SIZE).zoom - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_fitted_view_makes_room_for_the_dock_and_takes_it_back() {
+        let mut cam = Camera::new(GRID, SIZE);
+        let full = cam.view;
+        cam.set_below(200.0, GRID, SIZE);
+        for _ in 0..120 {
+            cam.update(1.0 / 60.0, SIZE);
+        }
+        // The whole grid is above the dock: its floor at 700 px, its top at 0, centred.
+        let floor = cam.view.world_to_screen([256.0, 0.0], SIZE);
+        let top = cam.view.world_to_screen([256.0, 288.0], SIZE);
+        assert!((floor[1] - 700.0).abs() < 0.5 && top[1].abs() < 0.5 && (floor[0] - 800.0).abs() < 0.5, "{floor:?} {top:?}");
+        cam.set_below(0.0, GRID, SIZE);
+        for _ in 0..120 {
+            cam.update(1.0 / 60.0, SIZE);
+        }
+        assert_eq!(cam.view, full);
+        // A view the user has moved is left alone.
+        cam.pan([40.0, 0.0]);
+        let moved = cam.view;
+        cam.set_below(200.0, GRID, SIZE);
+        cam.update(1.0 / 60.0, SIZE);
+        assert_eq!(cam.view, moved);
     }
 
     #[test]

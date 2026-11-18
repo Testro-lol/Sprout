@@ -28,6 +28,7 @@
 //! the headless tools.
 
 pub mod material;
+pub mod presets;
 pub mod params;
 mod raw;
 
@@ -63,7 +64,7 @@ pub const SPAWN_MAX: usize = 32768;
 
 /// Ints per cell in the scatter accumulators: at least `ACC_MIN` (four face sums, the cell
 /// weight, three channels), at most `ACC_MAX` (what the buffer is sized for). The stride in
-/// use follows the materials in the tank (`Tank`), so a tank of water, syrup and oil moves
+/// use follows the materials in the tank (`Tank`), so a tank of water, honey and oil moves
 /// as much memory as it always did.
 const ACC_MIN: u32 = 8;
 const ACC_MAX: u32 = 32;
@@ -79,15 +80,20 @@ const RIGID_BODIES: u64 = 4096;
 const BODY_WORDS: u64 = 32;
 /// Words of the heat ledger (`LedgerBuf` in common.glsl).
 const LEDGER_WORDS: u64 = 16 + 3 * MAX_MATERIALS as u64;
-/// How fast a liquid with `stain` 1 coats a solid it lies against, and the back wall, 1/s;
-/// how fast liquid that does not stain washes a film off, at rest, 1/s (film.comp).
-const STAIN_WALL_RATE: f32 = 3.0;
-const STAIN_BACK_RATE: f32 = 0.4;
-const STAIN_WASH_RATE: f32 = 0.06;
 /// Thickness unit of the film map, m (film.comp: 0.1 mm).
 const FILM_UNIT: f32 = 1.0e-4;
 /// Layers of the per-cell optics image (cell_optics.comp writes them, composite.frag reads them).
-const CELL_OPTICS_LAYERS: u32 = 16;
+const CELL_OPTICS_LAYERS: u32 = 24;
+/// Entries in the pool of bubbles, foam and spray (spray.comp).
+pub const DIFFUSE_MAX: u32 = 1 << 16;
+/// Entries after those for specks (spray.comp: the coarse particles of a liquid, `dust`).
+pub const DUST_MAX: u32 = 1 << 17;
+/// The whole pool: bubbles, foam and spray, then specks.
+pub const POOL_MAX: u32 = DIFFUSE_MAX + DUST_MAX;
+/// `FluidSim::look_buffers`: the draw commands and lists, the per-slot state, whether live.
+pub type LookBuffers<'a> = (&'a Subbuffer<[u32]>, &'a Subbuffer<[[u32; 4]]>, bool);
+/// `FluidSim::diffuse_buffers`: the pool, its draw command and list, whether live.
+pub type DiffuseBuffers<'a> = (&'a Subbuffer<[[f32; 8]]>, &'a Subbuffer<[u32]>, bool);
 const PARTICLE_GROUP: u32 = 128;
 /// Substeps between two particle sorts (see `sort.comp`), and the particle count below
 /// which sorting is not worth its dispatches.
@@ -170,6 +176,8 @@ pub struct Ledger {
     pub cooled: f64,
     /// Latent and sensible heat carried off by liquid that boiled away.
     pub boiled: f64,
+    /// Heat made inside the liquid: self-heating and reactions (README, "New properties").
+    pub made: f64,
     /// Per table row: particles that boiled away, and particles left behind as its residue.
     pub boiled_count: [u32; MAX_MATERIALS],
     pub residue_count: [u32; MAX_MATERIALS],
@@ -188,6 +196,7 @@ impl Default for Ledger {
             heated: 0.0,
             cooled: 0.0,
             boiled: 0.0,
+            made: 0.0,
             boiled_count: [0; MAX_MATERIALS],
             residue_count: [0; MAX_MATERIALS],
             steam_count: [0; MAX_MATERIALS],
@@ -198,7 +207,7 @@ impl Default for Ledger {
 impl Ledger {
     /// Net energy that entered the liquid, J/m.
     pub fn net_in(&self) -> f64 {
-        self.from_air - self.to_air + self.from_solids - self.to_solids + self.heated - self.cooled - self.boiled
+        self.from_air - self.to_air + self.from_solids - self.to_solids + self.heated - self.cooled - self.boiled + self.made
     }
 }
 
@@ -409,11 +418,13 @@ fn film_res(grid: [u32; 2]) -> u32 {
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct FilmPc {
     dt: f32,
-    wall_rate: f32,
-    back_rate: f32,
-    wash_rate: f32,
     parity: u32,
     mob_scale: f32,
+    /// FILM_UNIT in cells.
+    unit_cells: f32,
+    /// spray.comp's pool (drips): the bubbles' part, the whole.
+    pool_cap: u32,
+    pool_all: u32,
 }
 /// Periods of the patterns carried by the liquid (flow_map.comp; composite.frag: PERIOD_SHORT,
 /// PERIOD_LONG), s.
@@ -428,6 +439,8 @@ struct OpticsPc {
     spike_gap: f32,
     spike_mc: f32,
     spike_k: f32,
+    /// 1: add the specks' share of the liquid's colour (spray.comp's dust field), else 0.
+    dust: f32,
 }
 
 /// Ferrofluid spikes as drawn (cell_optics.comp, README "Magnetism"): never closer than this
@@ -446,6 +459,29 @@ struct FlowPc {
     period_s: f32,
     period_l: f32,
     parity: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct LookPc {
+    dt: f32,
+    now: f32,
+    cap: u32,
+    /// The specks' part of spray.comp's pool: first entry and count.
+    dust_base: u32,
+    dust_cap: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct SprayPc {
+    dt: f32,
+    now: f32,
+    stage: u32,
+    parity: u32,
+    cap: u32,
+    amount: f32,
+    /// The specks' part of the pool: first entry and count.
+    dust_base: u32,
+    dust_cap: u32,
 }
 /// The vapour of escaped steam mixes away into the air with this share of `steam_life` as its
 /// time constant (smoke.comp).
@@ -759,6 +795,9 @@ struct Passes {
     light: Pass,
     optics_blur: Pass,
     flow_map: Pass,
+    look: Pass,
+    spray: Pass,
+    sss: Pass,
     glow: Pass,
     film_tiles: Pass,
     film: Pass,
@@ -884,6 +923,23 @@ pub struct FluidSim {
     /// one texel per cell, layers 2 x copy + period; the copy that holds it now.
     flow: Arc<ImageView>,
     flow_parity: std::cell::Cell<u32>,
+    /// Per particle slot: its id and what it carries for the look (look.comp), and the
+    /// periodic sort's target for it.
+    plook: Subbuffer<[[u32; 4]]>,
+    plook2: Subbuffer<[[u32; 4]]>,
+    /// look.comp: phi per cell; the draw commands and lists of the look splat and the flakes.
+    lcell: Subbuffer<[i32]>,
+    lctl: Subbuffer<[u32]>,
+    /// Bubbles, foam and spray (spray.comp): the pool, its draw command and list, the foam per
+    /// cell (two copies) and the copy counted into next.
+    dpart: Subbuffer<[[f32; 8]]>,
+    dctl: Subbuffer<[u32]>,
+    dcount: Subbuffer<[u32]>,
+    diffuse_parity: std::cell::Cell<u32>,
+    /// Whether a liquid that foams or fizzes has been in the tank since it was reset (the
+    /// pool may hold something), and whether one with a carried look is in it now.
+    diffuse_seen: std::cell::Cell<bool>,
+    look_live: std::cell::Cell<bool>,
     film_in: Subbuffer<[u32]>,
     film_col: Subbuffer<[u32]>,
     film_tiles: Subbuffer<[u32]>,
@@ -933,7 +989,7 @@ pub struct FluidSim {
     region: Subbuffer<[u32]>,
     /// Per cell: liquid occupancy, density, viscosity, level (`CellBuf` in common.glsl).
     cell: Subbuffer<[[f32; 4]]>,
-    /// Per cell: density, oil share, syrup share, total occupancy (`CompBuf`).
+    /// Per cell: density, oil share, honey share, total occupancy (`CompBuf`).
     comp: Subbuffer<[[f32; 4]]>,
     resets: u64,
     /// One flag per 16 x 16 tile: where the implicit viscosity solve runs.
@@ -991,6 +1047,7 @@ impl FluidSim {
         let aux = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let grho = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let gbase = device_buffer::<[f32; 4]>(&gpu, cells, none);
+        let rmask = device_buffer::<u32>(&gpu, cells, none);
         let sprop = device_buffer::<[f32; 4]>(&gpu, cells, none);
         let mixb = device_buffer::<f32>(&gpu, cells * (MAX_PRESENT as u64 - 1), none);
         let surf2 = device_buffer::<[f32; 4]>(&gpu, cells, none);
@@ -1080,10 +1137,22 @@ impl FluidSim {
             .expect("out of GPU memory"),
         )
         .unwrap();
-        let film_c = film_image(Format::R8G8B8A8_UNORM);
+        let plook = device_buffer::<[u32; 4]>(&gpu, capacity as u64, none);
+        let plook2 = device_buffer::<[u32; 4]>(&gpu, capacity as u64, none);
+        // (Was look.comp's per-cell sums of a carried scalar; now the specks' share of the
+        // liquid's colour per cell: absorption RGB and scattering x DUST_FIX, spray.comp.)
+        let lcell = device_buffer::<i32>(&gpu, 4 * (grid[0] * grid[1]) as u64, none);
+        let lctl = device_buffer::<u32>(&gpu, 8 + 2 * capacity as u64, BufferUsage::INDIRECT_BUFFER);
+        let dpart = device_buffer::<[f32; 8]>(&gpu, POOL_MAX as u64, none);
+        // Counters, the sprites' draw list, the free stacks (shaders/pool.glsl).
+        let dctl = device_buffer::<u32>(&gpu, 8 + 2 * POOL_MAX as u64, BufferUsage::INDIRECT_BUFFER);
+        // Foam per cell (two copies), then resting specks per cell (two copies).
+        let dcount = device_buffer::<u32>(&gpu, 4 * (grid[0] * grid[1]) as u64, none);
+        // (Absorbance and scattering of the film, integrated through it: film.comp.)
+        let film_c = film_image(Format::R16G16B16A16_SFLOAT);
         let film_h = film_image(Format::R16G16B16A16_SFLOAT);
         let film_in = device_buffer::<u32>(&gpu, (fdim[0] * fdim[1]) as u64, BufferUsage::TRANSFER_DST);
-        let film_col = device_buffer::<u32>(&gpu, cells * 4, BufferUsage::TRANSFER_DST);
+        let film_col = device_buffer::<u32>(&gpu, cells * 8, BufferUsage::TRANSFER_DST);
         // Per tile: each copy's state there, whether drops were laid into it, whether the two
         // copies hold the same there, and whether liquid is in its cells this frame; and the
         // list of tiles that need work, behind the indirect dispatch over it (film_tiles.comp).
@@ -1234,6 +1303,7 @@ impl FluidSim {
         put(40, aux.as_bytes().clone());
         put(59, grho.as_bytes().clone());
         put(65, gbase.as_bytes().clone());
+        put(89, rmask.as_bytes().clone());
         put(41, sprop.as_bytes().clone());
         put(42, mixb.as_bytes().clone());
         put(43, surf2.as_bytes().clone());
@@ -1254,6 +1324,13 @@ impl FluidSim {
         put(72, film_in.as_bytes().clone());
         put(73, film_col.as_bytes().clone());
         put(74, film_tiles.as_bytes().clone());
+        put(90, plook.as_bytes().clone());
+        put(91, plook2.as_bytes().clone());
+        put(92, lcell.as_bytes().clone());
+        put(93, lctl.as_bytes().clone());
+        put(94, dpart.as_bytes().clone());
+        put(95, dctl.as_bytes().clone());
+        put(96, dcount.as_bytes().clone());
         put(75, film_list.as_bytes().clone());
         put(55, famocc.as_bytes().clone());
         put(56, famocc.as_bytes().clone());
@@ -1338,6 +1415,9 @@ impl FluidSim {
             light: Pass::with_images(&gpu, "light", spirv!("light.comp"), &table, &[(58, cellopt_raw.clone())]),
             optics_blur: Pass::with_images(&gpu, "optics_blur", spirv!("optics_blur.comp"), &table, &[(58, cellopt_raw.clone()), (60, cellopt.clone())]),
             flow_map: Pass::with_images(&gpu, "flow_map", spirv!("flow_map.comp"), &table, &[(60, cellopt.clone()), (64, flow.clone())]),
+            look: p("look", spirv!("look.comp")),
+            spray: Pass::with_images(&gpu, "spray", spirv!("spray.comp"), &table, &[(60, cellopt.clone())]),
+            sss: Pass::with_images(&gpu, "sss", spirv!("sss.comp"), &table, &[(58, cellopt_raw.clone()), (60, cellopt.clone())]),
             glow: Pass::with_images(&gpu, "glow", spirv!("glow.comp"), &table, &[(58, cellopt_raw.clone()), (62, glow_a.clone()), (63, glow_b.clone())]),
             film_tiles: Pass::build(&gpu, "film_tiles", gpu.shader_specialized(spirv!("film_tiles.comp"), &[(2, fres)]), &table, &[]),
             film: Pass::build(
@@ -1453,6 +1533,16 @@ impl FluidSim {
             film_parity: std::cell::Cell::new(0),
             flow,
             flow_parity: std::cell::Cell::new(0),
+            plook,
+            plook2,
+            lcell,
+            lctl,
+            dpart,
+            dctl,
+            dcount,
+            diffuse_parity: std::cell::Cell::new(0),
+            diffuse_seen: std::cell::Cell::new(false),
+            look_live: std::cell::Cell::new(false),
             film_in,
             film_col,
             film_tiles,
@@ -1560,13 +1650,26 @@ impl FluidSim {
         let nt = self.film_tiles.len() / 5;
         b.fill_buffer(self.film_tiles.clone().slice(4 * nt..5 * nt), 0).unwrap();
         self.pass.cell_optics.bind(b);
-        self.pass.cell_optics.push(b, OpticsPc { inv_speed, spike_gap, spike_mc, spike_k: SPIKE_HEIGHT });
+        let dust = if self.diffuse_seen.get() && self.has_dust() { 1.0 } else { 0.0 };
+        self.pass.cell_optics.push(b, OpticsPc { inv_speed, spike_gap, spike_mc, spike_k: SPIKE_HEIGHT, dust });
         dispatch(b, groups);
         // The light reaching each cell from above, one workgroup per column (light.comp).
         self.pass.light.bind(b);
         dispatch(b, [self.grid[0], 1, 1]);
         self.pass.optics_blur.bind(b);
         dispatch(b, groups);
+        // The light under the surface (sss.comp): prepared, then iterated from the last
+        // frame's solution (an even number of times, so it ends in layer 20).
+        let iters = self.params.sss_iters.div_ceil(2) * 2;
+        if iters > 0 {
+            self.pass.sss.bind(b);
+            self.pass.sss.push(b, [0u32, 20]);
+            dispatch(b, groups);
+            for k in 0..iters {
+                self.pass.sss.push(b, [1u32, if k % 2 == 0 { 20 } else { 21 }]);
+                dispatch(b, groups);
+            }
+        }
         // The patterns' displacement, carried along by the smoothed velocity (flow_map.comp).
         if dt > 0.0 {
             let parity = self.flow_parity.get();
@@ -1575,6 +1678,8 @@ impl FluidSim {
             dispatch(b, groups);
             self.flow_parity.set(1 - parity);
         }
+        self.record_look(b, dt);
+        self.record_spray(b, dt);
         let half = [self.grid[0].div_ceil(2).div_ceil(GRID_GROUP), self.grid[1].div_ceil(2).div_ceil(GRID_GROUP), 1];
         self.pass.glow.bind(b);
         for dir in [0i32, 1] {
@@ -1593,17 +1698,92 @@ impl FluidSim {
             self.pass.film.bind(b);
             self.pass.film.push(b, FilmPc {
                 dt,
-                wall_rate: STAIN_WALL_RATE,
-                back_rate: STAIN_BACK_RATE,
-                wash_rate: STAIN_WASH_RATE,
                 parity,
                 mob_scale: self.params.gravity * FILM_UNIT * FILM_UNIT / 3.0 * film_res(self.grid) as f32 / self.params.cell_size,
+                unit_cells: FILM_UNIT / self.params.cell_size,
+                pool_cap: DIFFUSE_MAX,
+                pool_all: POOL_MAX,
             });
             // SAFETY: film.comp reads its tile from the list for each workgroup, and the list
             // holds at most every tile once.
             unsafe { b.dispatch_indirect(self.film_list.clone().slice(0..3).reinterpret::<[DispatchIndirectCommand]>()) }.unwrap();
             self.film_parity.set(1 - parity);
         }
+    }
+
+    /// What the particles of liquids with particles of a look keep (look.comp): the
+    /// orientation of their platelets turned by the flow, and the list the renderer draws the
+    /// look field from; and the specks a fresh particle brings into the tank (spray.comp's pool).
+    fn record_look(&self, b: &mut Builder, dt: f32) {
+        let live = self.tank.rows.iter().any(|&r| {
+            let m = &self.params.mat[r];
+            (m.cloud > 0.0 && m.cloud_shape < 2.0 / 3.0) || m.dust > 0.0
+        });
+        self.look_live.set(live);
+        if !live || self.n_slots == 0 {
+            return;
+        }
+        b.update_buffer(self.lctl.clone().slice(0..8), Box::<[u32]>::from([0, 1, 0, 0, 0, 1, 0, 0])).unwrap();
+        self.pass.look.bind(b);
+        self.pass.look.push(b, LookPc { dt, now: self.sim_time() as f32, cap: self.capacity, dust_base: DIFFUSE_MAX, dust_cap: DUST_MAX });
+        dispatch(b, [self.n_slots.div_ceil(128), 1, 1]);
+    }
+
+    /// Whether a liquid with specks is in the tank.
+    fn has_dust(&self) -> bool {
+        self.tank.rows.iter().any(|&r| self.params.mat[r].dust > 0.0)
+    }
+
+    /// Makes and moves the bubbles, foam and spray (spray.comp) for the simulated time since
+    /// the last update, and lists the live ones for the renderer.
+    fn record_spray(&self, b: &mut Builder, dt: f32) {
+        let makes = self.tank.rows.iter().any(|&r| {
+            let m = &self.params.mat[r];
+            m.foam > 0.0 || m.fizz > 0.0
+        }) && self.params.bubbles > 0.0;
+        if makes || self.has_dust() {
+            self.diffuse_seen.set(true);
+        }
+        if !self.diffuse_seen.get() {
+            return;
+        }
+        let parity = self.diffuse_parity.get();
+        let cells = (self.grid[0] * self.grid[1]) as u64;
+        b.fill_buffer(self.dcount.clone().slice(parity as u64 * cells..(parity as u64 + 1) * cells), 0).unwrap();
+        b.fill_buffer(self.dcount.clone().slice((2 + parity as u64) * cells..(3 + parity as u64) * cells), 0).unwrap();
+        // The specks' share of the colour, laid down anew (cell_optics.comp reads it next frame).
+        b.fill_buffer(self.lcell.clone().reinterpret::<[u32]>(), 0).unwrap();
+        b.update_buffer(self.dctl.clone().slice(4..8), Box::<[u32]>::from([0, 1, 0, 0])).unwrap();
+        self.pass.spray.bind(b);
+        let pc = |stage| SprayPc {
+            dt,
+            now: self.sim_time() as f32,
+            stage,
+            parity,
+            cap: DIFFUSE_MAX,
+            amount: self.params.bubbles,
+            dust_base: DIFFUSE_MAX,
+            dust_cap: DUST_MAX,
+        };
+        if makes && dt > 0.0 {
+            self.pass.spray.push(b, pc(0));
+            dispatch(b, [self.grid[0].div_ceil(GRID_GROUP), self.grid[1].div_ceil(GRID_GROUP), 1]);
+        }
+        self.pass.spray.push(b, pc(1));
+        dispatch(b, [POOL_MAX.div_ceil(256), 1, 1]);
+        self.diffuse_parity.set(1 - parity);
+    }
+
+    /// The look field's and the flakes' draw commands and lists (look.comp), the per-slot
+    /// look state, and whether they hold anything this frame.
+    pub fn look_buffers(&self) -> LookBuffers<'_> {
+        (&self.lctl, &self.plook, self.look_live.get() && self.n_slots > 0)
+    }
+
+    /// The pool of bubbles, foam and spray and its draw command and list (spray.comp), and
+    /// whether it may hold anything.
+    pub fn diffuse_buffers(&self) -> DiffuseBuffers<'_> {
+        (&self.dpart, &self.dctl, self.diffuse_seen.get())
     }
 
     /// Carries the smoke field along with the air for the simulated time since the last call
@@ -1619,7 +1799,7 @@ impl FluidSim {
             }
         };
         self.smoke_at.set(Some((self.resets, now)));
-        if dt <= 0.0 || !self.has_steam() {
+        if dt <= 0.0 || !self.has_vapour() {
             return;
         }
         let res = smoke_res(self.grid);
@@ -1674,16 +1854,15 @@ impl FluidSim {
 
     /// Whether the film map can hold anything: a liquid that stains (or a concentrate of
     /// one) has been in the tank since it was last cleaned. Water alone never pays for it.
-    /// What the renderer must be able to draw for this tank: carried patterns (a liquid with
-    /// crackle, iridescence, or glints strong enough to sparkle: composite.frag draws the
-    /// sparkle above 0.5, and a blend of liquids under 0.45 stays clear of it) and stains
-    /// (`film_live`).
-    /// What the renderer needs to draw: carried patterns (a liquid with crackle, iridescence
-    /// or glints), stains (a staining liquid has been in the tank), ferrofluid spikes (a
+    /// What the renderer needs to draw: carried patterns (a liquid with crackle or
+    /// iridescence), stains (a staining liquid has been in the tank), ferrofluid spikes (a
     /// magnet and a magnetisable liquid).
     pub fn render_features(&self) -> (bool, bool, bool) {
         let p = &self.params;
-        let patterns = self.tank.rows.iter().any(|&r| p.mat[r].crackle > 0.0 || p.mat[r].iridescence > 0.0 || p.mat[r].glint > 0.45);
+        let patterns = self.tank.rows.iter().any(|&r| {
+            let m = &p.mat[r];
+            crate::sim::material::crust(m) > 0.0 || crate::sim::material::iridescence(m, p.pair_tension[0][(m.group as usize).min(3)], p.cell_size) > 0.0
+        });
         (patterns, self.film_live(), self.spike_params().0 > 0.0)
     }
 
@@ -1723,8 +1902,9 @@ impl FluidSim {
         if self.film_seen.get() {
             return true;
         }
-        let stains = |r: usize| self.params.mat[r].stain > 0.0;
-        let seen = self.tank.rows.iter().any(|&r| stains(r) || (self.params.mat[r].diluent >= 0 && stains(self.params.mat[r].diluent as usize)));
+        // (Every liquid that wets lays a film; steam does not.)
+        let wets = |r: usize| r != Material::Steam.index() && crate::sim::material::wetting(&self.params.mat[r]) > 0.0;
+        let seen = self.tank.rows.iter().any(|&r| wets(r));
         self.film_seen.set(seen);
         seen
     }
@@ -1751,7 +1931,7 @@ impl FluidSim {
         self.table[&41].clone().reinterpret::<[[f32; 4]]>()
     }
 
-    /// Per cell, as the last substep left it: oil share in y, syrup share in z (`CompBuf`).
+    /// Per cell, as the last substep left it: oil share in y, honey share in z (`CompBuf`).
     pub fn composition_buffer(&self) -> &Subbuffer<[[f32; 4]]> {
         &self.comp
     }
@@ -1874,7 +2054,7 @@ impl FluidSim {
         let mut thermal = self.thermal;
         for p in particles {
             if let Some(m) = p.material() {
-                thermal |= (p.t - self.params.ambient_temp).abs() > 0.05;
+                thermal |= (p.t - self.params.ambient_temp).abs() > 0.05 || self.params.mat[m.index()].makes_heat();
                 if m.index() != last {
                     last = m.index();
                     if !rows.contains(&last) {
@@ -1967,6 +2147,13 @@ impl FluidSim {
         self.caps() & CAP_STEAM != 0
     }
 
+    /// Whether puffs of vapour may be in the air: steam, or a liquid that fumes as it
+    /// evaporates or boils away.
+    pub fn has_vapour(&self) -> bool {
+        let p = &self.params;
+        self.has_steam() || self.tank.rows.iter().any(|&r| p.mat[r].fume > 0.0 && (p.mat[r].volatility > 0.0 || (self.thermal && p.mat[r].boil < 1.0e8)))
+    }
+
     /// Whether heat is being simulated (the tank is not isothermal).
     pub fn thermal(&self) -> bool {
         self.thermal
@@ -2027,6 +2214,22 @@ impl FluidSim {
                     th2: [if m.freezes() || m.diluent >= 0 { m.latent / m.heat_capacity } else { 0.0 }, m.emissivity, m.boil, m.latent_vap / m.heat_capacity],
                     el: [stress(m.shear_modulus), m.relax_time, m.susceptibility, m.residue_share],
                     misc: [m.freeze_shift, m.load, visc_exponent(r, m.diluent), m.expansion],
+                    ic: {
+                        // The partner's concentration family in this tank and its phase group
+                        // (particles.comp: how much of it a cell holds).
+                        let partner = m.react_with;
+                        let (fam, group) = if partner >= 0 && (partner as usize) < MAX_MATERIALS {
+                            let k = self.tank.rows.iter().position(|&x| x == partner as usize);
+                            (k.map_or(-1, |k| self.tank.chan[k][2]), p.mat[partner as usize].group.min(GROUPS as u32 - 1) as i32)
+                        } else {
+                            (-1, 0)
+                        };
+                        let at = self.tank.rows.iter().position(|&x| partner >= 0 && x == partner as usize);
+                        let _ = (fam, group);
+                        [if at.is_some() && m.react_rate > 0.0 { partner } else { -1 }, m.react_into, at.map_or(0, |k| k as i32), 0]
+                    },
+                    rx: [m.react_rate, m.react_heat / m.heat_capacity, m.self_heat / m.heat_capacity, m.volatility],
+                    gr: [m.friction, m.fume, m.fizz, 0.0],
                 }
             })
             .collect()
@@ -2202,6 +2405,10 @@ impl FluidSim {
             for f in &self.fields {
                 b.fill_buffer(f.clone(), 0).unwrap();
             }
+            b.fill_buffer(self.plook.clone().reinterpret::<[u32]>(), u32::MAX).unwrap();
+            for f in [self.dpart.clone().reinterpret::<[u32]>(), self.dctl.clone(), self.dcount.clone(), self.lctl.clone()] {
+                b.fill_buffer(f, 0).unwrap();
+            }
             self.cleared = true;
         }
         if !self.ind_ready {
@@ -2251,6 +2458,14 @@ impl FluidSim {
             b.fill_buffer(self.vd.clone().reinterpret::<[u32]>(), 0).unwrap();
             b.fill_buffer(self.step_buf.clone(), 0).unwrap();
             b.fill_buffer(self.dheat.clone().reinterpret::<[u32]>(), 0).unwrap();
+            // Particle ids start again from 0: no slot's look state is theirs. And the pool of
+            // bubbles, foam and spray empties.
+            b.fill_buffer(self.plook.clone().reinterpret::<[u32]>(), u32::MAX).unwrap();
+            b.fill_buffer(self.dpart.clone().reinterpret::<[u32]>(), 0).unwrap();
+            b.fill_buffer(self.dctl.clone(), 0).unwrap();
+            b.fill_buffer(self.dcount.clone(), 0).unwrap();
+            b.fill_buffer(self.lcell.clone().reinterpret::<[u32]>(), 0).unwrap();
+            self.diffuse_seen.set(false);
             if std::mem::take(&mut self.ledger_reset) {
                 b.fill_buffer(self.ledger.clone(), 0).unwrap();
             }
@@ -2512,9 +2727,9 @@ impl FluidSim {
         for &r in &self.tank.rows {
             let m = &p.mat[r];
             let dil = (m.diluent >= 0).then(|| &p.mat[m.diluent as usize]);
-            if m.rheology != RHEO_NEWTONIAN || m.skin > 0.0 {
+            if m.rheology != RHEO_NEWTONIAN || m.skin > 0.0 || m.friction > 0.0 {
                 caps |= CAP_RHEO;
-                rigid |= m.rheology == RHEO_HERSCHEL_BULKLEY || m.rheology == RHEO_THICKENING || m.skin > 0.0;
+                rigid |= m.rheology == RHEO_HERSCHEL_BULKLEY || m.rheology == RHEO_THICKENING || m.skin > 0.0 || m.friction > 0.0;
             }
             // Can it freeze, or get more viscous than the solve goes (cooling, or as it is)?
             if self.thermal {
@@ -2538,6 +2753,9 @@ impl FluidSim {
         // condenses or escapes; only no new steam forms.)
         if self.thermal && self.tank.rows.contains(&Material::Steam.index()) {
             caps |= CAP_STEAM;
+        }
+        if self.tank.rows.iter().any(|&r| p.mat[r].react_with >= 0 && p.mat[r].react_rate > 0.0 && self.tank.rows.contains(&(p.mat[r].react_with as usize))) {
+            caps |= CAP_REACT;
         }
         caps
     }
@@ -3020,6 +3238,7 @@ impl FluidSim {
         if let Some((a, s)) = &self.pstress {
             b.copy_buffer(CopyBufferInfo::buffers(s.clone().slice(0..n), a.clone().slice(0..n))).unwrap();
         }
+        b.copy_buffer(CopyBufferInfo::buffers(self.plook2.clone().slice(0..n), self.plook.clone().slice(0..n))).unwrap();
     }
 
     /// Records a particle count. The result lands in `stats` a few frames later, once
@@ -3177,13 +3396,26 @@ impl FluidSim {
         let w = host.read().unwrap();
         let unit = self.params.cell_heat();
         let e = |k: usize| ((w[2 * k] as u64 | (w[2 * k + 1] as u64) << 32) as f64 / 65536.0) * unit;
-        let mut l = Ledger { from_air: e(0), to_air: e(1), from_solids: e(2), to_solids: e(3), heated: e(4), cooled: e(5), boiled: e(6), ..Default::default() };
+        let mut l = Ledger { from_air: e(0), to_air: e(1), from_solids: e(2), to_solids: e(3), heated: e(4), cooled: e(5), boiled: e(6), made: e(7), ..Default::default() };
         for r in 0..MAX_MATERIALS {
             l.boiled_count[r] = w[16 + r];
-            l.residue_count[r] = w[80 + r];
-            l.steam_count[r] = w[144 + r];
+            l.residue_count[r] = w[16 + MAX_MATERIALS + r];
+            l.steam_count[r] = w[16 + 2 * MAX_MATERIALS + r];
         }
         l
+    }
+
+    /// Debug aid: the draw commands of the look field and the flakes (look.comp) and of the
+    /// bubbles, foam and spray (spray.comp), and the pool's hand-out counter.
+    pub fn debug_look_counts(&self) -> [u32; 16] {
+        let host = readback::<u32>(&self.gpu, 16);
+        let mut b = self.gpu.builder();
+        b.copy_buffer(CopyBufferInfo::buffers(self.lctl.clone().slice(0..8), host.clone().slice(0..8))).unwrap();
+        b.copy_buffer(CopyBufferInfo::buffers(self.dctl.clone().slice(0..8), host.clone().slice(8..16))).unwrap();
+        submit_and_wait(&self.gpu, b);
+        let mut out = [0u32; 16];
+        out.copy_from_slice(&host.read().unwrap()[..16]);
+        out
     }
 
     pub fn download_particles(&self) -> Vec<Particle> {

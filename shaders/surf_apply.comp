@@ -17,7 +17,7 @@
 // pressure gradient use the same face coefficient, so a jump of the right size is balanced
 // exactly and drives no flow ("balanced force").
 //
-// Water and syrup are miscible: they share one aqueous phase, so there is no tension
+// Water and honey are miscible: they share one aqueous phase, so there is no tension
 // between them (the transient Korteweg stress of a fresh miscible interface is neglected).
 
 layout(local_size_x = 16, local_size_y = 16) in;
